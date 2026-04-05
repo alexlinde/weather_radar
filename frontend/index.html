@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NYC Weather Radar</title>
+
+  <!-- MapLibre GL JS -->
+  <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Map container -->
+  <div id="map"></div>
+
+  <!-- Control panel -->
+  <div id="controls">
+    <h2>NYC Radar</h2>
+
+    <!-- Opacity slider -->
+    <div class="control-row">
+      <div class="control-label">
+        <span>Opacity</span>
+        <span id="opacity-value">80%</span>
+      </div>
+      <input
+        type="range"
+        id="opacity-slider"
+        min="0" max="1" step="0.01" value="0.8"
+        aria-label="Radar opacity"
+      />
+    </div>
+
+    <!-- Action buttons -->
+    <div class="control-row btn-row">
+      <button id="btn-refresh" title="Re-fetch latest frame">Refresh</button>
+      <button id="btn-reset-view" title="Fly back to NYC">Reset view</button>
+    </div>
+
+    <!-- Status -->
+    <div class="status-row">
+      <div id="status-dot" class="loading"></div>
+      <div id="timestamp">Connecting…</div>
+    </div>
+  </div>
+
+  <!-- Legend toggle (bottom-right) -->
+  <div id="legend-toggle">
+    <button id="btn-legend">Show legend</button>
+  </div>
+
+  <!-- Legend panel -->
+  <div id="legend" role="complementary" aria-label="Reflectivity colour scale"></div>
+
+  <!-- App scripts -->
+  <script src="colors.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

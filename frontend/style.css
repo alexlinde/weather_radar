@@ -1,0 +1,207 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #0d1117;
+}
+
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+/* ── Control Panel ──────────────────────────────────────────────────────── */
+
+#controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  background: rgba(13, 17, 23, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 14px 16px;
+  width: 220px;
+  backdrop-filter: blur(8px);
+  color: #e6edf3;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+}
+
+#controls h2 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #58a6ff;
+  margin-bottom: 12px;
+}
+
+.control-row {
+  margin-bottom: 12px;
+}
+
+.control-row:last-child {
+  margin-bottom: 0;
+}
+
+.control-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: #8b949e;
+  margin-bottom: 5px;
+}
+
+.control-label span:last-child {
+  color: #e6edf3;
+  font-weight: 500;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #58a6ff;
+  cursor: pointer;
+  border: 2px solid #0d1117;
+  box-shadow: 0 0 4px rgba(88,166,255,0.5);
+}
+
+/* ── Status Row ─────────────────────────────────────────────────────────── */
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #8b949e;
+  margin-top: 4px;
+}
+
+#status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3fb950;
+  flex-shrink: 0;
+}
+
+#status-dot.loading {
+  background: #d29922;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+#status-dot.error {
+  background: #f85149;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+#timestamp {
+  font-size: 11px;
+  color: #8b949e;
+  word-break: break-all;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+
+.btn-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+button {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.06);
+  color: #e6edf3;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+button:hover {
+  background: rgba(88,166,255,0.15);
+  border-color: #58a6ff;
+}
+
+button:active {
+  background: rgba(88,166,255,0.25);
+}
+
+/* ── Legend ─────────────────────────────────────────────────────────────── */
+
+#legend-toggle {
+  position: absolute;
+  bottom: 28px;
+  right: 12px;
+  z-index: 10;
+}
+
+#legend {
+  position: absolute;
+  bottom: 60px;
+  right: 12px;
+  z-index: 10;
+  background: rgba(13, 17, 23, 0.88);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding: 10px 12px;
+  backdrop-filter: blur(8px);
+  display: none;
+}
+
+#legend.visible {
+  display: block;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.legend-swatch {
+  width: 18px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.legend-item span {
+  font-size: 11px;
+  color: #e6edf3;
+  white-space: nowrap;
+}
+
+/* ── Attribution fix ────────────────────────────────────────────────────── */
+
+.maplibregl-ctrl-attrib {
+  font-size: 10px !important;
+}

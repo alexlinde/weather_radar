@@ -1,0 +1,24 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Test fixtures (real GRIB2 files — large, no need to commit)
+tests/fixtures/*.grib2
+tests/fixtures/*.gz
+
+# OS
+.DS_Store
