@@ -36,15 +36,45 @@
 
     <!-- Action buttons -->
     <div class="control-row btn-row">
-      <button id="btn-refresh" title="Re-fetch latest frame">Refresh</button>
+      <button id="btn-refresh" title="Re-fetch latest frames">Refresh</button>
       <button id="btn-reset-view" title="Fly back to NYC">Reset view</button>
     </div>
 
     <!-- Status -->
     <div class="status-row">
       <div id="status-dot" class="loading"></div>
-      <div id="timestamp">Connecting…</div>
+      <div id="timestamp">Loading frames…</div>
     </div>
+  </div>
+
+  <!-- Animation bar (bottom-center) -->
+  <div id="animation-bar">
+    <button id="btn-play" title="Play / Pause" aria-label="Play or pause animation">
+      <svg id="icon-play" viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+        <polygon points="6,4 20,12 6,20" />
+      </svg>
+      <svg id="icon-pause" viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display:none">
+        <rect x="5" y="4" width="4" height="16" />
+        <rect x="15" y="4" width="4" height="16" />
+      </svg>
+    </button>
+
+    <input
+      type="range"
+      id="frame-scrubber"
+      min="0" max="0" step="1" value="0"
+      aria-label="Frame scrubber"
+    />
+
+    <span id="frame-time">--:--</span>
+    <span id="frame-counter">0/0</span>
+
+    <select id="speed-select" aria-label="Playback speed">
+      <option value="1000">0.5x</option>
+      <option value="500" selected>1x</option>
+      <option value="250">2x</option>
+      <option value="150">3x</option>
+    </select>
   </div>
 
   <!-- Legend toggle (bottom-right) -->

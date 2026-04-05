@@ -20,5 +20,8 @@ htmlcov/
 tests/fixtures/*.grib2
 tests/fixtures/*.gz
 
+# Disk cache for downloaded GRIB2 files
+data/
+
 # OS
 .DS_Store

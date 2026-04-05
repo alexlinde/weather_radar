@@ -1,67 +1,110 @@
 """
-Simple in-memory frame cache with TTL.
+Multi-frame in-memory cache for decoded radar data.
 
-MRMS updates every ~2 minutes, so we cache for 120 seconds to avoid
-hammering S3 on every request.
+Stores up to MAX_FRAMES recent frames keyed by S3 object key.
+The S3 key encodes the timestamp, so it's a natural dedup key.
 """
 
 from __future__ import annotations
 
 import logging
-import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-TTL_SECONDS = 120
+MAX_FRAMES = 70
 
 
-class _FrameCache:
-    def __init__(self, ttl: int = TTL_SECONDS) -> None:
-        self._ttl = ttl
-        self._grid: np.ndarray | None = None
-        self._metadata: dict | None = None
-        self._fetched_at: float = 0.0
+@dataclass(slots=True)
+class FrameEntry:
+    metadata: dict[str, Any]
+    grid: np.ndarray
 
-    def _is_fresh(self) -> bool:
-        return (
-            self._grid is not None
-            and (time.monotonic() - self._fetched_at) < self._ttl
-        )
 
-    def get_or_fetch(self) -> tuple[np.ndarray, dict]:
-        """Return the cached frame if fresh; otherwise fetch a new one."""
-        if self._is_fresh():
-            age = time.monotonic() - self._fetched_at
-            logger.debug("Cache hit (age %.1fs)", age)
-            return self._grid, self._metadata  # type: ignore[return-value]
+class FrameCache:
+    def __init__(self, max_frames: int = MAX_FRAMES) -> None:
+        self._max = max_frames
+        self._frames: OrderedDict[str, FrameEntry] = OrderedDict()
 
-        logger.info("Cache miss — fetching latest MRMS frame…")
-        from .mrms import get_latest_frame
+    def has(self, s3_key: str) -> bool:
+        return s3_key in self._frames
 
-        grid, metadata = get_latest_frame()
-        self._grid = grid
-        self._metadata = metadata
-        self._fetched_at = time.monotonic()
-        logger.info("Cache updated: %s", metadata.get("timestamp"))
-        return grid, metadata
+    def get(self, s3_key: str) -> FrameEntry | None:
+        return self._frames.get(s3_key)
+
+    def store(self, s3_key: str, metadata: dict, grid: np.ndarray) -> None:
+        """Add a decoded frame. Evicts the oldest if at capacity."""
+        if s3_key in self._frames:
+            self._frames.move_to_end(s3_key)
+            return
+        if len(self._frames) >= self._max:
+            evicted_key, _ = self._frames.popitem(last=False)
+            logger.debug("Evicted oldest frame: %s", evicted_key)
+        self._frames[s3_key] = FrameEntry(metadata=metadata, grid=grid)
+
+    def get_latest(self) -> tuple[np.ndarray, dict] | None:
+        """Return the most recently inserted frame, or None."""
+        if not self._frames:
+            return None
+        entry = next(reversed(self._frames.values()))
+        return entry.grid, entry.metadata
+
+    def get_frames(self, count: int) -> list[tuple[str, FrameEntry]]:
+        """
+        Return up to `count` most recent frames as (s3_key, entry) pairs,
+        ordered oldest-first (chronological) for animation playback.
+        """
+        items = list(self._frames.items())
+        recent = items[-count:] if count < len(items) else items
+        return recent
+
+    def frame_count(self) -> int:
+        return len(self._frames)
 
     def invalidate(self) -> None:
-        """Force the next call to re-fetch."""
-        self._fetched_at = 0.0
+        """Clear all cached frames."""
+        self._frames.clear()
 
 
-# Module-level singleton
-_cache = _FrameCache()
+_cache = FrameCache()
 
 
 def get_or_fetch_latest() -> tuple[np.ndarray, dict]:
-    """Return the latest (possibly cached) radar frame and metadata."""
-    return _cache.get_or_fetch()
+    """Return the latest radar frame, fetching if cache is empty."""
+    result = _cache.get_latest()
+    if result is not None:
+        return result
+
+    logger.info("Cache empty — fetching latest MRMS frame…")
+    from .mrms import fetch_and_decode, list_latest_files
+
+    keys = list_latest_files(count=1)
+    if not keys:
+        raise RuntimeError("No MRMS files found in S3 bucket")
+    grid, metadata = fetch_and_decode(keys[0])
+    _cache.store(keys[0], metadata, grid)
+    return grid, metadata
+
+
+def store(s3_key: str, metadata: dict, grid: np.ndarray) -> None:
+    _cache.store(s3_key, metadata, grid)
+
+
+def has(s3_key: str) -> bool:
+    return _cache.has(s3_key)
+
+
+def get_frames(count: int = 10) -> list[tuple[str, FrameEntry]]:
+    return _cache.get_frames(count)
+
+
+def frame_count() -> int:
+    return _cache.frame_count()
 
 
 def invalidate() -> None:
-    """Invalidate the cache, forcing the next request to re-fetch."""
     _cache.invalidate()

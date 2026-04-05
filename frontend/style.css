@@ -200,6 +200,82 @@ button:active {
   white-space: nowrap;
 }
 
+/* ── Animation Bar ──────────────────────────────────────────────────────── */
+
+#animation-bar {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(13, 17, 23, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 8px 14px;
+  backdrop-filter: blur(8px);
+  color: #e6edf3;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  min-width: 340px;
+}
+
+#btn-play {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+}
+
+#frame-scrubber {
+  flex: 1;
+  min-width: 80px;
+}
+
+#frame-time {
+  font-size: 11px;
+  color: #8b949e;
+  white-space: nowrap;
+  min-width: 44px;
+  text-align: center;
+}
+
+#frame-counter {
+  font-size: 11px;
+  color: #58a6ff;
+  font-weight: 500;
+  white-space: nowrap;
+  min-width: 30px;
+  text-align: center;
+}
+
+#speed-select {
+  font-size: 11px;
+  font-weight: 500;
+  color: #e6edf3;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 6px;
+  padding: 4px 6px;
+  cursor: pointer;
+  outline: none;
+}
+
+#speed-select:hover {
+  border-color: #58a6ff;
+  background: rgba(88,166,255,0.15);
+}
+
+#speed-select option {
+  background: #161b22;
+  color: #e6edf3;
+}
+
 /* ── Attribution fix ────────────────────────────────────────────────────── */
 
 .maplibregl-ctrl-attrib {

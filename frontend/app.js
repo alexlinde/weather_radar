@@ -1,14 +1,13 @@
 /**
- * NYC Weather Radar — Main application.
+ * NYC Weather Radar — Main application with frame animation.
  *
- * Initialises a MapLibre GL map, fetches the latest MRMS radar image from the
- * backend API, and renders it as a georeferenced raster overlay.
- *
- * Auto-refreshes every 2 minutes. Manual refresh via button.
+ * Fetches a batch of recent radar frames from the backend, preloads them,
+ * and animates through them on a single MapLibre raster layer.
  */
 
 const API_BASE = 'http://127.0.0.1:8000';
-const REFRESH_INTERVAL_MS = 120_000; // 2 minutes
+const FRAME_COUNT = 60;
+const REFRESH_INTERVAL_MS = 120_000;
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -25,118 +24,232 @@ async function resolveMapStyle() {
       }
     }
   } catch (_) { /* ignore */ }
-  // Fallback: OpenFreeMap (no key needed)
   return 'https://tiles.openfreemap.org/styles/liberty';
 }
 
-// ── Radar overlay ─────────────────────────────────────────────────────────────
+// ── Animation state ───────────────────────────────────────────────────────────
 
-const SOURCE_ID = 'radar-image';
-const LAYER_ID  = 'radar-layer';
+let frames = [];           // { timestamp, imageUrl, bounds }
+let currentIndex = 0;
+let playing = false;
+let frameInterval = 500;   // ms between frames (1x speed)
+let lastFrameTime = 0;
+let animationId = null;
+let mapRef = null;
+let userOpacity = 0.8;
 
-let currentTimestamp = null;
-let isLoading = false;
+// ── Status helpers ────────────────────────────────────────────────────────────
 
 function setStatus(state, message) {
   const dot = document.getElementById('status-dot');
   const ts  = document.getElementById('timestamp');
-  dot.className = state; // '', 'loading', 'error'
+  dot.className = state;
   ts.textContent = message || '';
 }
 
-async function fetchAndUpdateRadar(map) {
-  if (isLoading) return;
-  isLoading = true;
-  setStatus('loading', 'Fetching…');
+function formatTimestamp(iso) {
+  if (!iso) return '--:--';
+  return new Date(iso).toLocaleTimeString('en-US', {
+    timeZone: 'America/New_York',
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
 
+function formatTimestampFull(iso) {
+  if (!iso) return '--';
+  return new Date(iso).toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    hour12: false,
+  });
+}
+
+// ── Frame loading ─────────────────────────────────────────────────────────────
+
+function preloadImage(dataUri) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = dataUri;
+  });
+}
+
+async function fetchFrames() {
+  setStatus('loading', 'Loading frames…');
   try {
-    const resp = await fetch(`${API_BASE}/api/radar/image`, { cache: 'no-store' });
+    const resp = await fetch(`${API_BASE}/api/radar/frames?count=${FRAME_COUNT}`, { cache: 'no-store' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
 
-    const north     = parseFloat(resp.headers.get('X-Radar-North'));
-    const south     = parseFloat(resp.headers.get('X-Radar-South'));
-    const west      = parseFloat(resp.headers.get('X-Radar-West'));
-    const east      = parseFloat(resp.headers.get('X-Radar-East'));
-    const timestamp = resp.headers.get('X-Radar-Timestamp');
+    const loaded = await Promise.all(
+      data.frames.map(async (f) => {
+        await preloadImage(f.image);
+        return {
+          timestamp: f.timestamp,
+          imageUrl: f.image,
+          bounds: f.bounds,
+        };
+      })
+    );
 
-    const blob = await resp.blob();
-    const imageUrl = URL.createObjectURL(blob);
+    frames = loaded;
+    currentIndex = frames.length - 1;
 
-    // MapLibre image source expects: top-left (NW), top-right (NE), bottom-right (SE), bottom-left (SW)
-    const coordinates = [
-      [west,  north],  // NW — top-left
-      [east,  north],  // NE — top-right
-      [east,  south],  // SE — bottom-right
-      [west,  south],  // SW — bottom-left
-    ];
+    updateScrubber();
+    updateFrameDisplay();
+    showFrame(currentIndex);
 
-    if (map.getSource(SOURCE_ID)) {
-      map.getSource(SOURCE_ID).updateImage({ url: imageUrl, coordinates });
-    } else {
-      map.addSource(SOURCE_ID, {
-        type: 'image',
-        url: imageUrl,
-        coordinates,
-      });
-      map.addLayer({
-        id: LAYER_ID,
-        type: 'raster',
-        source: SOURCE_ID,
-        paint: {
-          'raster-opacity': parseFloat(document.getElementById('opacity-slider').value),
-          'raster-fade-duration': 0,
-          'raster-resampling': 'linear',
-        },
-      });
-    }
+    const newest = frames[frames.length - 1];
+    setStatus('', `Latest: ${formatTimestampFull(newest?.timestamp)} ET`);
 
-    // Draw / update bounding box outline around the radar coverage area
-    const bboxGeoJSON = {
-      type: 'Feature',
-      geometry: {
-        type: 'Polygon',
-        coordinates: [[
-          [west,  south],
-          [east,  south],
-          [east,  north],
-          [west,  north],
-          [west,  south],
-        ]],
-      },
-    };
-
-    if (map.getSource('radar-bbox')) {
-      map.getSource('radar-bbox').setData(bboxGeoJSON);
-    } else {
-      map.addSource('radar-bbox', { type: 'geojson', data: bboxGeoJSON });
-      map.addLayer({
-        id: 'radar-bbox-line',
-        type: 'line',
-        source: 'radar-bbox',
-        paint: {
-          'line-color': '#58a6ff',
-          'line-width': 1.5,
-          'line-dasharray': [4, 3],
-          'line-opacity': 0.7,
-        },
-      });
-    }
-
-    // Revoke the old object URL after the image has loaded
-    map.once('idle', () => URL.revokeObjectURL(imageUrl));
-
-    currentTimestamp = timestamp;
-    const formatted = timestamp
-      ? new Date(timestamp).toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false })
-      : '—';
-    setStatus('', `Valid: ${formatted} ET`);
-
+    return true;
   } catch (err) {
-    console.error('Radar fetch error:', err);
+    console.error('Frame fetch error:', err);
     setStatus('error', `Error: ${err.message}`);
-  } finally {
-    isLoading = false;
+    return false;
   }
+}
+
+// ── Radar layer rendering ─────────────────────────────────────────────────────
+
+const SOURCE_ID = 'radar-image';
+const LAYER_ID  = 'radar-layer';
+
+function boundsToCoordinates(b) {
+  return [
+    [b.west, b.north],   // NW
+    [b.east, b.north],   // NE
+    [b.east, b.south],   // SE
+    [b.west, b.south],   // SW
+  ];
+}
+
+function ensureRadarLayer(map) {
+  if (map.getSource(SOURCE_ID)) return;
+  const placeholder = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  map.addSource(SOURCE_ID, {
+    type: 'image',
+    url: placeholder,
+    coordinates: [[-75.23, 42.0], [-72.67, 42.0], [-72.67, 39.44], [-75.23, 39.44]],
+  });
+  map.addLayer({
+    id: LAYER_ID,
+    type: 'raster',
+    source: SOURCE_ID,
+    paint: {
+      'raster-opacity': userOpacity,
+      'raster-fade-duration': 0,
+      'raster-resampling': 'linear',
+    },
+  });
+}
+
+function showFrame(index) {
+  if (!mapRef || frames.length === 0) return;
+  const map = mapRef;
+  const frame = frames[index];
+  if (!frame) return;
+
+  const coords = boundsToCoordinates(frame.bounds);
+  const src = map.getSource(SOURCE_ID);
+  if (src) {
+    src.updateImage({ url: frame.imageUrl, coordinates: coords });
+  }
+
+  updateBbox(map, frame.bounds);
+}
+
+function updateBbox(map, bounds) {
+  const bboxGeoJSON = {
+    type: 'Feature',
+    geometry: {
+      type: 'Polygon',
+      coordinates: [[
+        [bounds.west, bounds.south],
+        [bounds.east, bounds.south],
+        [bounds.east, bounds.north],
+        [bounds.west, bounds.north],
+        [bounds.west, bounds.south],
+      ]],
+    },
+  };
+
+  if (map.getSource('radar-bbox')) {
+    map.getSource('radar-bbox').setData(bboxGeoJSON);
+  } else {
+    map.addSource('radar-bbox', { type: 'geojson', data: bboxGeoJSON });
+    map.addLayer({
+      id: 'radar-bbox-line',
+      type: 'line',
+      source: 'radar-bbox',
+      paint: {
+        'line-color': '#58a6ff',
+        'line-width': 1.5,
+        'line-dasharray': [4, 3],
+        'line-opacity': 0.7,
+      },
+    });
+  }
+}
+
+// ── Animation loop ────────────────────────────────────────────────────────────
+
+function animationTick(now) {
+  if (!playing) return;
+
+  if (now - lastFrameTime >= frameInterval) {
+    lastFrameTime = now;
+    currentIndex = (currentIndex + 1) % frames.length;
+    showFrame(currentIndex);
+    updateFrameDisplay();
+  }
+
+  animationId = requestAnimationFrame(animationTick);
+}
+
+function play() {
+  if (frames.length < 2) return;
+  playing = true;
+  lastFrameTime = performance.now();
+  document.getElementById('icon-play').style.display = 'none';
+  document.getElementById('icon-pause').style.display = '';
+  animationId = requestAnimationFrame(animationTick);
+}
+
+function pause() {
+  playing = false;
+  document.getElementById('icon-play').style.display = '';
+  document.getElementById('icon-pause').style.display = 'none';
+  if (animationId) {
+    cancelAnimationFrame(animationId);
+    animationId = null;
+  }
+}
+
+function togglePlay() {
+  playing ? pause() : play();
+}
+
+// ── UI sync ───────────────────────────────────────────────────────────────────
+
+function updateScrubber() {
+  const scrubber = document.getElementById('frame-scrubber');
+  scrubber.max = Math.max(0, frames.length - 1);
+  scrubber.value = currentIndex;
+}
+
+function updateFrameDisplay() {
+  const scrubber = document.getElementById('frame-scrubber');
+  scrubber.value = currentIndex;
+
+  const timeEl = document.getElementById('frame-time');
+  const counterEl = document.getElementById('frame-counter');
+  const frame = frames[currentIndex];
+
+  timeEl.textContent = frame ? formatTimestamp(frame.timestamp) : '--:--';
+  counterEl.textContent = frames.length > 0 ? `${currentIndex + 1}/${frames.length}` : '0/0';
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -153,41 +266,78 @@ async function init() {
     bearing: 0,
     attributionControl: true,
   });
+  mapRef = map;
 
   map.addControl(new maplibregl.NavigationControl(), 'top-left');
   map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
   map.on('load', async () => {
-    await fetchAndUpdateRadar(map);
+    ensureRadarLayer(map);
+    const ok = await fetchFrames();
+    if (ok && frames.length >= 2) {
+      play();
+    }
 
-    // Auto-refresh
-    setInterval(() => fetchAndUpdateRadar(map), REFRESH_INTERVAL_MS);
+    setInterval(async () => {
+      const wasPlaying = playing;
+      if (wasPlaying) pause();
+      await fetchFrames();
+      if (wasPlaying && frames.length >= 2) play();
+    }, REFRESH_INTERVAL_MS);
   });
 
-  // ── Controls ────────────────────────────────────────────────────────────────
+  // ── Opacity slider ──────────────────────────────────────────────────────
 
   const opacitySlider = document.getElementById('opacity-slider');
   const opacityValue  = document.getElementById('opacity-value');
 
   opacitySlider.addEventListener('input', () => {
-    const val = parseFloat(opacitySlider.value);
-    opacityValue.textContent = Math.round(val * 100) + '%';
+    userOpacity = parseFloat(opacitySlider.value);
+    opacityValue.textContent = Math.round(userOpacity * 100) + '%';
     if (map.getLayer(LAYER_ID)) {
-      map.setPaintProperty(LAYER_ID, 'raster-opacity', val);
+      map.setPaintProperty(LAYER_ID, 'raster-opacity', userOpacity);
     }
   });
 
-  document.getElementById('btn-refresh').addEventListener('click', () => {
-    fetchAndUpdateRadar(map);
+  // ── Play / Pause ────────────────────────────────────────────────────────
+
+  document.getElementById('btn-play').addEventListener('click', togglePlay);
+
+  // ── Frame scrubber ──────────────────────────────────────────────────────
+
+  const scrubber = document.getElementById('frame-scrubber');
+  scrubber.addEventListener('input', () => {
+    const wasPlaying = playing;
+    if (wasPlaying) pause();
+    currentIndex = parseInt(scrubber.value, 10);
+    showFrame(currentIndex);
+    updateFrameDisplay();
   });
+
+  // ── Speed select ────────────────────────────────────────────────────────
+
+  document.getElementById('speed-select').addEventListener('change', (e) => {
+    frameInterval = parseInt(e.target.value, 10);
+  });
+
+  // ── Refresh button ──────────────────────────────────────────────────────
+
+  document.getElementById('btn-refresh').addEventListener('click', async () => {
+    const wasPlaying = playing;
+    if (wasPlaying) pause();
+    await fetchFrames();
+    if (wasPlaying && frames.length >= 2) play();
+  });
+
+  // ── Reset view ──────────────────────────────────────────────────────────
 
   document.getElementById('btn-reset-view').addEventListener('click', () => {
     map.flyTo({ center: [-73.98, 40.75], zoom: 10, pitch: 0, bearing: 0, duration: 800 });
   });
 
-  // ── Legend ──────────────────────────────────────────────────────────────────
+  // ── Legend ──────────────────────────────────────────────────────────────
 
-  const legendEl    = document.getElementById('legend');
+  const legendEl     = document.getElementById('legend');
   const legendToggle = document.getElementById('btn-legend');
 
   buildLegend(legendEl);
