@@ -218,6 +218,10 @@ class TileTextureCache {
 
   _key(ts, z, x, y) { return `${ts}/${z}/${x}/${y}`; }
 
+  has(ts, z, x, y) {
+    return this._textures.has(this._key(ts, z, x, y));
+  }
+
   get(ts, z, x, y) {
     const e = this._textures.get(this._key(ts, z, x, y));
     if (e) { e.lu = performance.now(); return e.t; }
@@ -428,11 +432,24 @@ class RadarLayer {
     await Promise.all(promises);
   }
 
-  prefetchFrame(frameIdx) {
-    if (frameIdx < 0 || frameIdx >= this._timestamps.length) return;
+  prefetchFrames(startIdx, count) {
+    const len = this._timestamps.length;
+    if (len === 0) return;
+    for (let i = 0; i < count; i++) {
+      const idx = (startIdx + i) % len;
+      const ts = this._timestamps[idx]?.timestamp;
+      if (!ts) continue;
+      for (const { z, x, y } of this._visibleTiles) this._tileCache.load(ts, z, x, y);
+    }
+  }
+
+  hasTexturesForFrame(frameIdx) {
     const ts = this._timestamps[frameIdx]?.timestamp;
-    if (!ts) return;
-    for (const { z, x, y } of this._visibleTiles) this._tileCache.load(ts, z, x, y);
+    if (!ts) return false;
+    for (const { z, x, y } of this._visibleTiles) {
+      if (!this._tileCache.has(ts, z, x, y)) return false;
+    }
+    return true;
   }
 
   // ── CustomLayerInterface ───────────────────────────────────────────────

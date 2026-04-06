@@ -136,6 +136,8 @@ function getCurrentFrameIndex() {
   return Math.floor(currentAnimationTime) % Math.max(1, timestamps.length);
 }
 
+const PREFETCH_AHEAD = 5;
+
 function showFrame() {
   if (!radarLayer || timestamps.length === 0) return;
 
@@ -147,8 +149,7 @@ function showFrame() {
 
   radarLayer.setAnimation(frameA, frameB, mix);
 
-  // Prefetch adjacent frames
-  radarLayer.prefetchFrame((frameB + 1) % len);
+  radarLayer.prefetchFrames((frameB + 1) % len, PREFETCH_AHEAD);
 }
 
 async function loadAndShowFrame() {
@@ -170,27 +171,46 @@ let lastAnimTime = 0;
 function animationTick(now) {
   if (!playing) return;
 
-  if (lastAnimTime > 0) {
+  if (lastAnimTime > 0 && radarLayer) {
     const dt = now - lastAnimTime;
     const step = dt / frameInterval;
-    currentAnimationTime += step;
-    if (currentAnimationTime >= timestamps.length) {
-      currentAnimationTime -= timestamps.length;
+    const len = timestamps.length;
+
+    let nextTime = currentAnimationTime + step;
+    if (nextTime >= len) nextTime -= len;
+
+    const nextFrameA = Math.floor(nextTime) % len;
+    const nextFrameB = (nextFrameA + 1) % len;
+
+    if (radarLayer.hasTexturesForFrame(nextFrameA) &&
+        radarLayer.hasTexturesForFrame(nextFrameB)) {
+      currentAnimationTime = nextTime;
+      showFrame();
+      updateFrameDisplay();
+    } else {
+      radarLayer.prefetchFrames(nextFrameA, PREFETCH_AHEAD);
     }
-    showFrame();
-    updateFrameDisplay();
   }
   lastAnimTime = now;
 
   animationId = requestAnimationFrame(animationTick);
 }
 
-function play() {
+const PREFETCH_BURST = 10;
+
+async function play() {
   if (timestamps.length < 2) return;
   playing = true;
   lastAnimTime = 0;
   document.getElementById('icon-play').style.display = 'none';
   document.getElementById('icon-pause').style.display = '';
+
+  if (radarLayer) {
+    const len = timestamps.length;
+    const startFrame = Math.floor(((currentAnimationTime % len) + len) % len);
+    radarLayer.prefetchFrames(startFrame, PREFETCH_BURST);
+  }
+
   animationId = requestAnimationFrame(animationTick);
 }
 
