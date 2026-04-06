@@ -6,6 +6,15 @@ A web-based weather radar viewer that pulls live MRMS (Multi-Radar Multi-Sensor)
 
 This is a working prototype, not a production app. Prioritise getting real data on screen over polish.
 
+## Current status
+
+**Phase 1 (data on screen): COMPLETE**
+**Phase 2 (time animation): COMPLETE**
+**Phase 3 (3D terrain + vertical levels): COMPLETE**
+**Phase 4 (motion-compensated interpolation): NOT STARTED**
+
+The app fetches 60 frames of tilt-level reflectivity data across 8 vertical levels, derives both 2D composites and 3D voxel volumes, and renders them over a MapLibre base map with 3D terrain. Animation plays through ~2 hours of history with play/pause, scrubber, and speed controls. A toggle switches between 2D composite and 3D point cloud views.
+
 ## Architecture
 
 ```
@@ -19,19 +28,26 @@ This is a working prototype, not a production app. Prioritise getting real data 
 ### Backend (Python / FastAPI)
 
 Responsibilities:
-- Fetch latest MRMS GRIB2 files from S3
-- Decode with custom minimal GRIB2 decoder (see below)
+- Fetch MRMS tilt-level GRIB2 files from S3 across 8 elevation angles
+- Decode with custom minimal GRIB2 decoder (no eccodes dependency)
 - Clip to NYC bounding box
-- Serve radar data as JSON (for deck.gl layers) or PNG tiles (for image overlay)
-- Cache aggressively — MRMS updates every 2 minutes, no need to re-fetch more often
+- Derive 2D composite via `nanmax` across tilt levels
+- Compute 3D voxel volumes for deck.gl PointCloudLayer
+- Serve radar data as JSON, PNG, or pre-computed voxel arrays
+- Two-tier caching: in-memory bounded cache + on-disk raw/decoded cache
+- Background seeding on startup (60 frames across all tilts)
 
 ### Frontend (HTML + JS)
 
 Responsibilities:
-- Render base map with MapLibre GL JS
-- Overlay radar data using deck.gl layers
-- Controls for threshold, opacity, vertical level selection
-- Time animation with frame interpolation
+- Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
+- 3D terrain via AWS elevation tiles (always enabled)
+- Overlay radar data using deck.gl BitmapLayer (2D) or PointCloudLayer (3D)
+- View mode toggle: Composite (2D flat) vs 3D Layers (volumetric points)
+- Time animation with 60 frames, play/pause, scrubber, speed control
+- Opacity slider, vertical exaggeration slider (3D mode)
+- NWS reflectivity color scale legend
+- Auto-refresh every 2 minutes
 
 ## Data Source: MRMS on AWS
 
@@ -39,27 +55,39 @@ Responsibilities:
 **Region:** `us-east-1`
 **Docs:** https://registry.opendata.aws/noaa-mrms-pds/
 
-### Key products to use
+### Data path (what we actually use)
 
-**Composite reflectivity (2D — start here):**
-```
-s3://noaa-mrms-pds/conus/MergedReflectivityQCComposite/
-```
-Single-level maximum reflectivity. Good for the initial 2D map overlay. Files are gzipped GRIB2.
+We fetch **tilt-level reflectivity** (`MergedReflectivityQC`) as the single data source, not the pre-computed composite. This gives us both 2D and 3D from one fetch path.
 
-**3D reflectivity (multi-level — phase 2):**
 ```
-s3://noaa-mrms-pds/conus/MergedReflectivityQC/
+s3://noaa-mrms-pds/CONUS/MergedReflectivityQC_{tilt}/{YYYYMMDD}/MRMS_...grib2.gz
 ```
-This product is available at 33 vertical tilt levels (00.50° through 19.50°). Each level is a separate GRIB2 file. For a 3D view, fetch several levels and stack them.
+
+**Important:** The bucket prefix is `CONUS/` (uppercase), and files are organized by date subdirectory.
+
+We fetch 8 tilt levels per timestamp:
+```
+00.50°, 01.50°, 02.50°, 03.50°, 05.00°, 07.00°, 10.00°, 14.00°
+```
+
+These are mapped to approximate physical heights for 3D rendering:
+```python
+TILT_TO_HEIGHT_KM = {
+    "00.50": 1.0, "01.50": 2.0, "02.50": 3.5, "03.50": 5.0,
+    "05.00": 7.0, "07.00": 9.0, "10.00": 12.0, "14.00": 15.0,
+}
+```
+
+The 2D composite is derived via `nanmax` across all tilt grids at each grid point — equivalent to the pre-computed `MergedReflectivityQCComposite` product, but we get 3D for free.
 
 ### File naming convention
 ```
-MRMS_MergedReflectivityQCComposite_00.50_YYYYMMDD-HHmmSS.grib2.gz
+MRMS_MergedReflectivityQC_{tilt}_{YYYYMMDD}-{HHmmSS}.grib2.gz
 ```
 
 ### How to list available files
-Use an HTTP GET to the S3 bucket's listing endpoint. Or use boto3 with no credentials:
+
+The pipeline scans today + yesterday + 2 days ago to span UTC day boundaries:
 
 ```python
 import boto3
@@ -67,55 +95,51 @@ from botocore import UNSIGNED
 from botocore.config import Config
 
 s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+paginator = s3.get_paginator('list_objects_v2')
 
-# List latest composite reflectivity files
-response = s3.list_objects_v2(
-    Bucket='noaa-mrms-pds',
-    Prefix='conus/MergedReflectivityQCComposite/',
-    Delimiter='/'
-)
+prefix = f"CONUS/MergedReflectivityQC_00.50/{date_str}/"
+for page in paginator.paginate(Bucket='noaa-mrms-pds', Prefix=prefix):
+    for obj in page.get('Contents', []):
+        print(obj['Key'])
 ```
-
-Note: The bucket uses a `latest/` prefix pattern for some products. Explore the bucket structure first — list prefixes under `conus/` to understand the layout.
 
 ### NYC bounding box for clipping
 ```
-North: 41.0
-South: 40.4
-East:  -73.6
-West:  -74.3
+North: 42.0
+South: 39.44
+East:  -72.67
+West:  -75.23
 ```
 
-This covers all five boroughs, parts of NJ, Long Island, and Westchester. Generous enough to see approaching weather.
+This is larger than the original plan — covers NYC, most of NJ, Long Island, the Hudson Valley, and parts of CT. Generous enough to see weather systems approaching from any direction.
 
 ## Base Map
 
-Use **MapLibre GL JS** as the map renderer (open source, no vendor lock-in).
+**MapLibre GL JS** with cascading tile source selection:
 
-For tile sources, try these in order of preference:
+1. **Stadia Maps — Stamen Terrain** (if `STADIA_API_KEY` is set)
+2. **MapTiler Outdoor** (if `MAPTILER_API_KEY` is set)
+3. **OpenFreeMap Liberty** (zero-config fallback, no key needed)
 
-### Option 1: Stadia Maps — Stamen Terrain (recommended)
-Best visual fit for this use case. Shows elevation shading, water bodies, and urban context.
-- Requires a free API key from https://stadiamaps.com
-- Style URL: `https://tiles.stadiamaps.com/styles/stamen_terrain.json?api_key={key}`
-- Free tier is generous (200k tiles/month)
+The frontend fetches tile config from `GET /api/config` at startup and falls back gracefully. Store API keys in `.env` (see `.env.example`).
 
-### Option 2: MapTiler Outdoor
-Good terrain + trail/urban detail.
-- Free API key from https://www.maptiler.com
-- Style URL: `https://api.maptiler.com/maps/outdoor-v2/style.json?key={key}`
-
-### Option 3: OpenFreeMap (no key needed)
-Zero-config fallback. Less visual detail but works immediately.
-- Style URL: `https://tiles.openfreemap.org/styles/liberty`
-
-**Store the API key in a `.env` file, never commit it.**
+3D terrain is always enabled using AWS Terrain Tiles:
+```javascript
+map.addSource('terrain', {
+    type: 'raster-dem',
+    tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+    encoding: 'terrarium',
+    tileSize: 256,
+    maxzoom: 15,
+});
+map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
+```
 
 ### Map initial view
 ```javascript
 center: [-73.98, 40.75],  // Midtown Manhattan
 zoom: 10,                  // Shows all 5 boroughs + surroundings
-pitch: 0,                  // Start flat for Phase 1; increase to ~45 in Phase 3 when terrain is enabled
+pitch: 0,                  // Flat in composite mode; 50° in 3D mode
 bearing: 0
 ```
 
@@ -124,113 +148,166 @@ bearing: 0
 ### Backend
 - **Python 3.11+**
 - **FastAPI** — API server
-- **numpy** — array operations, clipping, resampling
+- **numpy** — array operations, clipping, voxel computation
 - **boto3** — S3 access (unsigned requests, no credentials needed)
-- **Pillow** — PNG tile generation + JPEG2000 decoding (ships with openjpeg)
+- **Pillow** — PNG rendering + JPEG2000 decoding (ships with openjpeg)
 - **uvicorn** — ASGI server
+- **python-dotenv** — load `.env` for API keys
 
-No eccodes, no cfgrib, no system-level C dependencies. See "Custom GRIB2 Decoder" section below.
+No eccodes, no cfgrib, no system-level C dependencies.
 
 ### Frontend
-- **MapLibre GL JS** (~v4) — base map rendering
-- **deck.gl** (~v9) — GPU-accelerated data layers on top of MapLibre
-- **Vanilla JS or lightweight bundler** — keep it simple for a prototype, no React needed
+- **MapLibre GL JS** (~v4) — base map + 3D terrain
+- **deck.gl** (~v9) — BitmapLayer (2D), PointCloudLayer (3D), MapboxOverlay integration
+- **Vanilla JS** — no framework, no build step
 
-Load MapLibre and deck.gl from CDN for prototype speed:
+Loaded from CDN:
 ```html
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
 <script src="https://unpkg.com/deck.gl@9/dist.min.js"></script>
 ```
 
-## Build Plan
+## API Endpoints
 
-### Phase 1: Get data on screen (start here)
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/radar/latest` | GET | Latest clipped NYC radar as JSON (grid + metadata) |
+| `/api/radar/image` | GET | Latest radar as PNG with NWS color scale |
+| `/api/radar/frames?count=60` | GET | Recent frames as base64 PNGs, oldest-first |
+| `/api/radar/volume` | GET | Latest multi-level snapshot as voxel data |
+| `/api/radar/volume/frames?count=60` | GET | Recent volume frames as pre-computed voxels |
+| `/api/radar/refresh` | GET | Force cache invalidation + re-seed |
+| `/api/config` | GET | Frontend configuration (map tile API keys) |
+| `/health` | GET | Cache status (frame counts) |
 
-1. **Backend: Fetch + decode MRMS composite reflectivity**
-   - Write a Python script that downloads the latest composite reflectivity GRIB2 from S3
-   - Decode with the custom GRIB2 decoder (see section below)
-   - Clip to the NYC bounding box
-   - Print the array shape, lat/lon bounds, min/max values to verify
+The `/frames` and `/volume/frames` endpoints return 503 while the server is still seeding on startup. The frontend retries automatically (up to ~2 minutes).
 
-2. **Backend: Serve as API**
-   - FastAPI endpoint `GET /api/radar/latest` returns JSON:
-     ```json
-     {
-       "timestamp": "2026-04-05T18:02:00Z",
-       "bounds": { "north": 41.0, "south": 40.4, "east": -73.6, "west": -74.3 },
-       "grid": { "rows": <int>, "cols": <int> },
-       "data": [[<dbz values>]]  
-     }
-     ```
-   - Also support `GET /api/radar/image` that returns a PNG with transparent background, NWS reflectivity color scale applied. This is a fallback if the JSON payload is too large for smooth rendering.
+## Data Pipeline (`pipeline.py`)
 
-3. **Frontend: Base map + radar overlay**
-   - Initialise MapLibre with the chosen base map style
-   - Fetch radar data from the API
-   - Render using a deck.gl `BitmapLayer` (if PNG) or `GridCellLayer` (if JSON grid)
-   - Apply NWS reflectivity color scale
-   - Add opacity slider
+The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, derive both 2D and 3D outputs.**
 
-### Phase 2: Time animation
+### Seed flow (startup)
 
-4. **Backend: Serve recent frames**
-   - Endpoint `GET /api/radar/frames?count=10` returns the last N frames (timestamps + data)
-   - Cache decoded frames in memory
+1. List the 60 most recent `00.50` tilt keys from S3
+2. For each timestamp, derive S3 keys for all 8 tilt levels
+3. Fetch each tilt in parallel (ThreadPoolExecutor, 8 workers)
+4. For each tilt: check disk cache → download from S3 → decode GRIB2 → clip to NYC → save to disk cache
+5. Across all tilts for a timestamp: compute `nanmax` composite + extract voxels above 10 dBZ
+6. Store composite in `composite_cache`, voxels in `volume_cache`
 
-5. **Frontend: Animation loop**
-   - Fetch a batch of frames
-   - Animate through them on a timer
-   - Linear interpolation between frames as a baseline (alpha blend)
-   - Play/pause control, speed control, scrub slider
+### Caching architecture
 
-### Phase 3: 3D terrain + vertical levels
+**In-memory (`cache.py`):**
+- `BoundedCache` — thread-safe OrderedDict with max 70 entries, oldest-first eviction
+- `composite_cache` — keyed by S3 ref_key, stores `FrameEntry(metadata, grid)`
+- `volume_cache` — keyed by ISO timestamp, stores voxel lists
 
-6. **Frontend: Enable 3D terrain**
-   - Add a raster-DEM source to MapLibre using AWS Terrain Tiles (free, no key):
-     ```javascript
-     map.addSource('terrain', {
-       type: 'raster-dem',
-       tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-       encoding: 'terrarium',
-       tileSize: 256,
-     });
-     map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
-     ```
-   - Set an initial pitch (e.g. 45°) so terrain is visible
-   - This gives the user the Palisades, Hudson valley, harbor bathymetry, and LI topography for free
-   - Test that the 2D radar overlay from Phase 1 still renders correctly when draped over terrain
+**On-disk (`disk_cache.py`):**
+- `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3
+- `data/decoded/{tilt}/` — `.npy` (numpy array) + `.json` (metadata) per decoded frame
+- 24-hour eviction on startup
+- Legacy cache migration from flat layout to per-tilt layout
 
-7. **Backend: Multi-level data**
-   - Fetch MergedReflectivityQC at multiple tilt angles
-   - Stack into a 3D array, serve as JSON or binary
-   - Endpoint `GET /api/radar/volume`
+## Custom GRIB2 Decoder
 
-8. **Frontend: 3D radar visualisation**
-   - Use deck.gl `ColumnLayer` or custom layer to render vertical columns above the terrain
-   - Or render stacked translucent planes as explored in earlier prototypes
-   - Radar volumes should float above the terrain surface, not clip through it
-   - Add vertical level selector / cross-section tool
+**Do not use eccodes, cfgrib, pygrib, or wgrib2.** These all depend on the eccodes C library, which is ~100MB+, has painful cross-platform installation, and is massive overkill for our use case. We only need to decode one product family (MRMS reflectivity) which uses a narrow, predictable subset of the GRIB2 spec.
 
-### Phase 4: Motion-compensated frame interpolation
+### GRIB2 structure (what we parse)
 
-9. **Backend: Compute motion fields**
-   - Between consecutive cached frames, compute a 2D displacement field (block matching or optical flow)
-   - MRMS also publishes derived storm motion vectors — evaluate whether these are usable directly
-   - Serve motion vectors alongside frame data in `GET /api/radar/frames`
+| Section | Name | What we extract |
+|---------|------|-----------------|
+| 0 | Indicator | Magic bytes `GRIB`, edition (must be 2), total message length |
+| 1 | Identification | Reference time (year, month, day, hour, minute, second) |
+| 2 | Local Use | Skip (optional, MRMS may not include it) |
+| 3 | Grid Definition | Grid template, Ni (cols), Nj (rows), lat/lon of first and last grid point, resolution |
+| 4 | Product Definition | Parameter category, parameter number, level type, level value (tilt angle) |
+| 5 | Data Representation | Packing template number, reference value, binary scale, decimal scale, bits per value |
+| 6 | Bitmap | Bitmap presence indicator — if present, a bitmask of valid data points |
+| 7 | Data | Packed data values |
+| 8 | End | Magic bytes `7777` |
 
-10. **Frontend: Semi-Lagrangian advection**
-    - For each intermediate frame at time t between keyframes t₀ and t₁:
-      - Trace each pixel backward along the motion vector by α to sample from frame t₀
-      - Trace forward from t₁ by (1 - α) to sample from frame t₁
-      - Blend based on temporal proximity
-    - This replaces the naive alpha-blend from Phase 2
-    - Storms should slide smoothly across the map instead of ghosting/doubling
-    - Fall back to crossfade locally where the motion field has high residual error (cell splits, new development, decay)
+All multi-byte integers are big-endian. Use Python's `struct` module.
+
+### Supported templates
+
+- **Grid Template 3.0** — regular lat/lon grid (the only one MRMS uses)
+- **Data Representation Template 5.0** — simple packing (N-bit unsigned integers)
+- **Data Representation Template 5.40** — JPEG2000 packing (decoded via Pillow)
+- **Data Representation Template 5.41** — PNG packing (decoded via Pillow)
+
+All three data templates use the same physical formula:
+```
+value = (R + packed_int * 2^E) / 10^D
+```
+
+### GRIB2 signed integer encoding
+
+GRIB2 uses an explicit sign bit (MSB), **not** two's-complement, for signed 16-bit fields like the binary scale factor (E) and decimal scale factor (D). This tripped us up initially:
+```python
+def _signed16(raw: int) -> int:
+    sign = (raw >> 15) & 1
+    magnitude = raw & 0x7FFF
+    return -magnitude if sign else magnitude
+```
+
+### Longitude encoding
+
+MRMS longitude values can use the high bit (0x80000000) to represent negative values — not the GRIB2 sign-bit convention but a straightforward unsigned-wrapping pattern. Handle it like:
+```python
+def microdeg_lon(raw: int) -> float:
+    if raw & 0x80000000:
+        return (raw - 0x100000000) * 1e-6
+    return raw * 1e-6
+```
+
+### Bitmap handling
+
+Bitmap indicator byte 5 of Section 6:
+- 255 = no bitmap, all grid points have data
+- 0 = bitmap follows (1 bit per grid point, 1 = data present, 0 = missing)
+
+When a bitmap is present, the packed values in Section 7 are sparse — only grid points where the bitmap bit is 1 have corresponding values. Expand back to the full grid with NaN fill.
+
+### Section 3 byte offsets (Template 3.0)
+
+All offsets from section start, 0-based:
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| +30..33 | Ni | Columns (number of points along parallel) |
+| +34..37 | Nj | Rows (number of points along meridian) |
+| +46..49 | La1 | Latitude of first grid point (signed int, microdegrees) |
+| +50..53 | Lo1 | Longitude of first grid point (unsigned, microdegrees) |
+| +55..58 | La2 | Latitude of last grid point |
+| +59..62 | Lo2 | Longitude of last grid point |
+| +63..66 | Di | i-direction increment (microdegrees) |
+| +67..70 | Dj | j-direction increment (microdegrees) |
+| +71 | Scanning mode | Bit flags for scan direction |
+
+**Note:** La2/Lo2 start at offset +55/+59, not +56/+60 as the GRIB2 spec's 1-based numbering might suggest. This is because the resolution flags byte at +54 is a single byte, not a 4-byte field.
+
+### Section 5 byte offsets
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| +11..14 | R | Reference value (IEEE 754 float) |
+| +15..16 | E | Binary scale factor (GRIB2 signed 16-bit) |
+| +17..18 | D | Decimal scale factor (GRIB2 signed 16-bit) |
+| +19 | bits | Number of bits per packed value |
+
+### What we do NOT need to handle
+- Grid templates other than 3.0
+- Packing templates other than 5.0, 5.40, 5.41
+- Multiple messages per file
+- Complex/second-order packing (Template 5.2, 5.3)
+- Spectral data, ensemble metadata, or any exotic GRIB2 features
+
+If we encounter an unsupported template, fail loudly with a clear error message identifying the template number.
 
 ## NWS Reflectivity Color Scale
 
-Use this standard palette for mapping dBZ to RGBA. The alpha channel should be 0 for values below 5 dBZ (no echo).
+Standard palette for mapping dBZ to RGBA. Alpha is 0 below 5 dBZ (no echo).
 
 ```python
 NWS_DBZ_COLORS = [
@@ -251,160 +328,144 @@ NWS_DBZ_COLORS = [
 ]
 ```
 
-## Custom GRIB2 Decoder
+Backend PNG rendering uses alpha 220 for all active bands. The 3D PointCloudLayer uses a dynamic alpha ramp from 100–255 based on dBZ value.
 
-**Do not use eccodes, cfgrib, pygrib, or wgrib2.** These all depend on the eccodes C library, which is ~100MB+, has painful cross-platform installation, and is massive overkill for our use case. We only need to decode one product family (MRMS reflectivity) which uses a narrow, predictable subset of the GRIB2 spec.
+## Sentinel Value Handling
 
-### GRIB2 structure (what we need to parse)
-
-A GRIB2 file is a sequence of numbered sections. Each section starts with a 4-byte length and a 1-byte section number:
-
-| Section | Name | What we extract |
-|---------|------|-----------------|
-| 0 | Indicator | Magic bytes `GRIB`, edition (must be 2), total message length |
-| 1 | Identification | Reference time (year, month, day, hour, minute, second) |
-| 2 | Local Use | Skip (optional, MRMS may not include it) |
-| 3 | Grid Definition | Grid template, Ni (cols), Nj (rows), lat/lon of first and last grid point, resolution |
-| 4 | Product Definition | Parameter category, parameter number, level type, level value |
-| 5 | Data Representation | Packing template number, reference value, binary scale, decimal scale, bits per value |
-| 6 | Bitmap | Bitmap presence indicator — if present, a bitmask of valid data points |
-| 7 | Data | Packed data values |
-| 8 | End | Magic bytes `7777` |
-
-All multi-byte integers are big-endian. Use Python's `struct` module.
-
-### Grid Definition (Section 3)
-
-MRMS uses **Template 3.0** (regular lat/lon grid). Key fields at known byte offsets within the section:
-- Bytes 31–34: Ni (number of points along a parallel = columns)
-- Bytes 35–38: Nj (number of points along a meridian = rows)  
-- Bytes 47–50: La1 (latitude of first grid point, microdegrees, signed)
-- Bytes 51–54: Lo1 (longitude of first grid point, microdegrees, unsigned or signed)
-- Bytes 56–59: La2 (latitude of last grid point)
-- Bytes 60–63: Lo2 (longitude of last grid point)
-- Bytes 64–67: Di (i-direction increment, microdegrees)
-- Bytes 68–71: Dj (j-direction increment, microdegrees)
-
-Latitudes/longitudes are stored as scaled integers (multiply by 10⁻⁶ to get degrees). Check whether scanning direction is N→S or S→N (byte 72, scanning mode flags).
-
-### Data Representation (Section 5)
-
-MRMS products typically use one of these packing templates:
-
-**Template 5.0 — Simple Packing (most common for reflectivity)**
-- Reference value R (IEEE 754 float, bytes 12–15)
-- Binary scale factor E (signed 16-bit, bytes 16–17)
-- Decimal scale factor D (signed 16-bit, bytes 18–19)
-- Number of bits per packed value (byte 20)
-- Decode: `value = (R + packed_int * 2^E) / 10^D`
-- Unpack the data section as a bitstream of N-bit unsigned integers
-
-**Template 5.40 — JPEG2000 Packing**
-- Same R, E, D header fields
-- Data section (7) contains a raw JPEG2000 codestream
-- Decode the J2K with Pillow: `Image.open(BytesIO(j2k_bytes))` → numpy array of packed integers
-- Then apply the same `(R + packed * 2^E) / 10^D` formula
-- Pillow ships with openjpeg, so this requires no additional C library
-
-**Template 5.41 — PNG Packing**
-- Same structure as 5.40 but data is a PNG image
-- Decode with Pillow, same formula
-
-### Bitmap (Section 6)
-
-Byte 6 of Section 6 is the bitmap indicator:
-- Value 255 = no bitmap, all grid points have data
-- Value 0 = bitmap follows, one bit per grid point (1 = data present, 0 = missing)
-
-If a bitmap is present, only grid points where the bitmap bit is 1 have corresponding packed values in Section 7. Expand the sparse data back to the full grid, filling missing points with NaN or a sentinel.
-
-### Implementation approach
-
-```
-backend/
-├── grib2/
-│   ├── __init__.py
-│   ├── decoder.py      ← Main entry point: bytes in → (metadata_dict, numpy_array) out
-│   ├── sections.py     ← Parse each section, return structured dicts
-│   ├── packing.py      ← Unpack simple, J2K, and PNG templates
-│   └── bitstream.py    ← Utility for reading N-bit packed integers from a byte buffer
+MRMS uses large negative values (e.g., -999, -99) as sentinels for missing/no-data. These are masked to NaN after decoding:
+```python
+data[data < -30.0] = np.nan
 ```
 
-The decoder should:
-1. Validate the GRIB magic and edition number
-2. Walk sections by reading length + section number at each boundary
-3. Parse sections 3 (grid) and 5 (packing params) into dicts
-4. Decode section 7 using the appropriate unpacker
-5. Apply the scaling formula
-6. Reshape to (Nj, Ni) and handle scanning direction
-7. Return metadata (timestamp, grid bounds, resolution) + a numpy 2D array of dBZ values
-
-**Write tests for the decoder immediately** — download a single MRMS file to `tests/fixtures/` and verify that the decoded output has the expected shape, bounds, and value range. If possible, cross-validate against a known tool (e.g., run `wgrib2 -V` on the same file to get expected metadata, even if we don't use wgrib2 in production).
-
-### What we do NOT need to handle
-- Grid templates other than 3.0 (rotated, polar stereographic, etc.)
-- Packing templates other than 5.0, 5.40, 5.41
-- Multiple messages per file (MRMS uses one message per file)
-- Complex/second-order packing (Template 5.2, 5.3)
-- Spectral data, ensemble metadata, or any other exotic GRIB2 features
-
-If we encounter an unsupported template, fail loudly with a clear error message identifying the template number, rather than producing garbage output.
+The -30 dBZ threshold preserves legitimate weak reflectivity values while catching all known sentinel patterns.
 
 ## Key Constraints & Gotchas
 
 - **MRMS files are gzipped.** Decompress in memory with `gzip.decompress()` before passing to the decoder.
-- **Coordinate system.** MRMS uses lat/lon on a regular grid (not projected). MapLibre uses EPSG:4326 / Web Mercator. The data will need to be mapped to pixel coordinates when rendering.
-- **Data freshness.** Files appear in S3 with ~2-3 min latency from observation time. The latest file might be 2-5 minutes old. That's fine.
-- **File size.** A single CONUS composite reflectivity frame is ~2-3 MB compressed. The NYC clip will be tiny (a few KB).
-- **CORS.** The S3 bucket may not serve CORS headers for browser-direct access. Fetch from the backend, not the browser.
-- **No credentials.** Access the S3 bucket with unsigned requests. Do not configure or require AWS credentials.
-- **Terrain tiles.** The AWS elevation tiles (`elevation-tiles-prod`) are also public and free. No key needed.
-- **Scanning direction.** MRMS grids typically scan left→right, top→bottom (NW corner is first data point). Verify this by checking the scanning mode flags in Section 3 byte 72. If bit 2 is set, rows go S→N and the array needs flipping.
+- **Bucket prefix is uppercase.** Use `CONUS/MergedReflectivityQC_{tilt}/` not `conus/`.
+- **Files are organized by date.** `CONUS/MergedReflectivityQC_00.50/20260405/MRMS_...grib2.gz`
+- **Day boundary spanning.** List files from today, yesterday, and 2 days ago to handle UTC boundaries.
+- **Coordinate system.** MRMS uses lat/lon on a regular 0.01° grid. MapLibre handles EPSG:4326.
+- **Data freshness.** Files appear in S3 with ~2-3 min latency. The latest file may be 2-5 min old.
+- **File size.** A single CONUS tilt frame is ~2-3 MB compressed. The NYC clip is a few KB.
+- **CORS.** S3 bucket does not serve CORS headers. All data flows through the backend.
+- **No credentials.** S3 access uses unsigned requests (`botocore.UNSIGNED`).
+- **Terrain tiles.** AWS `elevation-tiles-prod` is public and free.
+- **Scanning direction.** MRMS grids scan left→right, top→bottom (NW corner first). The decoder checks scanning mode flags and flips the array if needed.
+- **Startup time.** Seeding 60 frames across 8 tilt levels (480 files) takes 1-2 minutes. The server starts accepting requests immediately; the frontend retries on 503.
+- **Thread safety.** `BoundedCache` uses `threading.Lock`. Seeding runs in a daemon thread. Pipeline uses `ThreadPoolExecutor` for concurrent S3 fetches.
 
 ## File Structure
 
 ```
-mrms-radar-prototype/
+weather_radar/
 ├── CLAUDE.md              ← this file
 ├── .env                   ← API keys (not committed)
+├── .env.example           ← template for .env
 ├── .gitignore
 ├── backend/
-│   ├── requirements.txt
-│   ├── main.py            ← FastAPI app
-│   ├── mrms.py            ← MRMS fetch/clip logic, uses grib2 decoder
-│   ├── cache.py           ← Simple in-memory frame cache
+│   ├── requirements.txt   ← production dependencies
+│   ├── requirements-dev.txt ← dev/test dependencies
+│   ├── main.py            ← FastAPI app, routes, lifespan
+│   ├── pipeline.py        ← data pipeline: fetch tilts → composite + voxels
+│   ├── mrms.py            ← S3 client, GRIB2 decode, clip to bbox
+│   ├── cache.py           ← BoundedCache (in-memory, thread-safe)
+│   ├── disk_cache.py      ← on-disk raw + decoded cache, per-tilt layout
+│   ├── render.py          ← grid-to-PNG rendering (NWS color scale)
 │   └── grib2/
 │       ├── __init__.py
-│       ├── decoder.py     ← Entry point: bytes → (metadata, numpy array)
-│       ├── sections.py    ← Section-level parsing
-│       ├── packing.py     ← Simple, J2K, PNG unpackers
+│       ├── decoder.py     ← entry point: bytes → (metadata, numpy array)
+│       ├── sections.py    ← section-level parsing (0–7)
+│       ├── packing.py     ← simple, J2K, PNG unpackers
 │       └── bitstream.py   ← N-bit integer reader utility
 ├── frontend/
-│   ├── index.html         ← Single-page app
-│   ├── style.css
-│   ├── app.js             ← Map init, radar overlay, controls
-│   └── colors.js          ← NWS color scale utilities
+│   ├── index.html         ← single-page app
+│   ├── style.css          ← dark theme, glassmorphism panels
+│   ├── app.js             ← map init, animation, 2D/3D rendering
+│   └── colors.js          ← NWS color scale + legend builder
 ├── tests/
-│   ├── fixtures/          ← One real MRMS GRIB2 file for testing
-│   └── test_decoder.py    ← Verify shape, bounds, value range
-└── scripts/
-    └── test_fetch.py      ← Standalone script to test MRMS data download + decode
+│   ├── __init__.py
+│   ├── fixtures/          ← real MRMS .grib2.gz file (gitignored)
+│   └── test_decoder.py    ← shape, bounds, value range, clip tests
+├── scripts/
+│   └── test_fetch.py      ← standalone download + decode diagnostic
+└── data/                  ← runtime cache (gitignored)
+    ├── raw/{tilt}/        ← raw .grib2.gz files from S3
+    └── decoded/{tilt}/    ← .npy + .json per decoded frame
 ```
 
-## Definition of Done (Phase 1)
+## Running
 
-- [ ] `tests/fixtures/` contains a real MRMS GRIB2 file
-- [ ] `python -m pytest tests/test_decoder.py` passes — decoder produces correct shape, bounds, and value range
-- [ ] Running `python scripts/test_fetch.py` downloads and decodes a live MRMS frame, prints shape and value range
-- [ ] `uvicorn backend.main:app` starts the API server
-- [ ] `GET /api/radar/latest` returns real clipped radar data for NYC
-- [ ] Opening `frontend/index.html` shows a map of NYC with live radar reflectivity overlaid
-- [ ] Radar uses the NWS color scale and has an opacity control
-- [ ] Areas with no radar echo (< 5 dBZ) are fully transparent
-- [ ] The map base layer clearly shows water (Hudson, East River, harbour), land, and urban context
+```bash
+# Install dependencies
+pip install -r backend/requirements.txt
 
-## Definition of Done (Phase 3)
+# Set up API keys (optional — app works without them)
+cp .env.example .env
+# Edit .env to add STADIA_API_KEY or MAPTILER_API_KEY
 
-- [ ] Map renders with 3D terrain — tilting the map shows elevation in the NYC region
-- [ ] Radar overlay drapes correctly over terrain without clipping through hills
-- [ ] Multi-level reflectivity data renders as 3D volumes above the terrain surface
+# Start the server (from project root)
+uvicorn backend.main:app
+
+# Open frontend (served separately, or just open the file)
+open frontend/index.html
+```
+
+The server seeds 60 frames on startup in a background thread. The frontend auto-retries until frames are available (~1-2 minutes).
+
+## Running Tests
+
+```bash
+# Download a test fixture first (if tests/fixtures/ is empty)
+python scripts/test_fetch.py
+
+# Run decoder tests
+pip install -r backend/requirements-dev.txt
+python -m pytest tests/test_decoder.py -v
+```
+
+## Build Plan (remaining)
+
+### Phase 4: Motion-compensated frame interpolation
+
+9. **Backend: Compute motion fields**
+   - Between consecutive cached frames, compute a 2D displacement field (block matching or optical flow)
+   - MRMS also publishes derived storm motion vectors — evaluate whether these are usable directly
+   - Serve motion vectors alongside frame data in `GET /api/radar/frames`
+
+10. **Frontend: Semi-Lagrangian advection**
+    - For each intermediate frame at time t between keyframes t₀ and t₁:
+      - Trace each pixel backward along the motion vector by α to sample from frame t₀
+      - Trace forward from t₁ by (1 - α) to sample from frame t₁
+      - Blend based on temporal proximity
+    - Storms should slide smoothly across the map instead of ghosting/doubling
+    - Fall back to crossfade locally where the motion field has high residual error (cell splits, new development, decay)
+
+## Design Decisions & Learnings
+
+### Why tilt-level data instead of the pre-computed composite
+
+The original plan was to start with `MergedReflectivityQCComposite` (2D) and add `MergedReflectivityQC` (3D) later. We skipped straight to tilt-level data because:
+- One fetch path gives both 2D and 3D output — `nanmax` across tilts produces an equivalent composite
+- Avoids maintaining two separate S3 listing/download paths
+- 3D volume data was the eventual goal anyway
+
+### Why PointCloudLayer instead of ColumnLayer
+
+deck.gl `PointCloudLayer` turned out to work better than `ColumnLayer` for volumetric radar:
+- Each voxel is a single point with a color — simpler data format (just `[lon, lat, alt, dbz]`)
+- Handles irregular sampling (not all cells are active at all levels)
+- Performs well with 100K+ points
+- Vertical exaggeration is just a multiplier on the altitude
+
+### Bounding box size
+
+Expanded from the original tight NYC box (40.4–41.0°N, 74.3–73.6°W) to a wider region (39.44–42.0°N, 75.23–72.67°W) to show enough surrounding area to see weather systems approaching. This roughly covers from Trenton to Hartford, Sandy Hook to the eastern tip of Long Island.
+
+### On-disk cache layout
+
+Originally used a flat `data/grib2_cache/` directory. Migrated to per-tilt subdirectories (`data/raw/00.50/`, `data/decoded/00.50/`, etc.) once we started fetching 8 tilt levels — the flat layout became unmanageable at ~1000+ files. The `disk_cache.py` module includes legacy migration logic.
+
+### Background seeding
+
+The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
