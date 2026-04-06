@@ -19,7 +19,7 @@ import numpy as np
 from . import disk_cache
 from .cache import FrameEntry, composite_cache, volume_cache
 from .grib2.decoder import decode_grib2
-from .mrms import NYC_BBOX, clip_to_bbox, fetch_raw, list_latest_files, mask_sentinel_values
+from .mrms import NYC_BBOX, S3KeyNotFound, clip_to_bbox, fetch_raw, list_latest_files, mask_sentinel_values
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,9 @@ def _fetch_and_decode_tilt(s3_key: str, bbox: dict | None = None) -> tuple[np.nd
         clipped, clipped_meta = clip_to_bbox(grid, metadata, bbox)
         disk_cache.put_decoded(s3_key, clipped, clipped_meta)
         return clipped, clipped_meta
+    except S3KeyNotFound:
+        logger.warning("Not yet available in S3: %s", s3_key)
+        return None
     except Exception:
         logger.exception("Failed to decode %s", s3_key)
         return None
@@ -118,8 +121,8 @@ def _compute_volume_voxels(
         if len(rows) == 0:
             continue
 
-        all_lons.append(west + cols * Di)
-        all_lats.append(north - rows * Dj)
+        all_lons.append(west + Di / 2 + cols * Di)
+        all_lats.append(north - Dj / 2 - rows * Dj)
         all_alts.append(np.full(len(rows), height_m))
         all_dbz.append(grid[rows, cols])
 

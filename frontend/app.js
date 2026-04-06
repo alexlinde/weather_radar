@@ -1,8 +1,9 @@
 /**
  * NYC Weather Radar — Main application with frame animation + 3D volume.
  *
- * Phase 2: fetches 60 recent radar frames and animates them on a MapLibre raster layer.
- * Phase 3: adds 3D terrain and a deck.gl ColumnLayer for volumetric radar columns.
+ * All radar rendering uses deck.gl on top of a MapLibre base map:
+ *   - Composite mode: BitmapLayer (2D reflectivity PNG)
+ *   - 3D Layers mode: PointCloudLayer (volumetric voxels)
  */
 
 const API_BASE = window.location.port === '8000'
@@ -137,54 +138,35 @@ async function fetchFrames() {
   }
 }
 
-// ── Radar layer rendering ─────────────────────────────────────────────────────
+// ── Radar layer rendering (deck.gl for both composite + 3D) ──────────────────
 
-const SOURCE_ID = 'radar-image';
-const LAYER_ID  = 'radar-layer';
-
-function boundsToCoordinates(b) {
-  return [
-    [b.west, b.north],   // NW
-    [b.east, b.north],   // NE
-    [b.east, b.south],   // SE
-    [b.west, b.south],   // SW
-  ];
-}
-
-function ensureRadarLayer(map) {
-  if (map.getSource(SOURCE_ID)) return;
-  const placeholder = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
-  map.addSource(SOURCE_ID, {
-    type: 'image',
-    url: placeholder,
-    coordinates: [[-75.23, 42.0], [-72.67, 42.0], [-72.67, 39.44], [-75.23, 39.44]],
-  });
-  map.addLayer({
-    id: LAYER_ID,
-    type: 'raster',
-    source: SOURCE_ID,
-    paint: {
-      'raster-opacity': userOpacity,
-      'raster-fade-duration': 0,
-      'raster-resampling': 'linear',
+function buildBitmapLayer(frame) {
+  const b = frame.bounds;
+  return new deck.BitmapLayer({
+    id: 'radar-composite',
+    image: frame.imageUrl,
+    bounds: [b.west, b.south, b.east, b.north],
+    opacity: userOpacity,
+    pickable: false,
+    textureParameters: {
+      minFilter: 'linear',
+      magFilter: 'linear',
     },
   });
 }
 
 function showFrame(index) {
-  if (!mapRef || frames.length === 0) return;
-  const map = mapRef;
+  if (!mapRef || !deckOverlay || frames.length === 0) return;
   const frame = frames[index];
   if (!frame) return;
 
-  const coords = boundsToCoordinates(frame.bounds);
-  const src = map.getSource(SOURCE_ID);
-  if (src) {
-    src.updateImage({ url: frame.imageUrl, coordinates: coords });
+  if (viewMode === 'composite') {
+    deckOverlay.setProps({ layers: [buildBitmapLayer(frame)] });
+  } else {
+    showVolumeFrame(index);
   }
 
-  updateBbox(map, frame.bounds);
-  showVolumeFrame(index);
+  updateBbox(mapRef, frame.bounds);
 }
 
 function updateBbox(map, bounds) {
@@ -281,7 +263,7 @@ function updateFrameDisplay() {
 // ── 3D Volume (deck.gl) ───────────────────────────────────────────────────────
 
 let deckOverlay = null;
-let volumeEnabled = false;
+let viewMode = 'composite'; // 'composite' | '3d'
 let verticalExaggeration = 3.0;
 let volumeFrames = [];   // [{timestamp, voxels}] — parallel to frames[]
 const POINT_SIZE_PX = 3;
@@ -313,14 +295,14 @@ function buildPointCloudLayer(voxels, exaggeration) {
 }
 
 function showVolumeFrame(index) {
-  if (!volumeEnabled || !deckOverlay || volumeFrames.length === 0) return;
+  if (viewMode !== '3d' || !deckOverlay || volumeFrames.length === 0) return;
   const vf = volumeFrames[Math.min(index, volumeFrames.length - 1)];
   if (!vf) return;
   deckOverlay.setProps({ layers: [buildPointCloudLayer(vf.voxels, verticalExaggeration)] });
 }
 
 async function fetchVolumeFrames() {
-  if (!volumeEnabled || !deckOverlay) return;
+  if (viewMode !== '3d' || !deckOverlay) return;
   document.getElementById('volume-status').textContent = 'Loading…';
   try {
     const resp = await fetch(
@@ -343,7 +325,7 @@ async function fetchVolumeFrames() {
     volumeFrames = data.frames;
     const totalVoxels = data.frames.reduce((s, f) => s + f.voxels.length, 0);
     document.getElementById('volume-status').textContent =
-      `On · ${data.count} frames · ${(totalVoxels / 1000).toFixed(0)}K pts`;
+      `${data.count} frames · ${(totalVoxels / 1000).toFixed(0)}K pts`;
     showVolumeFrame(currentIndex);
   } catch (err) {
     console.error('Volume frames fetch error:', err);
@@ -354,7 +336,32 @@ async function fetchVolumeFrames() {
 function clearVolumeLayer() {
   volumeFrames = [];
   if (deckOverlay) deckOverlay.setProps({ layers: [] });
-  document.getElementById('volume-status').textContent = 'Off';
+  document.getElementById('volume-status').textContent = '';
+}
+
+async function setViewMode(mode) {
+  if (mode === viewMode) return;
+  viewMode = mode;
+
+  const map = mapRef;
+  if (!map) return;
+
+  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+
+  const rowExag = document.getElementById('row-exaggeration');
+
+  if (mode === 'composite') {
+    map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+    rowExag.style.display = 'none';
+    volumeFrames = [];
+    showFrame(currentIndex);
+  } else {
+    map.easeTo({ pitch: 50, duration: 600 });
+    rowExag.style.display = '';
+    await fetchVolumeFrames();
+  }
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -367,7 +374,7 @@ async function init() {
     style: styleUrl,
     center: [-73.98, 40.75],
     zoom: 10,
-    pitch: 45,
+    pitch: 0,
     bearing: 0,
     attributionControl: true,
   });
@@ -391,7 +398,6 @@ async function init() {
     });
     map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
 
-    ensureRadarLayer(map);
     const ok = await fetchFrames();
     if (ok && frames.length >= 2) {
       play();
@@ -402,7 +408,7 @@ async function init() {
       if (wasPlaying) pause();
       await fetchFrames();
       if (wasPlaying && frames.length >= 2) play();
-      if (volumeEnabled) await fetchVolumeFrames();
+      if (viewMode === '3d') await fetchVolumeFrames();
     }, REFRESH_INTERVAL_MS);
   });
 
@@ -414,9 +420,7 @@ async function init() {
   opacitySlider.addEventListener('input', () => {
     userOpacity = parseFloat(opacitySlider.value);
     opacityValue.textContent = Math.round(userOpacity * 100) + '%';
-    if (map.getLayer(LAYER_ID)) {
-      map.setPaintProperty(LAYER_ID, 'raster-opacity', userOpacity);
-    }
+    if (viewMode === 'composite') showFrame(currentIndex);
   });
 
   // ── Play / Pause ────────────────────────────────────────────────────────
@@ -440,18 +444,10 @@ async function init() {
     frameInterval = parseInt(e.target.value, 10);
   });
 
-  // ── 3D Volume toggle ────────────────────────────────────────────────────
+  // ── View mode segmented control ──────────────────────────────────────────
 
-  document.getElementById('toggle-volume').addEventListener('change', async (e) => {
-    volumeEnabled = e.target.checked;
-    const rowExag = document.getElementById('row-exaggeration');
-    if (volumeEnabled) {
-      rowExag.style.display = '';
-      await fetchVolumeFrames();
-    } else {
-      rowExag.style.display = 'none';
-      clearVolumeLayer();
-    }
+  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
   });
 
   // ── Vertical exaggeration ───────────────────────────────────────────────
@@ -459,8 +455,7 @@ async function init() {
   document.getElementById('exag-slider').addEventListener('input', (e) => {
     verticalExaggeration = parseFloat(e.target.value);
     document.getElementById('exag-value').textContent = `${verticalExaggeration}x`;
-    // Re-render current frame at new scale — no network request needed
-    if (volumeEnabled) showVolumeFrame(currentIndex);
+    if (viewMode === '3d') showVolumeFrame(currentIndex);
   });
 
   // ── Refresh button ──────────────────────────────────────────────────────
@@ -470,13 +465,14 @@ async function init() {
     if (wasPlaying) pause();
     await fetchFrames();
     if (wasPlaying && frames.length >= 2) play();
-    if (volumeEnabled) await fetchVolumeFrames();
+    if (viewMode === '3d') await fetchVolumeFrames();
   });
 
   // ── Reset view ──────────────────────────────────────────────────────────
 
   document.getElementById('btn-reset-view').addEventListener('click', () => {
-    map.flyTo({ center: [-73.98, 40.75], zoom: 10, pitch: 45, bearing: 0, duration: 800 });
+    const pitch = viewMode === '3d' ? 50 : 0;
+    map.flyTo({ center: [-73.98, 40.75], zoom: 10, pitch, bearing: 0, duration: 800 });
   });
 
   // ── Legend ──────────────────────────────────────────────────────────────

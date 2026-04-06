@@ -37,16 +37,16 @@
       />
     </div>
 
-    <!-- 3D Volume toggle -->
+    <!-- View mode: Composite (2D) vs 3D -->
     <div class="control-row">
       <div class="control-label">
-        <label for="toggle-volume">3D Volume</label>
-        <span id="volume-status" class="volume-status-label">Off</span>
+        <span>View</span>
+        <span id="volume-status" class="volume-status-label"></span>
       </div>
-      <label class="toggle-switch">
-        <input type="checkbox" id="toggle-volume" />
-        <span class="toggle-track"></span>
-      </label>
+      <div class="seg-control" id="view-mode-seg">
+        <button class="seg-btn active" data-mode="composite">Composite</button>
+        <button class="seg-btn" data-mode="3d">3D Layers</button>
+      </div>
     </div>
 
     <!-- Vertical exaggeration (shown only when 3D is on) -->

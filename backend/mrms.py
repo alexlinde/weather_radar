@@ -72,10 +72,15 @@ def list_latest_files(product: str, count: int = 10) -> list[str]:
     return all_keys[:count]
 
 
+class S3KeyNotFound(Exception):
+    """Raised when an S3 key does not exist (yet)."""
+
+
 def fetch_raw(s3_key: str) -> bytes:
     """
     Get raw compressed .grib2.gz bytes for a key.
     Checks disk cache first, falls back to S3 download.
+    Raises S3KeyNotFound if the key doesn't exist in the bucket.
     """
     cached = disk_cache.get(s3_key)
     if cached is not None:
@@ -83,7 +88,10 @@ def fetch_raw(s3_key: str) -> bytes:
 
     logger.info("Downloading s3://%s/%s", BUCKET, s3_key)
     s3 = _s3_client()
-    response = s3.get_object(Bucket=BUCKET, Key=s3_key)
+    try:
+        response = s3.get_object(Bucket=BUCKET, Key=s3_key)
+    except s3.exceptions.NoSuchKey:
+        raise S3KeyNotFound(s3_key)
     compressed = response["Body"].read()
     logger.info("Downloaded %d bytes", len(compressed))
 
@@ -133,10 +141,10 @@ def clip_to_bbox(
 
     clipped = data[row_start:row_end, col_start:col_end]
 
-    clipped_north = north - row_start * Dj
-    clipped_south = north - (row_end - 1) * Dj
-    clipped_west = west + col_start * Di
-    clipped_east = west + (col_end - 1) * Di
+    clipped_north = north - row_start * Dj + Dj / 2
+    clipped_south = north - (row_end - 1) * Dj - Dj / 2
+    clipped_west = west + col_start * Di - Di / 2
+    clipped_east = west + (col_end - 1) * Di + Di / 2
 
     clipped_meta = {
         **metadata,
