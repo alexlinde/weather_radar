@@ -2,8 +2,9 @@
 FastAPI backend for the Weather Radar viewer.
 
 Endpoints:
-    GET /api/radar/tiles/{ts}/{z}/{x}/{y}.png        — 2D composite tile
-    GET /api/radar/volume/tiles/{ts}/{z}/{x}/{y}.json — 3D voxel tile
+    GET /api/radar/tiles/{ts}/{z}/{x}/{y}.png        — 2D composite tile (legacy)
+    GET /api/radar/volume/tiles/{ts}/{z}/{x}/{y}.bin  — single-frame binary voxel tile
+    GET /api/radar/volume/bulk/{z}/{x}/{y}.bin        — ALL frames' voxels for a tile
     GET /api/radar/timestamps                        — available timestamps
     GET /api/radar/refresh                           — force re-seed
     GET /api/config                                  — frontend map config
@@ -16,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import struct
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -41,6 +43,9 @@ except ImportError:
 # ── Lifespan: migrate legacy cache, evict stale files, seed frames ───────────
 
 
+DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("1", "true", "yes")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import threading
@@ -49,15 +54,19 @@ async def lifespan(app: FastAPI):
     disk_cache.migrate_legacy_cache()
     disk_cache.evict_older_than(hours=24)
 
-    def _bg_seed():
-        try:
-            n = pipeline.seed_frames(60)
-            logger.info("Seeding complete: %d timestamps cached", n)
-        except Exception:
-            logger.exception("Frame seeding failed")
+    if DEV_MODE:
+        n = pipeline.warm_from_disk(limit=20)
+        logger.info("DEV_MODE: warmed %d frames from disk cache (no S3 fetch)", n)
+    else:
+        def _bg_seed():
+            try:
+                n = pipeline.seed_frames(60)
+                logger.info("Seeding complete: %d timestamps cached", n)
+            except Exception:
+                logger.exception("Frame seeding failed")
 
-    threading.Thread(target=_bg_seed, daemon=True, name="cache-seed").start()
-    logger.info("Cache seeding started in background — server ready")
+        threading.Thread(target=_bg_seed, daemon=True, name="cache-seed").start()
+        logger.info("Cache seeding started in background — server ready")
 
     yield
 
@@ -196,6 +205,65 @@ def radar_voxel_tile_bin(
     )
 
 
+# ── Bulk voxel tiles (all frames in one response) ────────────────────────────
+
+
+MAX_FRAMES = 20
+
+
+@app.get("/api/radar/volume/bulk/{z}/{x}/{y}.bin")
+def radar_voxel_bulk(z: int, x: int, y: int):
+    """Serve ALL frames' voxels for a tile coordinate in one binary response.
+
+    Format: [uint16 frame_count][per-frame: existing binary tile format]
+    Each frame block is [uint32 count][float32 positions[3*N]][uint8 colors[4*N]].
+    GZip middleware compresses the response (~80-90% reduction).
+    """
+    from .cache import tilt_cache
+    from .tiles import (
+        MAX_ZOOM, MIN_ZOOM,
+        bin_tile_cache, render_voxel_tile_binary,
+    )
+    from . import disk_cache
+
+    if z < MIN_ZOOM or z > MAX_ZOOM:
+        raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
+
+    entries = disk_cache.list_tilt_grid_timestamps()
+    entries = entries[-MAX_FRAMES:]
+
+    if not entries:
+        raise HTTPException(
+            status_code=503,
+            detail="No frames cached yet — server is still seeding",
+        )
+
+    frame_chunks: list[bytes] = []
+    for entry in entries:
+        ts = entry["timestamp"]
+        cache_key = (ts, z, x, y)
+        cached = bin_tile_cache.get(cache_key)
+
+        if cached is None:
+            tilt_entry = tilt_cache.get(ts)
+            if tilt_entry is None:
+                cached = struct.pack("<I", 0)
+            else:
+                cached = render_voxel_tile_binary(
+                    tilt_entry["grids"], tilt_entry["meta"], z, x, y,
+                )
+                bin_tile_cache.put(cache_key, cached)
+
+        frame_chunks.append(cached)
+
+    header = struct.pack("<H", len(frame_chunks))
+    return Response(
+        content=header + b"".join(frame_chunks),
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=120"},
+    )
+
+
 # ── Timestamps ───────────────────────────────────────────────────────────────
 
 
@@ -210,6 +278,7 @@ def radar_timestamps():
             status_code=503,
             detail="No frames cached yet — server is still seeding",
         )
+    entries = entries[-MAX_FRAMES:]
     return {"timestamps": entries, "count": len(entries)}
 
 

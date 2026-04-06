@@ -131,6 +131,71 @@ def _build_frame(ref_key: str, pool=None) -> tuple[str, dict[str, sp.csr_matrix]
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
+def _conus_tile_coords(z: int = 4) -> list[tuple[int, int, int]]:
+    """Return (z, x, y) tile coords covering CONUS at the given zoom level."""
+    import math
+    n = 2 ** z
+    lon_min, lon_max = -130.0, -60.0
+    lat_min, lat_max = 22.0, 52.0
+    x_min = max(0, int((lon_min + 180) / 360 * n))
+    x_max = min(n - 1, int((lon_max + 180) / 360 * n))
+    rad_max = math.radians(lat_max)
+    rad_min = math.radians(lat_min)
+    y_min = max(0, int((1 - math.log(math.tan(rad_max) + 1 / math.cos(rad_max)) / math.pi) / 2 * n))
+    y_max = min(n - 1, int((1 - math.log(math.tan(rad_min) + 1 / math.cos(rad_min)) / math.pi) / 2 * n))
+    return [(z, x, y) for x in range(x_min, x_max + 1) for y in range(y_min, y_max + 1)]
+
+
+def warm_from_disk(limit: int = 20) -> int:
+    """Load the most recent frames from disk into the in-memory cache.
+
+    Skips all S3 fetching — useful for dev mode when you already have
+    cached data and don't want to wait for a full re-seed.
+    Also pre-extracts binary voxel tiles for CONUS z=4 so the bulk
+    endpoint serves instantly on first request.
+    """
+    from .tiles import bin_tile_cache, render_voxel_tile_binary
+
+    entries = disk_cache.list_tilt_grid_timestamps()
+    if not entries:
+        logger.warning("No frames on disk — nothing to warm")
+        return 0
+
+    recent = entries[-limit:]
+    loaded = 0
+    for entry in recent:
+        ts = entry["timestamp"]
+        result = disk_cache.get_tilt_grids(ts)
+        if result is None:
+            continue
+        grids, meta = result
+        tilt_cache.put(ts, grids, meta)
+        loaded += 1
+
+    logger.info("Warmed %d/%d frames from disk into memory", loaded, len(recent))
+
+    tile_coords = _conus_tile_coords(z=4)
+    prerendered = 0
+    for entry in recent:
+        ts = entry["timestamp"]
+        tilt_entry = tilt_cache.get(ts)
+        if tilt_entry is None:
+            continue
+        for z, x, y in tile_coords:
+            cache_key = (ts, z, x, y)
+            if bin_tile_cache.get(cache_key) is not None:
+                continue
+            data = render_voxel_tile_binary(
+                tilt_entry["grids"], tilt_entry["meta"], z, x, y,
+            )
+            bin_tile_cache.put(cache_key, data)
+            prerendered += 1
+
+    logger.info("Pre-rendered %d voxel tiles (%d tiles × %d frames)",
+                prerendered, len(tile_coords), loaded)
+    return loaded
+
+
 def seed_frames(count: int = 60) -> int:
     """Pre-fetch and cache tilt grids for the most recent timestamps.
 

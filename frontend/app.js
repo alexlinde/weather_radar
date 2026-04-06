@@ -1,26 +1,20 @@
 /**
- * Weather Radar — Main application with tile-based radar rendering.
+ * Weather Radar — Unified voxel architecture with GPU-based frame filtering.
  *
- * Both 2D composite and 3D voxel modes use deck.gl TileLayer for
- * viewport-based lazy loading. deck.gl manages tile lifecycle,
- * request cancellation (AbortSignal), and viewport culling.
- *
- * Modes:
- *   - Composite: TileLayer → BitmapLayer per tile (2D reflectivity PNG)
- *   - 3D Layers: TileLayer → PointCloudLayer per tile (volumetric voxels)
+ * All radar data (both 2D and 3D views) is loaded once into GPU buffers.
+ * Frame animation uses deck.gl DataFilterExtension — changing the visible
+ * frame only updates a single GPU uniform (filterRange), achieving the same
+ * zero-cost scrubbing pattern as the deck.gl animated arc demo.
  */
 
 const API_BASE = '';
-const FRAME_COUNT = 60;
 const REFRESH_INTERVAL_MS = 120_000;
 const MAX_503_RETRIES = 24;
 const TILE_MIN_ZOOM = 3;
 const TILE_MAX_ZOOM = 8;
-const VOXEL_MIN_ZOOM = 4;
-const POINT_SIZE_PX = 4;
-const PREFETCH_LOOKAHEAD = 1;
-const MAX_PREFETCH_TILES = 20;
-const DELTA_UNCHANGED = 0xFFFFFFFF;
+const POINT_SIZE_2D = 6;
+const POINT_SIZE_3D = 4;
+const VIEWPORT_REFETCH_DEBOUNCE_MS = 400;
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -53,7 +47,19 @@ let userOpacity = 0.8;
 let fetchAbort = null;
 let timestampFetchRetries = 0;
 let refreshIntervalId = null;
-let prevTimestamp = null;
+
+// ── Voxel data state ──────────────────────────────────────────────────────────
+
+let deckOverlay = null;
+let viewMode = 'composite';
+let verticalExaggeration = 3.0;
+
+// The combined GPU buffer data — set once after bulk fetch, stable reference
+let voxelLayerData = null;
+// Raw positions before vertical exaggeration (for re-scaling)
+let rawPositions = null;
+let currentBulkZoom = null;
+let bulkFetchController = null;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 
@@ -113,7 +119,6 @@ async function fetchTimestamps() {
 
     updateScrubber();
     updateFrameDisplay();
-    showFrame(currentIndex);
 
     const newest = timestamps[timestamps.length - 1];
     setStatus('', `Latest: ${formatTimestampFull(newest?.timestamp)} ET`);
@@ -127,20 +132,13 @@ async function fetchTimestamps() {
   }
 }
 
-// ── Adaptive quality ──────────────────────────────────────────────────────────
-
-function getEffectiveMaxZoom() {
-  return playing ? TILE_MAX_ZOOM - 1 : TILE_MAX_ZOOM;
-}
-
-// ── Prefetch buffer ──────────────────────────────────────────────────────────
+// ── Tile coordinate computation ───────────────────────────────────────────────
 
 function getVisibleTileCoords() {
   if (!mapRef) return [];
   const bounds = mapRef.getBounds();
   const zoom = Math.round(mapRef.getZoom());
-  const minZ = viewMode === 'composite' ? TILE_MIN_ZOOM : VOXEL_MIN_ZOOM;
-  const z = Math.max(minZ, Math.min(getEffectiveMaxZoom(), zoom));
+  const z = Math.max(TILE_MIN_ZOOM, Math.min(TILE_MAX_ZOOM, zoom));
   const n = 2 ** z;
   const xMin = Math.max(0, Math.floor((bounds.getWest() + 180) / 360 * n));
   const xMax = Math.min(n - 1, Math.floor((bounds.getEast() + 180) / 360 * n));
@@ -159,183 +157,155 @@ function getVisibleTileCoords() {
   return coords;
 }
 
-let lastPrefetchedIndex = -1;
+// ── Bulk voxel fetch + combined buffer builder ────────────────────────────────
 
-function prefetchFrames(fromIndex) {
-  if (timestamps.length === 0) return;
-  const nextIdx = (fromIndex + 1) % timestamps.length;
-  if (nextIdx === lastPrefetchedIndex) return;
-  lastPrefetchedIndex = nextIdx;
-
+async function bulkFetchVoxels() {
   const tiles = getVisibleTileCoords();
-  if (tiles.length === 0) return;
+  if (tiles.length === 0 || timestamps.length === 0) return;
 
-  const ts = timestamps[nextIdx];
-  if (!ts) return;
-  const enc = encodeURIComponent(ts.timestamp);
-  const subset = tiles.slice(0, MAX_PREFETCH_TILES);
+  const z = tiles[0].z;
+  if (z === currentBulkZoom && voxelLayerData) return;
 
-  for (const { z, x, y } of subset) {
-    const url = viewMode === 'composite'
-      ? `${API_BASE}/api/radar/tiles/${enc}/${z}/${x}/${y}.png`
-      : `${API_BASE}/api/radar/volume/tiles/${enc}/${z}/${x}/${y}.bin`;
-    fetch(url, { cache: 'force-cache' }).catch(() => {});
-  }
-}
+  if (bulkFetchController) bulkFetchController.abort();
+  bulkFetchController = new AbortController();
+  const signal = bulkFetchController.signal;
 
-// ── Binary tile parsing ──────────────────────────────────────────────────────
+  setStatus('loading', 'Loading radar data…');
 
-const rawTileCache = new Map();
-const RAW_TILE_CACHE_MAX = 4000;
-
-function parseBinaryTile(buffer, exag) {
-  const view = new DataView(buffer);
-  const count = view.getUint32(0, true);
-  if (count === 0 || count === DELTA_UNCHANGED) return null;
-
-  const rawPositions = new Float32Array(buffer, 4, count * 3);
-  const positions = new Float32Array(rawPositions);
-  for (let i = 2; i < positions.length; i += 3) {
-    positions[i] *= exag;
-  }
-  const colors = new Uint8ClampedArray(
-    buffer.slice(4 + count * 12, 4 + count * 12 + count * 4)
-  );
-  return {
-    length: count,
-    attributes: {
-      getPosition: { value: positions, size: 3 },
-      getColor: { value: colors, size: 4 },
-    },
-  };
-}
-
-function cacheTileBuffer(key, buffer) {
-  rawTileCache.set(key, buffer);
-  if (rawTileCache.size > RAW_TILE_CACHE_MAX) {
-    const oldest = rawTileCache.keys().next().value;
-    rawTileCache.delete(oldest);
-  }
-}
-
-// ── 2D Composite tile layer ──────────────────────────────────────────────────
-
-function buildTileLayer(timestamp) {
-  const maxZ = getEffectiveMaxZoom();
-  const tileUrl = `${API_BASE}/api/radar/tiles/${encodeURIComponent(timestamp)}/{z}/{x}/{y}.png`;
-  return new deck.TileLayer({
-    id: 'radar-tiles',
-    data: tileUrl,
-    minZoom: TILE_MIN_ZOOM,
-    maxZoom: maxZ,
-    tileSize: 256,
-    opacity: userOpacity,
-    loadOptions: { fetch: { cache: 'force-cache' } },
-    renderSubLayers: props => {
-      const { west, south, east, north } = props.tile.bbox;
-      return new deck.BitmapLayer(props, {
-        data: null,
-        image: props.data,
-        bounds: [west, south, east, north],
-        textureParameters: {
-          minFilter: 'linear',
-          magFilter: 'linear',
-        },
-      });
-    },
-  });
-}
-
-// ── 3D Voxel tile layer ─────────────────────────────────────────────────────
-
-let deckOverlay = null;
-let viewMode = 'composite';
-let verticalExaggeration = 3.0;
-
-function dbzToRgba(dbz) {
-  const bands = NWS_DBZ_COLORS;
-  const alpha = Math.min(255, Math.max(100, Math.round(100 + (dbz - 10) * (155 / 50))));
-  for (const band of bands) {
-    if (dbz >= band.min && dbz < band.max) return [band.r, band.g, band.b, alpha];
-  }
-  if (dbz >= 65) return [200, 200, 255, 255];
-  return [0, 0, 0, 0];
-}
-
-function buildVoxelTileLayer(timestamp, baseTimestamp) {
-  const exag = verticalExaggeration;
-  const maxZ = getEffectiveMaxZoom();
-  const enc = encodeURIComponent(timestamp);
-  const tileUrl = `${API_BASE}/api/radar/volume/tiles/${enc}/{z}/{x}/{y}.bin`;
-  return new deck.TileLayer({
-    id: 'radar-volume-tiles',
-    data: tileUrl,
-    minZoom: VOXEL_MIN_ZOOM,
-    maxZoom: maxZ,
-    tileSize: 256,
-    getTileData: (tile) => {
-      const { x, y, z } = tile.index;
-      let url = `${API_BASE}/api/radar/volume/tiles/${enc}/${z}/${x}/${y}.bin`;
-      if (baseTimestamp) {
-        url += `?base=${encodeURIComponent(baseTimestamp)}`;
-      }
-      return fetch(url, { signal: tile.signal, cache: baseTimestamp ? 'default' : 'force-cache' })
-        .then(res => {
-          if (!res.ok) return null;
-          return res.arrayBuffer();
-        })
-        .then(buffer => {
-          if (!buffer) return null;
-          const count = new DataView(buffer).getUint32(0, true);
-          const key = `${z}/${x}/${y}`;
-
-          if (count === DELTA_UNCHANGED) {
-            const prev = rawTileCache.get(key);
-            return prev ? parseBinaryTile(prev, exag) : null;
-          }
-
-          cacheTileBuffer(key, buffer);
-          return parseBinaryTile(buffer, exag);
-        })
+  try {
+    const fetches = tiles.map(({ z, x, y }) =>
+      fetch(`${API_BASE}/api/radar/volume/bulk/${z}/${x}/${y}.bin`, { signal })
+        .then(r => r.ok ? r.arrayBuffer() : null)
         .catch(err => {
-          if (err.name === 'AbortError') return null;
-          console.warn('Voxel tile fetch error:', err);
+          if (err.name === 'AbortError') throw err;
+          console.warn('Bulk fetch error:', err);
           return null;
-        });
-    },
-    renderSubLayers: props => {
-      if (!props.data?.length) return null;
-      return new deck.PointCloudLayer({
-        id: `${props.id}-points`,
-        data: props.data,
-        getPosition: { value: props.data.attributes.getPosition.value, size: 3 },
-        getColor: { value: props.data.attributes.getColor.value, size: 4 },
-        pointSize: POINT_SIZE_PX,
-        sizeUnits: 'pixels',
-        opacity: 0.9,
-        pickable: false,
-        material: false,
-        parameters: { depthTest: true },
-      });
+        })
+    );
+
+    const buffers = await Promise.all(fetches);
+
+    const allPositions = [];
+    const allColors = [];
+    const allFrameIndices = [];
+    let totalVoxels = 0;
+
+    for (const buffer of buffers) {
+      if (!buffer) continue;
+      const view = new DataView(buffer);
+      const frameCount = view.getUint16(0, true);
+      let offset = 2;
+
+      for (let fi = 0; fi < frameCount; fi++) {
+        if (offset + 4 > buffer.byteLength) break;
+        const count = view.getUint32(offset, true);
+        offset += 4;
+        if (count === 0) continue;
+        if (count === 0xFFFFFFFF) continue;
+
+        const posBytes = count * 3 * 4;
+        const colorBytes = count * 4;
+        if (offset + posBytes + colorBytes > buffer.byteLength) break;
+
+        const positions = new Float32Array(buffer.slice(offset, offset + posBytes));
+        offset += posBytes;
+        const colors = new Uint8ClampedArray(buffer.slice(offset, offset + colorBytes));
+        offset += colorBytes;
+
+        allPositions.push(positions);
+        allColors.push(colors);
+        allFrameIndices.push(new Float32Array(count).fill(fi));
+        totalVoxels += count;
+      }
+    }
+
+    if (totalVoxels === 0) {
+      voxelLayerData = null;
+      rawPositions = null;
+      currentBulkZoom = z;
+      showFrame(currentIndex);
+      setStatus('', 'No radar data in view');
+      return;
+    }
+
+    const combinedPositions = new Float32Array(totalVoxels * 3);
+    const combinedColors = new Uint8ClampedArray(totalVoxels * 4);
+    const combinedFrameIndices = new Float32Array(totalVoxels);
+
+    let posOff = 0, colOff = 0, idxOff = 0;
+    for (let i = 0; i < allPositions.length; i++) {
+      combinedPositions.set(allPositions[i], posOff);
+      posOff += allPositions[i].length;
+      combinedColors.set(allColors[i], colOff);
+      colOff += allColors[i].length;
+      combinedFrameIndices.set(allFrameIndices[i], idxOff);
+      idxOff += allFrameIndices[i].length;
+    }
+
+    rawPositions = new Float32Array(combinedPositions);
+    applyVerticalExaggeration(combinedPositions, verticalExaggeration);
+
+    voxelLayerData = {
+      length: totalVoxels,
+      attributes: {
+        getPosition: { value: combinedPositions, size: 3 },
+        getColor: { value: combinedColors, size: 4 },
+        getFilterValue: { value: combinedFrameIndices, size: 1 },
+      },
+    };
+
+    currentBulkZoom = z;
+    console.log(`Loaded ${totalVoxels.toLocaleString()} voxels across ${timestamps.length} frames (${(totalVoxels * 17 / 1e6).toFixed(1)} MB)`);
+
+    showFrame(currentIndex);
+
+    const newest = timestamps[timestamps.length - 1];
+    setStatus('', `Latest: ${formatTimestampFull(newest?.timestamp)} ET`);
+
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    console.error('Bulk voxel fetch failed:', err);
+    setStatus('error', 'Failed to load radar data');
+  }
+}
+
+function applyVerticalExaggeration(positions, exag) {
+  for (let i = 2; i < positions.length; i += 3) {
+    positions[i] = rawPositions[i] * exag;
+  }
+}
+
+// ── Radar layer builder ───────────────────────────────────────────────────────
+
+const dataFilterExt = new deck.DataFilterExtension({ filterSize: 1 });
+
+function buildRadarLayer(frameIndex) {
+  if (!voxelLayerData) return null;
+
+  const is2D = viewMode === 'composite';
+  return new deck.PointCloudLayer({
+    id: 'radar-voxels',
+    data: voxelLayerData,
+    pointSize: is2D ? POINT_SIZE_2D : POINT_SIZE_3D,
+    sizeUnits: 'pixels',
+    opacity: userOpacity,
+    material: false,
+    pickable: false,
+    parameters: { depthTest: !is2D },
+    extensions: [dataFilterExt],
+    filterRange: [frameIndex - 0.5, frameIndex + 0.5],
+    updateTriggers: {
+      getPosition: verticalExaggeration,
     },
   });
 }
 
-// ── Frame display ────────────────────────────────────────────────────────────
+// ── Frame display ─────────────────────────────────────────────────────────────
 
 function showFrame(index) {
-  if (!mapRef || !deckOverlay || timestamps.length === 0) return;
-  const ts = timestamps[index];
-  if (!ts) return;
-
-  if (viewMode === 'composite') {
-    deckOverlay.setProps({ layers: [buildTileLayer(ts.timestamp)] });
-  } else {
-    deckOverlay.setProps({
-      layers: [buildVoxelTileLayer(ts.timestamp, prevTimestamp)],
-    });
-  }
-  prevTimestamp = ts.timestamp;
+  if (!mapRef || !deckOverlay) return;
+  const layer = buildRadarLayer(index);
+  deckOverlay.setProps({ layers: layer ? [layer] : [] });
 }
 
 // ── Animation loop ────────────────────────────────────────────────────────────
@@ -348,7 +318,6 @@ function animationTick(now) {
     currentIndex = (currentIndex + 1) % timestamps.length;
     showFrame(currentIndex);
     updateFrameDisplay();
-    prefetchFrames(currentIndex);
   }
 
   animationId = requestAnimationFrame(animationTick);
@@ -360,7 +329,6 @@ function play() {
   lastFrameTime = performance.now();
   document.getElementById('icon-play').style.display = 'none';
   document.getElementById('icon-pause').style.display = '';
-  prefetchFrames(currentIndex);
   animationId = requestAnimationFrame(animationTick);
 }
 
@@ -425,6 +393,22 @@ function setViewMode(mode) {
   showFrame(currentIndex);
 }
 
+// ── Viewport change handler ───────────────────────────────────────────────────
+
+let viewportDebounceTimer = null;
+
+function onViewportChange() {
+  if (viewportDebounceTimer) clearTimeout(viewportDebounceTimer);
+  viewportDebounceTimer = setTimeout(() => {
+    if (!mapRef) return;
+    const zoom = Math.round(mapRef.getZoom());
+    const z = Math.max(TILE_MIN_ZOOM, Math.min(TILE_MAX_ZOOM, zoom));
+    if (z !== currentBulkZoom) {
+      bulkFetchVoxels();
+    }
+  }, VIEWPORT_REFETCH_DEBOUNCE_MS);
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
@@ -458,17 +442,27 @@ async function init() {
     map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
 
     const ok = await fetchTimestamps();
-    if (ok && timestamps.length >= 2) {
-      play();
+    if (ok && timestamps.length > 0) {
+      await bulkFetchVoxels();
+      if (timestamps.length >= 2) {
+        play();
+      }
     }
 
     refreshIntervalId = setInterval(async () => {
       const wasPlaying = playing;
       if (wasPlaying) pause();
+      currentBulkZoom = null;
+      voxelLayerData = null;
       await fetchTimestamps();
+      if (timestamps.length > 0) {
+        await bulkFetchVoxels();
+      }
       if (wasPlaying && timestamps.length >= 2) play();
     }, REFRESH_INTERVAL_MS);
   });
+
+  map.on('moveend', onViewportChange);
 
   // ── Opacity slider ──────────────────────────────────────────────────────
 
@@ -478,7 +472,7 @@ async function init() {
   opacitySlider.addEventListener('input', () => {
     userOpacity = parseFloat(opacitySlider.value);
     opacityValue.textContent = Math.round(userOpacity * 100) + '%';
-    if (viewMode === 'composite') showFrame(currentIndex);
+    showFrame(currentIndex);
   });
 
   // ── Play / Pause ────────────────────────────────────────────────────────
@@ -488,13 +482,11 @@ async function init() {
   // ── Frame scrubber ──────────────────────────────────────────────────────
 
   const scrubber = document.getElementById('frame-scrubber');
-  let scrubTimer = null;
   scrubber.addEventListener('input', () => {
     if (playing) pause();
     currentIndex = parseInt(scrubber.value, 10);
     updateFrameDisplay();
-    if (scrubTimer) clearTimeout(scrubTimer);
-    scrubTimer = setTimeout(() => showFrame(currentIndex), 150);
+    showFrame(currentIndex);
   });
 
   // ── Speed select ────────────────────────────────────────────────────────
@@ -514,7 +506,10 @@ async function init() {
   document.getElementById('exag-slider').addEventListener('input', (e) => {
     verticalExaggeration = parseFloat(e.target.value);
     document.getElementById('exag-value').textContent = `${verticalExaggeration}x`;
-    if (viewMode === '3d') showFrame(currentIndex);
+    if (voxelLayerData && rawPositions) {
+      applyVerticalExaggeration(voxelLayerData.attributes.getPosition.value, verticalExaggeration);
+      showFrame(currentIndex);
+    }
   });
 
   // ── Refresh button ──────────────────────────────────────────────────────
@@ -522,7 +517,12 @@ async function init() {
   document.getElementById('btn-refresh').addEventListener('click', async () => {
     const wasPlaying = playing;
     if (wasPlaying) pause();
+    currentBulkZoom = null;
+    voxelLayerData = null;
     await fetchTimestamps();
+    if (timestamps.length > 0) {
+      await bulkFetchVoxels();
+    }
     if (wasPlaying && timestamps.length >= 2) play();
   });
 
