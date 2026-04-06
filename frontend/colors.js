@@ -22,28 +22,13 @@ const NWS_DBZ_COLORS = [
 ];
 
 /**
- * Map a dBZ value to an [r, g, b, a] array (0–255 each).
- * Returns [0,0,0,0] for values below 5 dBZ or null/undefined.
- */
-function dbzToColor(dbz) {
-  if (dbz == null || isNaN(dbz) || dbz < 5) return [0, 0, 0, 0];
-  for (const band of NWS_DBZ_COLORS) {
-    if (dbz >= band.min && dbz < band.max) {
-      return [band.r, band.g, band.b, 220];
-    }
-  }
-  // Above highest band
-  return [200, 200, 255, 220];
-}
-
-/**
  * Build the legend DOM entries — call once on page load.
  * @param {HTMLElement} container
  */
 function buildLegend(container) {
   const bands = [
     ...NWS_DBZ_COLORS,
-    { min: 65, max: Infinity, r: 200, g: 200, b: 255 },
+    { min: 75, max: Infinity, r: 200, g: 200, b: 255 },
   ];
   container.innerHTML = '';
   for (const band of bands) {

@@ -5,9 +5,12 @@
  * Phase 3: adds 3D terrain and a deck.gl ColumnLayer for volumetric radar columns.
  */
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = window.location.port === '8000'
+  ? ''
+  : `${window.location.protocol}//${window.location.hostname}:8000`;
 const FRAME_COUNT = 60;
 const REFRESH_INTERVAL_MS = 120_000;
+const MAX_503_RETRIES = 24; // ~2 minutes at 5s intervals
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -23,7 +26,7 @@ async function resolveMapStyle() {
         return `https://api.maptiler.com/maps/outdoor-v2/style.json?key=${cfg.maptiler_api_key}`;
       }
     }
-  } catch (_) { /* ignore */ }
+  } catch (err) { console.warn('Could not load map config, using fallback:', err.message); }
   return 'https://tiles.openfreemap.org/styles/liberty';
 }
 
@@ -37,6 +40,10 @@ let lastFrameTime = 0;
 let animationId = null;
 let mapRef = null;
 let userOpacity = 0.8;
+let fetchAbort = null;
+let frameFetchRetries = 0;
+let volumeFetchRetries = 0;
+let refreshIntervalId = null;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 
@@ -77,14 +84,26 @@ function preloadImage(dataUri) {
 }
 
 async function fetchFrames() {
+  if (fetchAbort) fetchAbort.abort();
+  fetchAbort = new AbortController();
+
   setStatus('loading', 'Loading frames…');
   try {
-    const resp = await fetch(`${API_BASE}/api/radar/frames?count=${FRAME_COUNT}`, { cache: 'no-store' });
+    const resp = await fetch(
+      `${API_BASE}/api/radar/frames?count=${FRAME_COUNT}`,
+      { cache: 'no-store', signal: fetchAbort.signal },
+    );
     if (resp.status === 503) {
-      setStatus('loading', 'Server seeding cache…');
-      setTimeout(fetchFrames, 5_000);
+      frameFetchRetries++;
+      if (frameFetchRetries < MAX_503_RETRIES) {
+        setStatus('loading', 'Server seeding cache…');
+        setTimeout(fetchFrames, 5_000);
+      } else {
+        setStatus('error', 'Server unavailable — try refreshing');
+      }
       return false;
     }
+    frameFetchRetries = 0;
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
 
@@ -111,6 +130,7 @@ async function fetchFrames() {
 
     return true;
   } catch (err) {
+    if (err.name === 'AbortError') return false;
     console.error('Frame fetch error:', err);
     setStatus('error', `Error: ${err.message}`);
     return false;
@@ -286,7 +306,7 @@ function buildPointCloudLayer(voxels, exaggeration) {
     pointSize: POINT_SIZE_PX,
     sizeUnits: 'pixels',
     opacity: 0.9,
-    pickable: true,
+    pickable: false,
     material: false,
     parameters: { depthTest: true },
   });
@@ -303,12 +323,21 @@ async function fetchVolumeFrames() {
   if (!volumeEnabled || !deckOverlay) return;
   document.getElementById('volume-status').textContent = 'Loading…';
   try {
-    const resp = await fetch(`${API_BASE}/api/radar/volume/frames?count=${FRAME_COUNT}`, { cache: 'no-store' });
+    const resp = await fetch(
+      `${API_BASE}/api/radar/volume/frames?count=${FRAME_COUNT}`,
+      { cache: 'no-store' },
+    );
     if (resp.status === 503) {
-      document.getElementById('volume-status').textContent = 'Seeding…';
-      setTimeout(fetchVolumeFrames, 10_000);
+      volumeFetchRetries++;
+      if (volumeFetchRetries < MAX_503_RETRIES) {
+        document.getElementById('volume-status').textContent = 'Seeding…';
+        setTimeout(fetchVolumeFrames, 10_000);
+      } else {
+        document.getElementById('volume-status').textContent = 'Unavailable';
+      }
       return;
     }
+    volumeFetchRetries = 0;
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     volumeFrames = data.frames;
@@ -358,6 +387,7 @@ async function init() {
       tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
       encoding: 'terrarium',
       tileSize: 256,
+      maxzoom: 15,
     });
     map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
 
@@ -367,7 +397,7 @@ async function init() {
       play();
     }
 
-    setInterval(async () => {
+    refreshIntervalId = setInterval(async () => {
       const wasPlaying = playing;
       if (wasPlaying) pause();
       await fetchFrames();

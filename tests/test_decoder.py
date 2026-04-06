@@ -122,7 +122,7 @@ class TestGrid:
         points_above_5dbz = (valid > 5).sum()
         # At any given moment there will be rain somewhere over CONUS (usually >> 100k points)
         # Use a very conservative threshold to avoid false failures
-        assert points_above_5dbz >= 0  # just ensure no exception; warning below
+        assert points_above_5dbz >= 1, "Expected at least some precipitation over CONUS"
         if points_above_5dbz == 0:
             import warnings
             warnings.warn("No precipitation found in CONUS (unusual but possible in rare conditions)")

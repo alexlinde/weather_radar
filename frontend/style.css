@@ -85,6 +85,23 @@ input[type="range"]::-webkit-slider-thumb {
   box-shadow: 0 0 4px rgba(88,166,255,0.5);
 }
 
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #58a6ff;
+  cursor: pointer;
+  border: 2px solid #0d1117;
+  box-shadow: 0 0 4px rgba(88,166,255,0.5);
+}
+
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
+  border: none;
+}
+
 /* ── Status Row ─────────────────────────────────────────────────────────── */
 
 .status-row {
@@ -132,7 +149,9 @@ input[type="range"]::-webkit-slider-thumb {
   margin-top: 4px;
 }
 
-button {
+#controls button,
+#animation-bar button,
+#legend-toggle button {
   flex: 1;
   padding: 5px 8px;
   font-size: 11px;
@@ -145,12 +164,16 @@ button {
   transition: background 0.15s, border-color 0.15s;
 }
 
-button:hover {
+#controls button:hover,
+#animation-bar button:hover,
+#legend-toggle button:hover {
   background: rgba(88,166,255,0.15);
   border-color: #58a6ff;
 }
 
-button:active {
+#controls button:active,
+#animation-bar button:active,
+#legend-toggle button:active {
   background: rgba(88,166,255,0.25);
 }
 
@@ -240,7 +263,11 @@ button:active {
 }
 
 .toggle-switch input {
-  display: none;
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
 }
 
 .volume-status-label {
@@ -323,6 +350,17 @@ button:active {
 #speed-select option {
   background: #161b22;
   color: #e6edf3;
+}
+
+/* ── Focus-visible for keyboard navigation ─────────────────────────────── */
+
+#controls button:focus-visible,
+#animation-bar button:focus-visible,
+#legend-toggle button:focus-visible,
+input[type="range"]:focus-visible,
+select:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
 }
 
 /* ── Attribution fix ────────────────────────────────────────────────────── */

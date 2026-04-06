@@ -55,7 +55,8 @@ def parse_section1(data: bytes, offset: int) -> dict:
     """Section 1 — Identification Section. Extracts reference time."""
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
-    assert sec_num == 1, f"Expected section 1, got {sec_num}"
+    if sec_num != 1:
+        raise ValueError(f"Expected section 1, got {sec_num}")
 
     # Bytes relative to start of section (offset 0 = first byte of length field)
     # centre: bytes 5-6, sub-centre: 7-8, master tables: 9, local tables: 10
@@ -86,7 +87,8 @@ def parse_section3(data: bytes, offset: int) -> dict:
     """
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
-    assert sec_num == 3, f"Expected section 3, got {sec_num}"
+    if sec_num != 3:
+        raise ValueError(f"Expected section 3, got {sec_num}")
 
     source = data[offset + 5]
     (num_data_points,) = _unpack("I", data, offset + 6)
@@ -192,7 +194,8 @@ def parse_section4(data: bytes, offset: int) -> dict:
     """
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
-    assert sec_num == 4, f"Expected section 4, got {sec_num}"
+    if sec_num != 4:
+        raise ValueError(f"Expected section 4, got {sec_num}")
 
     (num_coords,) = _unpack("H", data, offset + 5)
     (template_num,) = _unpack("H", data, offset + 7)
@@ -233,7 +236,8 @@ def parse_section5(data: bytes, offset: int) -> dict:
     """
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
-    assert sec_num == 5, f"Expected section 5, got {sec_num}"
+    if sec_num != 5:
+        raise ValueError(f"Expected section 5, got {sec_num}")
 
     (num_packed,) = _unpack("I", data, offset + 5)
     (template_num,) = _unpack("H", data, offset + 9)
@@ -273,7 +277,8 @@ def parse_section6(data: bytes, offset: int) -> dict:
     """
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
-    assert sec_num == 6, f"Expected section 6, got {sec_num}"
+    if sec_num != 6:
+        raise ValueError(f"Expected section 6, got {sec_num}")
 
     bitmap_indicator = data[offset + 5]
 
@@ -294,7 +299,8 @@ def parse_section7(data: bytes, offset: int) -> dict:
     """Section 7 — Data Section. Returns raw packed bytes."""
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
-    assert sec_num == 7, f"Expected section 7, got {sec_num}"
+    if sec_num != 7:
+        raise ValueError(f"Expected section 7, got {sec_num}")
 
     payload = data[offset + 5 : offset + sec_len]
     return {"section_length": sec_len, "data": payload}

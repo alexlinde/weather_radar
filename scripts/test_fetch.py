@@ -22,7 +22,7 @@ import numpy as np
 from botocore import UNSIGNED
 from botocore.config import Config
 
-from backend.mrms import BUCKET, COMPOSITE_PRODUCT, list_latest_files, fetch_grib2, clip_to_bbox, mask_sentinel_values
+from backend.mrms import BUCKET, COMPOSITE_PRODUCT, list_latest_files, clip_to_bbox, mask_sentinel_values
 from backend.grib2.decoder import decode_grib2
 
 FIXTURES_DIR = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"

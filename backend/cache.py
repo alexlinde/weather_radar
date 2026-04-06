@@ -8,6 +8,7 @@ The S3 key encodes the timestamp, so it's a natural dedup key.
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -29,45 +30,53 @@ class FrameCache:
     def __init__(self, max_frames: int = MAX_FRAMES) -> None:
         self._max = max_frames
         self._frames: OrderedDict[str, FrameEntry] = OrderedDict()
+        self._lock = threading.Lock()
 
     def has(self, s3_key: str) -> bool:
-        return s3_key in self._frames
+        with self._lock:
+            return s3_key in self._frames
 
     def get(self, s3_key: str) -> FrameEntry | None:
-        return self._frames.get(s3_key)
+        with self._lock:
+            return self._frames.get(s3_key)
 
     def store(self, s3_key: str, metadata: dict, grid: np.ndarray) -> None:
         """Add a decoded frame. Evicts the oldest if at capacity."""
-        if s3_key in self._frames:
-            self._frames.move_to_end(s3_key)
-            return
-        if len(self._frames) >= self._max:
-            evicted_key, _ = self._frames.popitem(last=False)
-            logger.debug("Evicted oldest frame: %s", evicted_key)
-        self._frames[s3_key] = FrameEntry(metadata=metadata, grid=grid)
+        with self._lock:
+            if s3_key in self._frames:
+                self._frames.move_to_end(s3_key)
+                return
+            if len(self._frames) >= self._max:
+                evicted_key, _ = self._frames.popitem(last=False)
+                logger.debug("Evicted oldest frame: %s", evicted_key)
+            self._frames[s3_key] = FrameEntry(metadata=metadata, grid=grid)
 
     def get_latest(self) -> tuple[np.ndarray, dict] | None:
         """Return the most recently inserted frame, or None."""
-        if not self._frames:
-            return None
-        entry = next(reversed(self._frames.values()))
-        return entry.grid, entry.metadata
+        with self._lock:
+            if not self._frames:
+                return None
+            entry = next(reversed(self._frames.values()))
+            return entry.grid, entry.metadata
 
     def get_frames(self, count: int) -> list[tuple[str, FrameEntry]]:
         """
         Return up to `count` most recent frames as (s3_key, entry) pairs,
         ordered oldest-first (chronological) for animation playback.
         """
-        items = list(self._frames.items())
+        with self._lock:
+            items = list(self._frames.items())
         recent = items[-count:] if count < len(items) else items
         return recent
 
     def frame_count(self) -> int:
-        return len(self._frames)
+        with self._lock:
+            return len(self._frames)
 
     def invalidate(self) -> None:
         """Clear all cached frames."""
-        self._frames.clear()
+        with self._lock:
+            self._frames.clear()
 
 
 _cache = FrameCache()
@@ -92,6 +101,10 @@ def get_or_fetch_latest() -> tuple[np.ndarray, dict]:
 
 def store(s3_key: str, metadata: dict, grid: np.ndarray) -> None:
     _cache.store(s3_key, metadata, grid)
+
+
+def get(s3_key: str) -> FrameEntry | None:
+    return _cache.get(s3_key)
 
 
 def has(s3_key: str) -> bool:

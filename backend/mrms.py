@@ -9,6 +9,7 @@ Fetch pipeline (three-tier waterfall):
 
 from __future__ import annotations
 
+import functools
 import gzip
 import logging
 from typing import Any
@@ -34,16 +35,12 @@ NYC_BBOX = {
     "west": -75.23,
 }
 
-_s3 = None
 
-
+@functools.lru_cache(maxsize=1)
 def _s3_client():
-    global _s3
-    if _s3 is None:
-        _s3 = boto3.client(
-            "s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED)
-        )
-    return _s3
+    return boto3.client(
+        "s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED)
+    )
 
 
 def list_latest_files(product: str = COMPOSITE_PRODUCT, count: int = 10) -> list[str]:
@@ -99,9 +96,10 @@ def fetch_raw(s3_key: str) -> bytes:
 
 
 def decode_and_clip(
-    raw_gz: bytes, bbox: dict = NYC_BBOX
+    raw_gz: bytes, bbox: dict | None = None
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Decompress, decode GRIB2, mask sentinels, clip to bounding box."""
+    bbox = bbox or NYC_BBOX
     raw = gzip.decompress(raw_gz)
     metadata, grid = decode_grib2(raw)
     grid = mask_sentinel_values(grid)
@@ -110,14 +108,15 @@ def decode_and_clip(
 
 
 def fetch_and_decode(
-    s3_key: str, bbox: dict = NYC_BBOX
+    s3_key: str, bbox: dict | None = None
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
     Full pipeline for a single frame.
     Cache waterfall: memory -> decoded disk -> raw disk -> S3 -> decode -> clip.
     """
-    if _cache.has(s3_key):
-        entry = _cache._cache.get(s3_key)
+    bbox = bbox or NYC_BBOX
+    entry = _cache.get(s3_key)
+    if entry is not None:
         return entry.grid, entry.metadata
 
     decoded = disk_cache.get_decoded(s3_key)
@@ -193,13 +192,14 @@ def get_recent_frames(count: int = 20) -> int:
 def clip_to_bbox(
     data: np.ndarray,
     metadata: dict,
-    bbox: dict = NYC_BBOX,
+    bbox: dict | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
     Clip a decoded GRIB2 grid to the given bounding box.
 
     Assumes row 0 = northernmost latitude (scanning direction already corrected).
     """
+    bbox = bbox or NYC_BBOX
     north = metadata["north"]
     south = metadata["south"]
     west = metadata["west"]
@@ -258,8 +258,9 @@ def fetch_grib2(s3_key: str) -> bytes:
     return gzip.decompress(raw_gz)
 
 
-def get_latest_frame(bbox: dict = NYC_BBOX) -> tuple[np.ndarray, dict]:
+def get_latest_frame(bbox: dict | None = None) -> tuple[np.ndarray, dict]:
     """Fetch, decode, and clip the latest MRMS composite reflectivity frame."""
+    bbox = bbox or NYC_BBOX
     keys = list_latest_files(COMPOSITE_PRODUCT, count=5)
     if not keys:
         raise RuntimeError("No MRMS files found in S3 bucket")

@@ -109,7 +109,7 @@ def grid_to_png(grid: np.ndarray) -> bytes:
         mask = (~np.isnan(grid)) & (grid >= min_dbz) & (grid < max_dbz)
         rgba[mask] = [r, g, b, 220]
 
-    rgba[(~np.isnan(grid)) & (grid >= 65)] = [200, 200, 255, 220]
+    rgba[(~np.isnan(grid)) & (grid >= 75)] = [200, 200, 255, 220]
 
     img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
@@ -122,19 +122,18 @@ def grid_to_png(grid: np.ndarray) -> bytes:
 
 
 @app.get("/api/radar/latest")
-async def radar_latest():
+def radar_latest():
     """Return the latest clipped NYC radar frame as JSON."""
     try:
         from .cache import get_or_fetch_latest
 
         grid, metadata = get_or_fetch_latest()
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to fetch radar data")
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail="Failed to fetch radar data")
 
-    data_serialisable = [
-        [None if np.isnan(v) else round(float(v), 2) for v in row] for row in grid
-    ]
+    rounded = np.round(grid, 2)
+    data_serialisable = np.where(np.isnan(rounded), None, rounded).tolist()
 
     return {
         "timestamp": metadata["timestamp"],
@@ -153,15 +152,15 @@ async def radar_latest():
 
 
 @app.get("/api/radar/image")
-async def radar_image():
+def radar_image():
     """Return the latest NYC radar frame as a PNG with NWS colour scale."""
     try:
         from .cache import get_or_fetch_latest
 
         grid, metadata = get_or_fetch_latest()
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to fetch radar data")
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail="Failed to fetch radar data")
 
     png_bytes = grid_to_png(grid)
 
@@ -178,7 +177,7 @@ async def radar_image():
 
 
 @app.get("/api/radar/frames")
-async def radar_frames(count: int = Query(default=60, ge=1, le=70)):
+def radar_frames(count: int = Query(default=60, ge=1, le=70)):
     """
     Return up to `count` recent radar frames as base64-encoded PNGs.
     Frames are ordered oldest-first (chronological) for animation playback.
@@ -213,24 +212,23 @@ async def radar_frames(count: int = Query(default=60, ge=1, le=70)):
 @app.get("/api/radar/volume")
 async def radar_volume():
     """
-    Return the latest multi-level radar snapshot as a list of 3D columns.
+    Return the latest multi-level radar snapshot as voxel data.
 
-    Each column: [lon, lat, max_dbz, echo_top_km]
-    Only cells with reflectivity >= 5 dBZ are included.
+    Each voxel: [lon, lat, altitude_m, dbz]
+    Only cells with reflectivity >= 10 dBZ are included.
     """
     try:
         from . import mrms_volume
 
         volume = await asyncio.to_thread(mrms_volume.fetch_volume_snapshot)
-        columns = mrms_volume.compute_columns(volume)
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to fetch volume data")
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502, detail="Failed to fetch volume data")
 
     return {
         "timestamp": volume["timestamp"],
         "bounds": volume["bounds"],
-        "columns": columns,
+        "voxels": volume["voxels"],
     }
 
 

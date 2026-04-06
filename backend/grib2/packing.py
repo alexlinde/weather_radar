@@ -66,7 +66,7 @@ def unpack_simple(
         physical = np.full(num_packed, R / (10.0**D), dtype=np.float32)
     else:
         reader = BitstreamReader(section7_bytes)
-        raw = np.array(reader.read_array(bits_per_value, num_packed), dtype=np.float32)
+        raw = reader.read_array(bits_per_value, num_packed).astype(np.float32)
         physical = _apply_scale(raw, R, E, D)
 
     return _expand_bitmap(physical, bitmap_bytes, num_points)

@@ -99,8 +99,9 @@ def derive_tilt_key(ref_key: str, tilt: str) -> str:
 # ── Per-frame volume computation ──────────────────────────────────────────────
 
 
-def _fetch_and_decode_tilt(s3_key: str, bbox: dict) -> tuple[np.ndarray, dict] | None:
+def _fetch_and_decode_tilt(s3_key: str, bbox: dict | None = None) -> tuple[np.ndarray, dict] | None:
     """Fetch + decode one tilt file. Returns (clipped_grid, metadata) or None on error."""
+    bbox = bbox or NYC_BBOX
     try:
         decoded = disk_cache.get_decoded(s3_key)
         if decoded is not None:
@@ -233,7 +234,7 @@ def volume_frame_count() -> int:
         return len(_volume_frames)
 
 
-def seed_volume_frames(count: int = 60, bbox: dict = NYC_BBOX) -> int:
+def seed_volume_frames(count: int = 60, bbox: dict | None = None) -> int:
     """
     Pre-fetch and cache column data for the `count` most recent volume snapshots.
     Uses a shared ThreadPoolExecutor so tilt-level decodes run in parallel.
@@ -241,6 +242,7 @@ def seed_volume_frames(count: int = 60, bbox: dict = NYC_BBOX) -> int:
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    bbox = bbox or NYC_BBOX
     logger.info("Seeding volume frame cache (%d frames across %d tilts)…", count, len(TILT_LEVELS))
     ref_keys = list_tilt_files("00.50", count=count)
 
@@ -259,7 +261,7 @@ def seed_volume_frames(count: int = 60, bbox: dict = NYC_BBOX) -> int:
             timestamp, columns = result
             _store_frame(timestamp, columns)
             logger.info("  [%d/%d] volume frame %s: %d voxels",
-                        i + 1, len(ordered), timestamp, len(voxels))
+                        i + 1, len(ordered), timestamp, len(columns))
 
     total = volume_frame_count()
     logger.info("Volume frame cache seeded: %d frames", total)
@@ -274,14 +276,15 @@ def invalidate_volume_cache() -> None:
 # ── Legacy single-snapshot API (kept for /api/radar/volume backward compat) ───
 
 
-def fetch_volume_snapshot(bbox: dict = NYC_BBOX) -> dict[str, Any]:
+def fetch_volume_snapshot(bbox: dict | None = None) -> dict[str, Any]:
     """Return the latest volume frame as a full snapshot dict."""
+    bbox = bbox or NYC_BBOX
     with _lock:
         if _volume_frames:
             ts, cols = next(reversed(_volume_frames.items()))
             return {
                 "timestamp": ts,
-                "bounds": {k: v for k, v in NYC_BBOX.items()},
+                "bounds": {k: v for k, v in bbox.items()},
                 "voxels": cols,
             }
 
@@ -299,10 +302,5 @@ def fetch_volume_snapshot(bbox: dict = NYC_BBOX) -> dict[str, Any]:
     return {
         "timestamp": timestamp,
         "bounds": {k: v for k, v in bbox.items()},
-        "voxels": voxels,
+        "voxels": columns,
     }
-
-
-def compute_columns(volume: dict[str, Any], min_dbz: float = 5.0) -> list[list[float]]:
-    """Pass-through for callers that already have a snapshot dict."""
-    return volume.get("columns", [])

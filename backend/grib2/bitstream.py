@@ -5,6 +5,8 @@ Used by Template 5.0 (simple packing) to unpack variable-width integers from
 GRIB2 Section 7.
 """
 
+import numpy as np
+
 
 class BitstreamReader:
     """Reads N-bit unsigned integers from a packed byte buffer."""
@@ -43,6 +45,25 @@ class BitstreamReader:
 
         return result
 
-    def read_array(self, n: int, count: int) -> list[int]:
-        """Read `count` consecutive N-bit unsigned integers."""
-        return [self.read(n) for _ in range(count)]
+    def read_array(self, n: int, count: int) -> np.ndarray:
+        """Read `count` consecutive N-bit unsigned integers using vectorized numpy ops."""
+        if n == 0:
+            self._bit_pos += 0
+            return np.zeros(count, dtype=np.uint64)
+
+        total_bits = n * count
+        byte_start = self._bit_pos >> 3
+        bit_offset = self._bit_pos & 7
+        bytes_needed = (bit_offset + total_bits + 7) >> 3
+
+        buf = np.frombuffer(
+            self._data[byte_start : byte_start + bytes_needed],
+            dtype=np.uint8,
+        )
+        bits = np.unpackbits(buf)[bit_offset : bit_offset + total_bits]
+        bits = bits.reshape(count, n)
+        powers = np.uint64(1) << np.arange(n - 1, -1, -1, dtype=np.uint64)
+        values = bits.astype(np.uint64) @ powers
+
+        self._bit_pos += total_bits
+        return values
