@@ -11,10 +11,10 @@ This is a working prototype, not a production app. Prioritise getting real data 
 **Phase 1 (data on screen): COMPLETE**
 **Phase 2 (time animation): COMPLETE**
 **Phase 3 (3D terrain + vertical levels): COMPLETE**
-**Phase 3.5 (CONUS tile serving — 2D and 3D): COMPLETE**
+**Phase 3.5 (unified voxel architecture): COMPLETE**
 **Phase 4 (motion-compensated interpolation): NOT STARTED**
 
-The app fetches 60 frames of tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). Both 2D composites and 3D voxel tiles are served on-demand as standard TMS tiles. The frontend uses deck.gl TileLayer for viewport-based lazy tile loading over a MapLibre base map with 3D terrain, starting at a CONUS-wide view. Animation plays through ~2 hours of history with play/pause, scrubber, and speed controls. A toggle switches between 2D composite tiles and 3D volumetric voxel tiles — both use the same tile-based architecture with deck.gl's built-in AbortSignal request cancellation.
+The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves all 20 frames of voxel data for each tile coordinate in a single bulk binary response. The frontend loads all voxels for visible tiles into GPU buffers once, then uses deck.gl `DataFilterExtension` to switch frames by updating a single GPU uniform — achieving zero-cost scrubbing with no per-frame network requests or buffer re-uploads. Both 2D composite and 3D volumetric views use the same `PointCloudLayer`, differing only in pitch, point size, and depth testing. The map uses MapLibre GL JS with 3D terrain, starting at a CONUS-wide view.
 
 ## Architecture
 
@@ -32,25 +32,24 @@ Responsibilities:
 - Fetch MRMS tilt-level GRIB2 files from S3 across 8 elevation angles
 - Decode with custom minimal GRIB2 decoder (no eccodes dependency)
 - Convert to scipy.sparse CSR matrices (95-99% of grid is NaN/sentinel → 20x memory reduction)
-- Serve 2D composite tiles (`/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png`) — composite derived lazily via `np.fmax` across tilt grids
-- Serve 3D voxel tiles (`/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json`) — zoom-based spatial downsampling keeps voxel counts manageable
-- Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + rendered tile LRUs (PNG + JSON, 2000 entries each)
-- GZip middleware compresses JSON voxel tiles (~87% reduction)
-- Background seeding on startup (60 frames across all tilts)
+- Serve bulk voxel tiles (`/api/radar/volume/bulk/{z}/{x}/{y}.bin`) — all 20 frames packed in one binary response per tile coordinate
+- Zoom-based spatial downsampling keeps voxel counts manageable
+- Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + binary voxel tile LRU (2000 entries)
+- GZip middleware compresses binary voxel responses (~80-90% reduction)
+- Background seeding on startup (60 frames across all tilts) + voxel tile pre-rendering for default viewport
 
 ### Frontend (HTML + JS)
 
 Responsibilities:
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
 - 3D terrain via AWS elevation tiles (always enabled)
-- Overlay 2D radar tiles using deck.gl TileLayer → BitmapLayer per tile
-- Overlay 3D radar voxels using deck.gl TileLayer → PointCloudLayer per tile
-- Both modes use viewport-based lazy loading — only visible tiles are fetched
-- deck.gl AbortSignal cancels in-flight requests when tiles leave viewport or frame changes
-- Browser HTTP cache (`Cache-Control: immutable` + `force-cache`) makes revisited frames instant
+- Bulk-fetch all frames' voxels for visible tiles on load → build combined typed arrays
+- Single `deck.PointCloudLayer` with `DataFilterExtension` renders both 2D and 3D views
+- Frame scrubbing updates a single GPU `filterRange` uniform — zero-cost, no network or buffer work
+- 2D/3D toggle changes pitch, point size, and depth testing on the same layer
+- Re-fetches bulk voxel data when zoom level changes (debounced)
 - Default CONUS view at z=4, user zooms in to area of interest
-- View mode toggle: Composite (2D) vs 3D Layers (volumetric)
-- Time animation with 60 frames, play/pause, scrubber, speed control
+- Time animation with 20 frames, play/pause, scrubber, speed control
 - Opacity slider, vertical exaggeration slider (3D mode)
 - NWS reflectivity color scale legend
 - Auto-refresh every 2 minutes
@@ -147,7 +146,7 @@ bearing: 0
 - **numpy** — array operations
 - **scipy** — sparse matrix storage (CSR format, 20x memory reduction for MRMS data)
 - **boto3** — S3 access (unsigned requests, no credentials needed)
-- **Pillow** — PNG rendering + JPEG2000 decoding (ships with openjpeg)
+- **Pillow** — JPEG2000/PNG decoding for GRIB2 packing templates (ships with openjpeg)
 - **uvicorn** — ASGI server
 - **python-dotenv** — load `.env` for API keys
 
@@ -155,7 +154,7 @@ No eccodes, no cfgrib, no system-level C dependencies.
 
 ### Frontend
 - **MapLibre GL JS** (~v4) — base map + 3D terrain
-- **deck.gl** (~v9) — TileLayer (both 2D and 3D), BitmapLayer, PointCloudLayer, MapboxOverlay
+- **deck.gl** (~v9) — PointCloudLayer, DataFilterExtension, MapboxOverlay
 - **Vanilla JS** — no framework, no build step
 
 Loaded from CDN:
@@ -169,21 +168,19 @@ Loaded from CDN:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png` | GET | 2D composite TMS tile. z=3–8. |
-| `/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json` | GET | 3D voxel tile (JSON array of `[lon, lat, alt_m, dbz]`). z=3–8. Zoom-based downsampling. |
-| `/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.bin` | GET | 3D binary voxel tile. `?base={prev_ts}` for delta (returns 4-byte unchanged sentinel if identical). |
-| `/api/radar/timestamps` | GET | Available timestamps with bounds (for tile URL construction). |
+| `/api/radar/volume/bulk/{z}/{x}/{y}.bin` | GET | All frames' voxels for a tile coordinate in one binary response. z=3–8. |
+| `/api/radar/timestamps` | GET | Available timestamps with bounds. |
 | `/api/radar/refresh` | GET | Force cache invalidation + re-seed. |
 | `/api/config` | GET | Frontend configuration (map tile API keys). |
 | `/health` | GET | Cache status (in-memory + on-disk counts). |
 
 The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes).
 
-Both tile types include `Cache-Control: public, max-age=3600, immutable` — radar tiles are immutable once generated, so the browser caches them aggressively. Combined with `cache: 'force-cache'` on the frontend fetch, animation scrubbing through previously visited frames is nearly instant.
+The bulk endpoint packs all 20 frames into one response: `[uint16 frame_count][per-frame: [uint32 count][float32 positions[3*N]][uint8 colors[4*N]]]`. GZip middleware compresses the binary data ~80-90%. The response uses `Cache-Control: public, max-age=120` since new frames appear every 2 minutes.
 
 ## Data Pipeline (`pipeline.py`)
 
-The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, store as sparse matrices, derive everything else on demand.**
+The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, store as sparse matrices, pre-render voxel tiles for the default viewport.**
 
 ### Seed flow (startup)
 
@@ -193,21 +190,21 @@ The pipeline is the core orchestration layer. It operates on a single principle:
 4. Decode GRIB2 → mask sentinels (< -30 → NaN) → convert to scipy.sparse CSR (NaN → implicit zero)
 5. Save sparse tilt grids to `data/tilt_grids/{YYYYMMDD-HHMMSS}/` (8 `.npz` + `meta.json`)
 6. Populate in-memory `ConusTiltCache` LRU
+7. Pre-render binary voxel tiles for the most recent 20 frames at z=4 (CONUS default viewport)
 
-No pre-computation of composites or voxels — these are derived per-tile on request.
+In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetching). Step 7 still runs.
 
 ### Caching architecture
 
 **ConusTiltCache (`cache.py`):**
-- Single unified LRU for all tile serving (both 2D and 3D)
-- Key: timestamp string → Value: dict of 8 sparse CSR matrices + metadata + lazy composite
+- Thread-safe LRU for sparse tilt grid sets
+- Key: timestamp string → Value: dict of 8 sparse CSR matrices + metadata
 - Max 20 entries (~780 MB: 20 timestamps × 39 MB sparse per timestamp)
 - Falls back to `disk_cache.get_tilt_grids()` on miss (33ms disk load)
-- 2D composite derived lazily via `np.fmax` across tilt grids (~80ms, cached in entry)
 
-**Tile caches (`tiles.py`):**
-- `tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → PNG bytes
-- `voxel_tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → JSON bytes
+**Binary tile cache (`tiles.py`):**
+- `bin_tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → binary voxel bytes
+- Pre-populated at startup for z=4 CONUS tiles; cache misses at other zoom levels are computed on demand
 
 **On-disk (`disk_cache.py`):**
 - `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3 (~0.5 MB each)
@@ -242,7 +239,7 @@ At CONUS zoom (z=3-4), full-resolution voxel tiles would contain millions of poi
 | z=7 | 1 | 8 | 10 | ~20,000 |
 | z=8 | 1 | 8 | 10 | ~1,000 |
 
-The frontend uses `VOXEL_MIN_ZOOM=4` (skips z=3 for 3D entirely). GZip middleware compresses JSON by ~87% over the wire.
+GZip middleware compresses the binary voxel data ~80-90% over the wire.
 
 ## Custom GRIB2 Decoder
 
@@ -363,7 +360,7 @@ NWS_DBZ_COLORS = [
 ]
 ```
 
-Backend PNG rendering uses alpha 220 for all active bands. The 3D PointCloudLayer uses a dynamic alpha ramp from 100–255 based on dBZ value.
+The PointCloudLayer uses a dynamic alpha ramp from 100–255 based on dBZ value (`colorize_voxels` in `tiles.py`).
 
 ## Sentinel Value Handling
 
@@ -403,13 +400,13 @@ weather_radar/
 ├── backend/
 │   ├── requirements.txt   ← production dependencies (includes scipy)
 │   ├── requirements-dev.txt ← dev/test dependencies
-│   ├── main.py            ← FastAPI app, routes (2D tiles, 3D voxel tiles, timestamps)
-│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU
-│   ├── tiles.py           ← TMS tile math, 2D render, 3D voxel render, tile caches
+│   ├── main.py            ← FastAPI app, bulk voxel endpoint, timestamps, config
+│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU + voxel pre-render
+│   ├── tiles.py           ← TMS tile math, voxel extraction + binary packing, tile cache
 │   ├── mrms.py            ← S3 client, file listing, download
-│   ├── cache.py           ← ConusTiltCache (unified sparse LRU with lazy composite)
+│   ├── cache.py           ← ConusTiltCache (sparse LRU with disk fallback)
 │   ├── disk_cache.py      ← on-disk raw + sparse tilt grid cache
-│   ├── render.py          ← NWS color scale: colorize_grid() + grid_to_png()
+│   ├── render.py          ← NWS reflectivity color scale constants
 │   └── grib2/
 │       ├── __init__.py
 │       ├── decoder.py     ← entry point: bytes → (metadata, numpy array)
@@ -419,7 +416,7 @@ weather_radar/
 ├── frontend/
 │   ├── index.html         ← single-page app
 │   ├── style.css          ← dark theme, glassmorphism panels
-│   ├── app.js             ← map init, animation, 2D tiles + 3D voxel tiles
+│   ├── app.js             ← map init, bulk voxel loading, GPU-filtered animation
 │   └── colors.js          ← NWS color scale + legend builder
 ├── tests/
 │   ├── __init__.py
@@ -450,14 +447,14 @@ cp .env.example .env
 # Start the server (from project root) — serves both API and frontend
 uvicorn backend.main:app
 
-# Or with HTTP/2 via hypercorn (multiplexes tile requests over one connection):
-hypercorn backend.main:app --bind 0.0.0.0:8000
+# Dev mode (skip S3 fetching, load from disk cache):
+DEV_MODE=1 uvicorn backend.main:app
 
 # Open in browser
 open http://localhost:8000
 ```
 
-The server seeds 60 frames on startup in a background thread. The frontend auto-retries until frames are available (~1-2 minutes).
+The server seeds 60 frames on startup in a background thread, then pre-renders voxel tiles for the default CONUS viewport. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second.
 
 ## Running Tests
 
@@ -507,20 +504,21 @@ MRMS reflectivity grids are extremely sparse: after sentinel masking, 95-99.3% o
 
 Sparse is better on every axis: memory, disk, I/O speed, and allows caching 20 frames in memory instead of 3.
 
-### Why tile-based 3D instead of bulk voxel fetch
+### Why unified voxel architecture (not per-frame tile fetching)
 
-The original 3D approach pre-computed all voxels for a fixed NYC bounding box and sent them as a single bulk JSON response. This had several problems:
-- Locked to one geographic region
-- Full 60-frame bulk fetch regardless of viewport (~5-20 MB per frame)
-- No request cancellation — switching frames couldn't abort in-flight data
-- Memory-intensive: all 60 frames of voxel data in the frontend
+The earlier approach used deck.gl `TileLayer` to fetch PNG (2D) or binary (3D) tiles per frame per visible tile coordinate. This had poor scrubbing performance because every frame change triggered:
+- HTTP requests for each visible tile × the new frame
+- Decoding/uploading new GPU textures or buffers
+- Layer re-creation or prop invalidation in deck.gl
 
-The tile-based approach mirrors the 2D system:
-- deck.gl TileLayer manages viewport-based loading, AbortSignal cancellation, and tile lifecycle
-- Only visible tiles are fetched — pan/zoom is smooth
-- Zoom-based downsampling keeps voxel counts manageable (3.7K at z=3, 39K at z=5, 1.1K at z=8)
-- Browser HTTP cache makes animation scrubbing through previously viewed frames instant
-- Same UX for both 2D and 3D — just swap the TileLayer sublayer type
+The unified approach, inspired by the [deck.gl animated flight demo](https://deck.gl/examples/maplibre), loads all data up front and animates entirely on the GPU:
+1. **Bulk binary endpoint** — one request per tile coordinate returns all 20 frames' voxels
+2. **Combined typed arrays** — positions, colors, and frame indices concatenated into single buffers
+3. **`DataFilterExtension`** — each voxel has a `frameIndex` attribute; `filterRange` selects the visible frame
+4. **Frame scrubbing** — updates one GPU uniform, no buffer re-uploads, no network requests
+5. **Both 2D and 3D** — same `PointCloudLayer`, different pitch/pointSize/depthTest settings
+
+Trade-off: at CONUS zoom (z=4), the 2D composite view shows a "dot grid" rather than continuous raster. Acceptable for a prototype; could be addressed with custom shaders or screen-space splatting later.
 
 ### Why PointCloudLayer instead of ColumnLayer
 
@@ -529,10 +527,11 @@ deck.gl `PointCloudLayer` turned out to work better than `ColumnLayer` for volum
 - Handles irregular sampling (not all cells are active at all levels)
 - Performs well with 100K+ points
 - Vertical exaggeration is just a multiplier on the altitude
+- `DataFilterExtension` integrates cleanly for frame filtering
 
 ### Background seeding
 
-The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
+The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread, followed by voxel pre-rendering for the default z=4 CONUS viewport. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
 
 ### On-disk cache layout
 

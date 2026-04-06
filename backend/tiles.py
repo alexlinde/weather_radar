@@ -1,15 +1,13 @@
 """
-TMS tile rendering for CONUS radar data (2D composites and 3D voxel tiles).
+TMS voxel tile rendering for CONUS radar data.
 
-2D tiles: extract subgrid from composite → colorize → 256x256 PNG.
-3D tiles: extract subregion from each tilt → downsample → filter → voxel JSON.
-
-Both tile types follow the standard {z}/{x}/{y} convention.
+Extracts subregions from sparse tilt grids, downsamples by zoom,
+colorizes via NWS scale, and packs into binary format.
+Tiles follow the standard {z}/{x}/{y} convention.
 """
 
 from __future__ import annotations
 
-import io
 import math
 import struct
 import threading
@@ -18,15 +16,12 @@ from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
-from PIL import Image
 
-from .render import NWS_DBZ_COLORS, colorize_grid
+from .render import NWS_DBZ_COLORS
 
-TILE_SIZE = 256
 MIN_ZOOM = 3
 MAX_ZOOM = 8
-_TILE_CACHE_MAX = 2000
-_VOXEL_TILE_CACHE_MAX = 2000
+_BIN_TILE_CACHE_MAX = 2000
 
 TILT_TO_HEIGHT_KM: dict[str, float] = {
     "00.50": 1.0,
@@ -88,85 +83,7 @@ def _grid_overlap(
     return row_start, row_end, col_start, col_end
 
 
-# ── Pre-computed transparent tile ────────────────────────────────────────────
-
-
-_TRANSPARENT_TILE: bytes | None = None
-
-
-def _get_transparent_tile() -> bytes:
-    global _TRANSPARENT_TILE
-    if _TRANSPARENT_TILE is None:
-        img = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=False)
-        buf.seek(0)
-        _TRANSPARENT_TILE = buf.read()
-    return _TRANSPARENT_TILE
-
-
-# ── 2D tile renderer ─────────────────────────────────────────────────────────
-
-
-def render_tile(
-    grid: np.ndarray,
-    metadata: dict,
-    z: int,
-    x: int,
-    y: int,
-) -> bytes:
-    """Render a 256x256 PNG tile from a CONUS composite grid."""
-    tb = tile_bounds(z, x, y)
-    overlap = _grid_overlap(tb, metadata)
-    if overlap is None:
-        return _get_transparent_tile()
-
-    row_start, row_end, col_start, col_end = overlap
-    subgrid = grid[row_start:row_end, col_start:col_end]
-
-    tile_lon_span = tb["east"] - tb["west"]
-    tile_lat_span = tb["north"] - tb["south"]
-    Di = metadata["Di"]
-    Dj = metadata["Dj"]
-    grid_n = metadata["north"]
-    grid_w = metadata["west"]
-
-    overlap_n = grid_n - row_start * Dj
-    overlap_s = grid_n - row_end * Dj
-    overlap_w = grid_w + col_start * Di
-    overlap_e = grid_w + col_end * Di
-
-    px_left = int(round((overlap_w - tb["west"]) / tile_lon_span * TILE_SIZE))
-    px_right = int(round((overlap_e - tb["west"]) / tile_lon_span * TILE_SIZE))
-    px_top = int(round((tb["north"] - overlap_n) / tile_lat_span * TILE_SIZE))
-    px_bottom = int(round((tb["north"] - overlap_s) / tile_lat_span * TILE_SIZE))
-
-    target_w = max(1, px_right - px_left)
-    target_h = max(1, px_bottom - px_top)
-
-    rgba = colorize_grid(subgrid)
-    img_part = Image.fromarray(rgba, mode="RGBA")
-    resample = Image.NEAREST if max(subgrid.shape) < 64 else Image.BILINEAR
-    img_part = img_part.resize((target_w, target_h), resample)
-
-    full_coverage = (px_left == 0 and px_top == 0
-                     and target_w == TILE_SIZE and target_h == TILE_SIZE)
-    if full_coverage:
-        buf = io.BytesIO()
-        img_part.save(buf, format="PNG", optimize=False)
-        buf.seek(0)
-        return buf.read()
-
-    tile_img = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
-    tile_img.paste(img_part, (px_left, px_top))
-
-    buf = io.BytesIO()
-    tile_img.save(buf, format="PNG", optimize=False)
-    buf.seek(0)
-    return buf.read()
-
-
-# ── 3D voxel tile renderer ──────────────────────────────────────────────────
+# ── Voxel tile renderer ──────────────────────────────────────────────────────
 
 
 def _downsample_step(z: int) -> int:
@@ -182,7 +99,6 @@ _LOW_ZOOM_TILTS = {"00.50", "02.50", "05.00", "10.00"}
 _MAX_VOXELS_PER_TILE = 40_000
 
 _EMPTY_BIN_TILE = struct.pack("<I", 0)
-DELTA_UNCHANGED = struct.pack("<I", 0xFFFFFFFF)
 
 
 def colorize_voxels(dbz_values: np.ndarray) -> np.ndarray:
@@ -208,7 +124,7 @@ def _extract_voxels(
     x: int,
     y: int,
 ) -> np.ndarray | None:
-    """Core voxel extraction shared by JSON and binary renderers.
+    """Extract voxels from sparse tilt grids for a tile region.
 
     Returns Nx4 float array of [lon, lat, altitude_m, dbz] or None.
     """
@@ -268,18 +184,6 @@ def _extract_voxels(
     return result
 
 
-def render_voxel_tile(
-    sparse_grids: dict[str, sp.csr_matrix],
-    metadata: dict,
-    z: int,
-    x: int,
-    y: int,
-) -> list[list[float]]:
-    """Extract voxels as JSON-serializable list of [lon, lat, altitude_m, dbz]."""
-    result = _extract_voxels(sparse_grids, metadata, z, x, y)
-    return result.tolist() if result is not None else []
-
-
 def render_voxel_tile_binary(
     sparse_grids: dict[str, sp.csr_matrix],
     metadata: dict,
@@ -289,7 +193,6 @@ def render_voxel_tile_binary(
 ) -> bytes:
     """Pack voxels as binary: [uint32 count][float32 positions][uint8 colors].
 
-    Count 0xFFFFFFFF is reserved as the delta "unchanged" sentinel.
     Positions are 3 × float32 (lon, lat, alt_m) per voxel.
     Colors are 4 × uint8 (R, G, B, A) per voxel, pre-computed from dBZ.
     """
@@ -307,9 +210,9 @@ def render_voxel_tile_binary(
 
 
 class TileCache:
-    """Thread-safe LRU cache for rendered tile data (PNG bytes or JSON bytes)."""
+    """Thread-safe LRU cache for rendered binary voxel tile data."""
 
-    def __init__(self, max_size: int = _TILE_CACHE_MAX) -> None:
+    def __init__(self, max_size: int = _BIN_TILE_CACHE_MAX) -> None:
         self._max = max_size
         self._data: OrderedDict[tuple, bytes] = OrderedDict()
         self._lock = threading.Lock()
@@ -335,6 +238,4 @@ class TileCache:
             self._data.clear()
 
 
-tile_cache = TileCache()
-voxel_tile_cache = TileCache(max_size=_VOXEL_TILE_CACHE_MAX)
-bin_tile_cache = TileCache(max_size=_VOXEL_TILE_CACHE_MAX)
+bin_tile_cache = TileCache(max_size=_BIN_TILE_CACHE_MAX)

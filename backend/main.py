@@ -2,19 +2,16 @@
 FastAPI backend for the Weather Radar viewer.
 
 Endpoints:
-    GET /api/radar/tiles/{ts}/{z}/{x}/{y}.png        — 2D composite tile (legacy)
-    GET /api/radar/volume/tiles/{ts}/{z}/{x}/{y}.bin  — single-frame binary voxel tile
-    GET /api/radar/volume/bulk/{z}/{x}/{y}.bin        — ALL frames' voxels for a tile
-    GET /api/radar/timestamps                        — available timestamps
-    GET /api/radar/refresh                           — force re-seed
-    GET /api/config                                  — frontend map config
-    GET /health                                      — cache status
+    GET /api/radar/volume/bulk/{z}/{x}/{y}.bin  — all frames' voxels for a tile
+    GET /api/radar/timestamps                   — available timestamps
+    GET /api/radar/refresh                      — force re-seed
+    GET /api/config                             — frontend map config
+    GET /health                                 — cache status
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import struct
@@ -80,129 +77,6 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
-
-
-# ── 2D composite tiles ──────────────────────────────────────────────────────
-
-
-@app.get("/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png")
-def radar_tile(timestamp: str, z: int, x: int, y: int):
-    """Serve a single 256x256 radar composite tile."""
-    from .cache import tilt_cache
-    from .tiles import MAX_ZOOM, MIN_ZOOM, render_tile, tile_cache
-
-    if z < MIN_ZOOM or z > MAX_ZOOM:
-        raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
-
-    cache_key = (timestamp, z, x, y)
-    cached = tile_cache.get(cache_key)
-    if cached is not None:
-        return Response(
-            content=cached,
-            media_type="image/png",
-            headers={"Cache-Control": "public, max-age=3600, immutable"},
-        )
-
-    result = tilt_cache.get_composite(timestamp)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Timestamp not available")
-    grid, meta = result
-
-    png_bytes = render_tile(grid, meta, z, x, y)
-    tile_cache.put(cache_key, png_bytes)
-
-    return Response(
-        content=png_bytes,
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=3600, immutable"},
-    )
-
-
-# ── 3D voxel tiles ──────────────────────────────────────────────────────────
-
-
-@app.get("/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json")
-def radar_voxel_tile(timestamp: str, z: int, x: int, y: int):
-    """Serve voxel data for a tile region across all tilt levels."""
-    from .cache import tilt_cache
-    from .tiles import MAX_ZOOM, MIN_ZOOM, render_voxel_tile, voxel_tile_cache
-
-    if z < MIN_ZOOM or z > MAX_ZOOM:
-        raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
-
-    cache_key = (timestamp, z, x, y)
-    cached = voxel_tile_cache.get(cache_key)
-    if cached is not None:
-        return Response(
-            content=cached,
-            media_type="application/json",
-            headers={"Cache-Control": "public, max-age=3600, immutable"},
-        )
-
-    entry = tilt_cache.get(timestamp)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="Timestamp not available")
-
-    voxels = render_voxel_tile(entry["grids"], entry["meta"], z, x, y)
-    payload = json.dumps({"voxels": voxels, "count": len(voxels)})
-    payload_bytes = payload.encode()
-    voxel_tile_cache.put(cache_key, payload_bytes)
-
-    return Response(
-        content=payload_bytes,
-        media_type="application/json",
-        headers={"Cache-Control": "public, max-age=3600, immutable"},
-    )
-
-
-# ── 3D binary voxel tiles ────────────────────────────────────────────────────
-
-
-@app.get("/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.bin")
-def radar_voxel_tile_bin(
-    timestamp: str, z: int, x: int, y: int,
-    base: str | None = None,
-):
-    """Serve voxel data as a compact binary tile.
-
-    Binary format: [uint32 count][float32 positions (3×N)][uint8 colors (4×N)].
-    With ?base=<prev_timestamp>, returns 4-byte unchanged sentinel (0xFFFFFFFF)
-    if the tile content is identical to the base frame.
-    """
-    from .cache import tilt_cache
-    from .tiles import (
-        DELTA_UNCHANGED, MAX_ZOOM, MIN_ZOOM,
-        bin_tile_cache, render_voxel_tile_binary,
-    )
-
-    if z < MIN_ZOOM or z > MAX_ZOOM:
-        raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
-
-    cache_key = (timestamp, z, x, y)
-    cached = bin_tile_cache.get(cache_key)
-
-    if cached is None:
-        entry = tilt_cache.get(timestamp)
-        if entry is None:
-            raise HTTPException(status_code=404, detail="Timestamp not available")
-        cached = render_voxel_tile_binary(entry["grids"], entry["meta"], z, x, y)
-        bin_tile_cache.put(cache_key, cached)
-
-    if base:
-        base_key = (base, z, x, y)
-        base_cached = bin_tile_cache.get(base_key)
-        if base_cached is not None and base_cached == cached:
-            return Response(
-                content=DELTA_UNCHANGED,
-                media_type="application/octet-stream",
-                headers={"Cache-Control": "public, max-age=3600, immutable"},
-            )
-
-    return Response(
-        content=cached,
-        media_type="application/octet-stream",
-        headers={"Cache-Control": "public, max-age=3600, immutable"},
-    )
 
 
 # ── Bulk voxel tiles (all frames in one response) ────────────────────────────

@@ -4,8 +4,8 @@ MRMS data pipeline: fetch tilt-level reflectivity, store as sparse grids.
 Single fetch path: tilt-level MergedReflectivityQC files from S3.
 Output: sparse CSR tilt grids on disk + in-memory LRU cache.
 
-Both 2D composite tiles and 3D voxel tiles are derived on-demand at
-tile-serve time — no pre-computation of composites or voxels.
+Binary voxel tiles for the default CONUS viewport (z=4) are pre-rendered
+after seeding/warming so the bulk endpoint serves instantly on first request.
 """
 
 from __future__ import annotations
@@ -199,9 +199,12 @@ def warm_from_disk(limit: int = 20) -> int:
 def seed_frames(count: int = 60) -> int:
     """Pre-fetch and cache tilt grids for the most recent timestamps.
 
+    After fetching, pre-renders binary voxel tiles for the default CONUS
+    viewport (z=4) so the bulk endpoint serves instantly on first request.
     Returns number of timestamps now cached.
     """
     from concurrent.futures import ThreadPoolExecutor
+    from .tiles import bin_tile_cache, render_voxel_tile_binary
 
     logger.info("Seeding frame cache (%d frames across %d tilts)…", count, len(TILT_LEVELS))
     ref_keys = list_tilt_files("00.50", count=count)
@@ -227,14 +230,33 @@ def seed_frames(count: int = 60) -> int:
     total = tilt_cache.count()
     logger.info("Frame cache seeded: %d timestamps in memory, %d on disk",
                 total, len(disk_cache.list_tilt_grid_timestamps()))
+
+    tile_coords = _conus_tile_coords(z=4)
+    entries = disk_cache.list_tilt_grid_timestamps()
+    recent = entries[-20:]
+    prerendered = 0
+    for entry in recent:
+        ts = entry["timestamp"]
+        tilt_entry = tilt_cache.get(ts)
+        if tilt_entry is None:
+            continue
+        for z, x, y in tile_coords:
+            cache_key = (ts, z, x, y)
+            if bin_tile_cache.get(cache_key) is not None:
+                continue
+            data = render_voxel_tile_binary(
+                tilt_entry["grids"], tilt_entry["meta"], z, x, y,
+            )
+            bin_tile_cache.put(cache_key, data)
+            prerendered += 1
+
+    logger.info("Pre-rendered %d voxel tiles for default viewport", prerendered)
     return total
 
 
 def invalidate_all() -> None:
     """Clear all in-memory caches."""
     tilt_cache.clear()
-    from .tiles import bin_tile_cache, tile_cache, voxel_tile_cache
-    tile_cache.clear()
-    voxel_tile_cache.clear()
+    from .tiles import bin_tile_cache
     bin_tile_cache.clear()
     disk_cache.invalidate_ts_list_cache()
