@@ -44,12 +44,12 @@ def compute_composite(sparse_grids: dict[str, sp.csr_matrix]) -> np.ndarray:
         sgrid = sparse_grids.get(tilt)
         if sgrid is None:
             continue
-        dense = sgrid.toarray().astype(np.float32)
+        dense = sgrid.toarray()
         dense[dense == 0] = np.nan
         if result is None:
             result = dense
         else:
-            result = np.fmax(result, dense)
+            np.fmax(result, dense, out=result)
 
     if result is None:
         raise ValueError("No tilt grids available for composite")
@@ -108,7 +108,7 @@ def compute_motion_field(
             block_zm = block - block.mean()
             search_zm = search - search.mean()
 
-            block_norm = np.sqrt(np.sum(block_zm ** 2))
+            block_norm = np.linalg.norm(block_zm)
             if block_norm < 1e-6:
                 continue
 
@@ -125,7 +125,7 @@ def compute_motion_field(
 
             py, px = peak_idx
             patch = search_zm[py : py + block.shape[0], px : px + block.shape[1]]
-            patch_norm = np.sqrt(np.sum(patch ** 2))
+            patch_norm = np.linalg.norm(patch)
             if patch_norm > 1e-6 and patch.shape == block_zm.shape:
                 ncc = corr[peak_idx] / (block_norm * patch_norm)
                 conf = float(np.clip(ncc, 0.0, 1.0))

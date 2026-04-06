@@ -10,7 +10,7 @@ This is a working prototype, not a production app. Prioritise getting real data 
 
 All planned phases are complete.
 
-The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a custom MapLibre `CustomLayerInterface` with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Both 2D composite and 3D volumetric modes use the same atlas tile data — the difference is geometry (one ground plane vs 8 altitude planes). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS with 3D terrain, starting at a CONUS-wide view.
+The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a three.js overlay renderer synced to MapLibre's projection matrix, with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Three view modes use the same atlas tile data: Composite (fmax across bands on one ground plane), 3D (8 stacked planes at tilt altitudes), and Volume (ray-marched volumetric rendering). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS starting at a CONUS-wide view. 3D terrain is currently disabled pending a tile seam fix.
 
 ## Architecture
 
@@ -38,12 +38,13 @@ Responsibilities:
 
 Responsibilities:
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
-- 3D terrain via AWS elevation tiles (always enabled)
-- Custom `RadarLayer` (`CustomLayerInterface`) renders atlas tiles via WebGL with GLSL shaders
-- GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection, spatial smoothing, tile edge blending
+- 3D terrain via AWS elevation tiles (currently disabled — tile seam issue)
+- three.js overlay renderer (`RadarLayer` as MapLibre `CustomLayerInterface`) with camera projection synced from MapLibre's render callback matrix
+- GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection, spatial smoothing, tile edge blending
 - Motion texture cache loads per-frame-pair CONUS-wide motion vectors; shader converts tile UV → geographic coordinates → motion texture UV, traces pixels backward/forward along displacement field, blends with crossfade weighted by confidence
-- 2D composite mode: single ground-level quad per tile, shader takes fmax across 8 tilt bands
-- 3D layers mode: 8 stacked quads per tile at tilt altitudes, one band per quad
+- Composite mode: single ground-level quad per tile, shader takes fmax across 8 tilt bands
+- 3D mode: 8 stacked quads per tile at tilt altitudes, one band per quad
+- Volume mode: single box mesh per viewport, ray-marched through a stitched tile atlas texture with trilinear interpolation between tilt levels
 - Continuous float animation time with motion-compensated interpolation between keyframes
 - Viewport-based tile loading with browser HTTP cache (`force-cache` + `immutable`)
 - Default CONUS view at z=4, user zooms in to area of interest
@@ -116,7 +117,7 @@ for page in paginator.paginate(Bucket='noaa-mrms-pds', Prefix=prefix):
 
 The frontend fetches tile config from `GET /api/config` at startup and falls back gracefully. Store API keys in `.env` (see `.env.example`).
 
-3D terrain is always enabled using AWS Terrain Tiles:
+3D terrain is currently disabled (commented out in `app.js`) due to a tile seam issue with the radar overlay. When re-enabled, it uses AWS Terrain Tiles:
 ```javascript
 map.addSource('terrain', {
     type: 'raster-dem',
@@ -151,14 +152,16 @@ bearing: 0
 No eccodes, no cfgrib, no system-level C dependencies.
 
 ### Frontend
-- **MapLibre GL JS** (~v4) — base map + 3D terrain
-- **Custom WebGL** — `CustomLayerInterface` with GLSL shaders for atlas tile rendering
-- **Vanilla JS** — no framework, no build step, no deck.gl
+- **MapLibre GL JS** (~v4) — base map (3D terrain disabled pending seam fix)
+- **three.js** (~v0.160) — overlay WebGL renderer, synced to MapLibre's projection matrix
+- **GLSL shaders** via `THREE.ShaderMaterial` — dBZ decoding, color ramp, motion advection, volume ray marching
+- **Vanilla JS** — no framework, no build step
 
 Loaded from CDN:
 ```html
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 ```
 
 ## API Endpoints
@@ -420,7 +423,7 @@ weather_radar/
 ├── frontend/
 │   ├── index.html         ← single-page app
 │   ├── style.css          ← dark theme, glassmorphism panels
-│   ├── radar-layer.js     ← CustomLayerInterface: WebGL rendering, motion advection GLSL shaders
+│   ├── radar-layer.js     ← three.js overlay renderer, GLSL shaders, tile/motion texture caches
 │   ├── app.js             ← map init, continuous animation, motion prefetch, UI wiring
 │   └── colors.js          ← NWS color scale, legend builder, GPU color ramp data
 ├── tests/
@@ -544,10 +547,10 @@ The earlier approach used deck.gl `PointCloudLayer` with `DataFilterExtension` f
 
 The atlas tile approach, inspired by [MapTiler's 3D weather demo](https://www.maptiler.com/tools/weather/3d/), achieves MapTiler-level visual polish:
 1. **Atlas tiles** — 256×2048 grayscale PNG per tile, 8 tilt bands stacked vertically (~2-10 KB each)
-2. **Custom WebGL** — MapLibre `CustomLayerInterface` renders textured quads directly in the GL context
+2. **three.js overlay** — separate `WebGLRenderer` canvas over MapLibre, camera projection synced per frame from MapLibre's matrix. Registered as a MapLibre `CustomLayerInterface`.
 3. **GLSL shaders** — GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection, spatial smoothing, tile edge blending
 4. **Continuous animation** — float `currentAnimationTime` with motion-compensated interpolation so storms slide smoothly between keyframes
-5. **2D/3D from same data** — composite mode takes `fmax` across 8 bands in the shader; 3D mode renders 8 stacked quads
+5. **Three view modes from same data** — composite takes `fmax` across 8 bands in the shader; 3D renders 8 stacked quads; volume ray-marches through a stitched tile atlas
 6. **Browser HTTP cache** — `Cache-Control: immutable` + `force-cache` makes revisited frames instant
 
 ### Why FFT block matching for motion (not optical flow or MRMS products)

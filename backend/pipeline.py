@@ -120,9 +120,7 @@ def _build_frame(ref_key: str, pool=None) -> tuple[str, dict[str, sp.csr_matrix]
 
     sparse_grids: dict[str, sp.csr_matrix] = {}
     for tilt, (grid, _) in decoded.items():
-        g = grid.copy()
-        g[np.isnan(g)] = 0
-        sparse_grids[tilt] = sp.csr_matrix(g)
+        sparse_grids[tilt] = sp.csr_matrix(np.nan_to_num(grid, nan=0.0))
 
     disk_cache.put_tilt_grids(timestamp, sparse_grids, meta)
     return timestamp, sparse_grids, meta
@@ -198,6 +196,26 @@ def _rebuild_from_raw(limit: int = 20) -> int:
     return rebuilt
 
 
+def _prerender_atlas_tiles(entries: list[dict], tile_coords: list[tuple[int, int, int]]) -> int:
+    """Pre-render atlas PNG tiles for the given timestamps and tile coordinates."""
+    from .tiles import atlas_tile_cache, render_atlas_tile
+
+    count = 0
+    for entry in entries:
+        ts = entry["timestamp"]
+        tilt_entry = tilt_cache.get(ts)
+        if tilt_entry is None:
+            continue
+        grids, meta = tilt_entry["grids"], tilt_entry["meta"]
+        for z, x, y in tile_coords:
+            cache_key = (ts, z, x, y)
+            if atlas_tile_cache.get(cache_key) is None:
+                data = render_atlas_tile(grids, meta, z, x, y)
+                atlas_tile_cache.put(cache_key, data)
+                count += 1
+    return count
+
+
 def warm_from_disk(limit: int = 20) -> int:
     """Load the most recent frames from disk into the in-memory cache.
 
@@ -208,8 +226,6 @@ def warm_from_disk(limit: int = 20) -> int:
     Falls back to rebuilding from raw GRIB2 files if tilt_grids/ is
     empty (e.g. after a cache wipe).
     """
-    from .tiles import atlas_tile_cache, render_atlas_tile
-
     entries = disk_cache.list_tilt_grid_timestamps()
     if not entries:
         logger.info("No tilt grids on disk — attempting rebuild from raw files")
@@ -236,20 +252,7 @@ def warm_from_disk(limit: int = 20) -> int:
     logger.info("Warmed %d/%d frames from disk into memory", loaded, len(recent))
 
     tile_coords = _conus_tile_coords(z=4)
-    atlas_count = 0
-    for entry in recent:
-        ts = entry["timestamp"]
-        tilt_entry = tilt_cache.get(ts)
-        if tilt_entry is None:
-            continue
-        grids, meta = tilt_entry["grids"], tilt_entry["meta"]
-        for z, x, y in tile_coords:
-            cache_key = (ts, z, x, y)
-            if atlas_tile_cache.get(cache_key) is None:
-                data = render_atlas_tile(grids, meta, z, x, y)
-                atlas_tile_cache.put(cache_key, data)
-                atlas_count += 1
-
+    atlas_count = _prerender_atlas_tiles(recent, tile_coords)
     logger.info("Pre-rendered %d atlas tiles (%d coords × %d frames)",
                 atlas_count, len(tile_coords), loaded)
 
@@ -264,7 +267,6 @@ def seed_frames(count: int = 60) -> int:
     default CONUS viewport (z=4).  Returns number of timestamps cached.
     """
     from concurrent.futures import ThreadPoolExecutor
-    from .tiles import atlas_tile_cache, render_atlas_tile
 
     logger.info("Seeding frame cache (%d frames across %d tilts)…", count, len(TILT_LEVELS))
     ref_keys = list_tilt_files("00.50", count=count)
@@ -294,20 +296,7 @@ def seed_frames(count: int = 60) -> int:
     tile_coords = _conus_tile_coords(z=4)
     entries = disk_cache.list_tilt_grid_timestamps()
     recent = entries[-20:]
-    atlas_count = 0
-    for entry in recent:
-        ts = entry["timestamp"]
-        tilt_entry = tilt_cache.get(ts)
-        if tilt_entry is None:
-            continue
-        grids, meta = tilt_entry["grids"], tilt_entry["meta"]
-        for z, x, y in tile_coords:
-            cache_key = (ts, z, x, y)
-            if atlas_tile_cache.get(cache_key) is None:
-                data = render_atlas_tile(grids, meta, z, x, y)
-                atlas_tile_cache.put(cache_key, data)
-                atlas_count += 1
-
+    atlas_count = _prerender_atlas_tiles(recent, tile_coords)
     logger.info("Pre-rendered %d atlas tiles for default viewport", atlas_count)
 
     compute_all_motion()

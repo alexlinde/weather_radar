@@ -468,6 +468,7 @@ class RadarLayer {
     this._stalePurgeTimer = null;
     this._dummyTex = null;
     this._currentMatrix = null;
+    this._camPosVec = null;
 
     this._volCanvasA = null;
     this._volCanvasB = null;
@@ -738,6 +739,7 @@ class RadarLayer {
     this._colorRampTex = buildColorRampTexture();
     this._dummyTex = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
     this._dummyTex.needsUpdate = true;
+    this._camPosVec = new THREE.Vector3();
   }
 
   _resizeRenderer() {
@@ -1030,7 +1032,7 @@ class RadarLayer {
     const cx = ((b0*(a11*a22-a12*a21) - a01*(b1*a22-a12*b2) + a02*(b1*a21-a11*b2))) * invDet;
     const cy = ((a00*(b1*a22-a12*b2) - b0*(a10*a22-a12*a20) + a02*(a10*b2-b1*a20))) * invDet;
     const cz = ((a00*(a11*b2-b1*a21) - a01*(a10*b2-b1*a20) + b0*(a10*a21-a11*a20))) * invDet;
-    return new THREE.Vector3(cx, cy, cz);
+    return this._camPosVec.set(cx, cy, cz);
   }
 
   _purgeStale() {

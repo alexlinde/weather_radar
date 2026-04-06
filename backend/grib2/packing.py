@@ -21,26 +21,30 @@ def _apply_scale(packed: np.ndarray, R: float, E: int, D: int) -> np.ndarray:
     return (R + packed.astype(np.float32) * (2.0**E)) / (10.0**D)
 
 
-def _expand_bitmap(values: np.ndarray, bitmap_bytes: bytes | None, num_points: int) -> np.ndarray:
+def _unpack_bitmap(bitmap_bytes: bytes, num_points: int) -> np.ndarray:
+    """Unpack a GRIB2 bitmap to a boolean mask of valid data points."""
+    bits = np.unpackbits(np.frombuffer(bitmap_bytes, dtype=np.uint8))
+    return bits[:num_points]
+
+
+def _expand_bitmap(
+    values: np.ndarray,
+    bitmap_mask: np.ndarray | None,
+    num_points: int,
+) -> np.ndarray:
     """
-    If a bitmap is present, expand the sparse `values` array (one entry per set bit)
-    back to the full `num_points` grid, filling missing points with NaN.
+    If a bitmap mask is present, expand the sparse `values` array (one entry per
+    set bit) back to the full `num_points` grid, filling missing points with NaN.
     """
-    if bitmap_bytes is None:
-        # No bitmap — values covers all grid points
+    if bitmap_mask is None:
         if len(values) != num_points:
             raise ValueError(
                 f"Expected {num_points} values but got {len(values)} (no bitmap present)"
             )
         return values
 
-    # Unpack the bitmap: each byte encodes 8 points, MSB first
-    bits = np.unpackbits(np.frombuffer(bitmap_bytes, dtype=np.uint8))
-    # Trim to exact number of grid points (bitmap is padded to byte boundary)
-    bits = bits[:num_points]
-
     full = np.full(num_points, np.nan, dtype=np.float32)
-    full[bits == 1] = values
+    full[bitmap_mask == 1] = values
     return full
 
 
@@ -58,18 +62,17 @@ def unpack_simple(
     Reads `num_packed` N-bit unsigned integers from the bitstream, applies
     the scaling formula, then expands using the bitmap.
     """
-    num_packed = int(np.sum(np.unpackbits(np.frombuffer(bitmap_bytes, dtype=np.uint8))[:num_points])) \
-        if bitmap_bytes is not None else num_points
+    bitmap_mask = _unpack_bitmap(bitmap_bytes, num_points) if bitmap_bytes is not None else None
+    num_packed = int(bitmap_mask.sum()) if bitmap_mask is not None else num_points
 
     if bits_per_value == 0:
-        # All values are equal to R/10^D (constant field)
         physical = np.full(num_packed, R / (10.0**D), dtype=np.float32)
     else:
         reader = BitstreamReader(section7_bytes)
         raw = reader.read_array(bits_per_value, num_packed).astype(np.float32)
         physical = _apply_scale(raw, R, E, D)
 
-    return _expand_bitmap(physical, bitmap_bytes, num_points)
+    return _expand_bitmap(physical, bitmap_mask, num_points)
 
 
 def unpack_jpeg2000(
@@ -89,8 +92,9 @@ def unpack_jpeg2000(
     img = Image.open(BytesIO(section7_bytes))
     packed = np.array(img, dtype=np.float32).ravel()
 
+    bitmap_mask = _unpack_bitmap(bitmap_bytes, num_points) if bitmap_bytes is not None else None
     physical = _apply_scale(packed, R, E, D)
-    return _expand_bitmap(physical, bitmap_bytes, num_points)
+    return _expand_bitmap(physical, bitmap_mask, num_points)
 
 
 def unpack_png(
@@ -110,5 +114,6 @@ def unpack_png(
     img = Image.open(BytesIO(section7_bytes))
     packed = np.array(img, dtype=np.float32).ravel()
 
+    bitmap_mask = _unpack_bitmap(bitmap_bytes, num_points) if bitmap_bytes is not None else None
     physical = _apply_scale(packed, R, E, D)
-    return _expand_bitmap(physical, bitmap_bytes, num_points)
+    return _expand_bitmap(physical, bitmap_mask, num_points)

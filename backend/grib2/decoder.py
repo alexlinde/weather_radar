@@ -8,7 +8,7 @@ Usage:
 
 Returns:
     metadata: dict with keys timestamp, La1, Lo1, La2, Lo2, Ni, Nj, Di, Dj
-    grid:     numpy 2-D float64 array of shape (Nj, Ni), dBZ values, NaN for missing
+    grid:     numpy 2-D float32 array of shape (Nj, Ni), dBZ values, NaN for missing
 """
 
 from __future__ import annotations

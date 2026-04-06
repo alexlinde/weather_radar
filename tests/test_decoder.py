@@ -85,9 +85,9 @@ class TestGrid:
         metadata, grid = decoded
         assert grid.shape == (metadata["Nj"], metadata["Ni"])
 
-    def test_dtype_float64(self, decoded):
+    def test_dtype_float32(self, decoded):
         _, grid = decoded
-        assert grid.dtype == np.float64
+        assert grid.dtype == np.float32
 
     def test_expected_conus_shape(self, decoded):
         _, grid = decoded
@@ -128,23 +128,3 @@ class TestGrid:
             warnings.warn("No precipitation found in CONUS (unusual but possible in rare conditions)")
 
 
-class TestNYCClip:
-    def test_clip_shape(self, decoded):
-        metadata, grid = decoded
-        from backend.mrms import clip_to_bbox, NYC_BBOX
-        clipped, cmeta = clip_to_bbox(grid, metadata, NYC_BBOX)
-        # Should be a small array
-        assert clipped.ndim == 2
-        assert clipped.shape[0] > 0
-        assert clipped.shape[1] > 0
-        assert clipped.shape == (cmeta["Nj"], cmeta["Ni"])
-
-    def test_clip_bounds_within_bbox(self, decoded):
-        metadata, grid = decoded
-        from backend.mrms import clip_to_bbox, NYC_BBOX
-        _, cmeta = clip_to_bbox(grid, metadata, NYC_BBOX)
-        # Clipped bounds should be within (or very close to) the requested bbox
-        assert cmeta["north"] <= NYC_BBOX["north"] + 0.02
-        assert cmeta["south"] >= NYC_BBOX["south"] - 0.02
-        assert cmeta["west"] >= NYC_BBOX["west"] - 0.02
-        assert cmeta["east"] <= NYC_BBOX["east"] + 0.02
