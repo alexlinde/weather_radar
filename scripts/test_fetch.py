@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone script: download the latest MRMS composite reflectivity frame,
+Standalone script: download the latest MRMS tilt-level reflectivity frame,
 decode it, print diagnostic info, and save the raw .gz file to tests/fixtures/.
 
 Run from the project root:
@@ -10,11 +10,9 @@ Run from the project root:
 from __future__ import annotations
 
 import sys
-import os
 import gzip
 import pathlib
 
-# Allow importing from backend/ when run from the project root
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import boto3
@@ -22,10 +20,11 @@ import numpy as np
 from botocore import UNSIGNED
 from botocore.config import Config
 
-from backend.mrms import BUCKET, COMPOSITE_PRODUCT, list_latest_files, clip_to_bbox, mask_sentinel_values
+from backend.mrms import BUCKET, list_latest_files, clip_to_bbox, mask_sentinel_values, NYC_BBOX
 from backend.grib2.decoder import decode_grib2
 
 FIXTURES_DIR = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+TILT_PRODUCT = "CONUS/MergedReflectivityQC_00.50"
 
 
 def main() -> None:
@@ -33,9 +32,8 @@ def main() -> None:
     print("MRMS Fetch + Decode Test")
     print("=" * 60)
 
-    # --- List available files ---
-    print(f"\nListing files in s3://{BUCKET}/{COMPOSITE_PRODUCT}/YYYYMMDD/ …")
-    keys = list_latest_files(COMPOSITE_PRODUCT, count=5)
+    print(f"\nListing files for {TILT_PRODUCT} …")
+    keys = list_latest_files(TILT_PRODUCT, count=5)
     if not keys:
         print("ERROR: No files found in bucket.")
         sys.exit(1)
@@ -46,21 +44,18 @@ def main() -> None:
 
     latest_key = keys[0]
 
-    # --- Download + decompress ---
     print(f"\nDownloading: {latest_key}")
     s3 = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
     response = s3.get_object(Bucket=BUCKET, Key=latest_key)
     compressed = response["Body"].read()
     print(f"Compressed size: {len(compressed) / 1024:.1f} KB")
 
-    # Save the compressed file to fixtures/
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-    fixture_name = pathlib.Path(latest_key).name  # e.g. MRMS_Merged...grib2.gz
+    fixture_name = pathlib.Path(latest_key).name
     fixture_path = FIXTURES_DIR / fixture_name
     fixture_path.write_bytes(compressed)
     print(f"Saved fixture to: {fixture_path}")
 
-    # --- Decompress + decode ---
     print("\nDecompressing…")
     raw = gzip.decompress(compressed)
     print(f"Decompressed size: {len(raw) / 1024:.1f} KB")
@@ -88,9 +83,7 @@ def main() -> None:
     print(f"  Points > 5 dBZ:     {(valid > 5).sum():,}")
     print(f"  Points > 35 dBZ:    {(valid > 35).sum():,}")
 
-    # --- Clip to NYC ---
     print("\n--- NYC Clip ---")
-    from backend.mrms import NYC_BBOX
     clipped, cmeta = clip_to_bbox(grid, metadata, NYC_BBOX)
     print(f"  Shape:  {clipped.shape}")
     print(f"  North:  {cmeta['north']:.4f}°")

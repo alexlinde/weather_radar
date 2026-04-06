@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -22,7 +21,6 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from PIL import Image
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -37,27 +35,25 @@ except ImportError:
     pass
 
 
-# ── Lifespan: seed frame cache on startup ─────────────────────────────────────
+# ── Lifespan: migrate legacy cache, evict stale files, seed frames ───────────
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import threading
-    from . import disk_cache, mrms, mrms_volume
+    from . import disk_cache, pipeline
+    from .cache import composite_cache, volume_cache
 
+    disk_cache.migrate_legacy_cache()
     disk_cache.evict_older_than(hours=24)
 
     def _bg_seed():
         try:
-            n = mrms.get_recent_frames(60)
-            logger.info("Composite seeding complete: %d frames", n)
+            n = pipeline.seed_frames(60)
+            logger.info("Seeding complete: %d volume / %d composite",
+                        n, composite_cache.count())
         except Exception:
-            logger.exception("Composite seeding failed")
-        try:
-            n = mrms_volume.seed_volume_frames(60)
-            logger.info("Volume seeding complete: %d frames", n)
-        except Exception:
-            logger.exception("Volume seeding failed")
+            logger.exception("Frame seeding failed")
 
     threading.Thread(target=_bg_seed, daemon=True, name="cache-seed").start()
     logger.info("Cache seeding started in background — server ready")
@@ -65,7 +61,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="NYC Weather Radar API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="NYC Weather Radar API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,42 +77,6 @@ app.add_middleware(
     ],
 )
 
-# ── NWS Reflectivity Color Scale ──────────────────────────────────────────────
-
-NWS_DBZ_COLORS: list[tuple[float, float, int, int, int]] = [
-    (5, 10, 64, 192, 64),
-    (10, 15, 48, 160, 48),
-    (15, 20, 0, 144, 0),
-    (20, 25, 0, 120, 0),
-    (25, 30, 255, 255, 0),
-    (30, 35, 230, 180, 0),
-    (35, 40, 255, 100, 0),
-    (40, 45, 255, 0, 0),
-    (45, 50, 200, 0, 0),
-    (50, 55, 180, 0, 120),
-    (55, 60, 150, 0, 200),
-    (60, 65, 255, 255, 255),
-    (65, 75, 200, 200, 255),
-]
-
-
-def grid_to_png(grid: np.ndarray) -> bytes:
-    """Convert a 2D dBZ array to a PNG with NWS color scale. Transparent below 5 dBZ."""
-    rows, cols = grid.shape
-    rgba = np.zeros((rows, cols, 4), dtype=np.uint8)
-
-    for min_dbz, max_dbz, r, g, b in NWS_DBZ_COLORS:
-        mask = (~np.isnan(grid)) & (grid >= min_dbz) & (grid < max_dbz)
-        rgba[mask] = [r, g, b, 220]
-
-    rgba[(~np.isnan(grid)) & (grid >= 75)] = [200, 200, 255, 220]
-
-    img = Image.fromarray(rgba, mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
-    buf.seek(0)
-    return buf.read()
-
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -124,13 +84,19 @@ def grid_to_png(grid: np.ndarray) -> bytes:
 @app.get("/api/radar/latest")
 def radar_latest():
     """Return the latest clipped NYC radar frame as JSON."""
-    try:
-        from .cache import get_or_fetch_latest
+    from .cache import composite_cache
+    from . import pipeline
 
-        grid, metadata = get_or_fetch_latest()
-    except Exception:
-        logger.exception("Failed to fetch radar data")
-        raise HTTPException(status_code=502, detail="Failed to fetch radar data")
+    entry = composite_cache.latest()
+    if entry is None:
+        try:
+            grid, metadata = pipeline.fetch_latest_composite()
+        except Exception:
+            logger.exception("Failed to fetch radar data")
+            raise HTTPException(status_code=502, detail="Failed to fetch radar data")
+    else:
+        _, frame = entry
+        grid, metadata = frame.grid, frame.metadata
 
     rounded = np.round(grid, 2)
     data_serialisable = np.where(np.isnan(rounded), None, rounded).tolist()
@@ -154,13 +120,20 @@ def radar_latest():
 @app.get("/api/radar/image")
 def radar_image():
     """Return the latest NYC radar frame as a PNG with NWS colour scale."""
-    try:
-        from .cache import get_or_fetch_latest
+    from .cache import composite_cache
+    from . import pipeline
+    from .render import grid_to_png
 
-        grid, metadata = get_or_fetch_latest()
-    except Exception:
-        logger.exception("Failed to fetch radar data")
-        raise HTTPException(status_code=502, detail="Failed to fetch radar data")
+    entry = composite_cache.latest()
+    if entry is None:
+        try:
+            grid, metadata = pipeline.fetch_latest_composite()
+        except Exception:
+            logger.exception("Failed to fetch radar data")
+            raise HTTPException(status_code=502, detail="Failed to fetch radar data")
+    else:
+        _, frame = entry
+        grid, metadata = frame.grid, frame.metadata
 
     png_bytes = grid_to_png(grid)
 
@@ -178,13 +151,11 @@ def radar_image():
 
 @app.get("/api/radar/frames")
 def radar_frames(count: int = Query(default=60, ge=1, le=70)):
-    """
-    Return up to `count` recent radar frames as base64-encoded PNGs.
-    Frames are ordered oldest-first (chronological) for animation playback.
-    """
-    from . import cache
+    """Return recent radar frames as base64-encoded PNGs, oldest-first."""
+    from .cache import composite_cache
+    from .render import grid_to_png
 
-    frames_data = cache.get_frames(count)
+    frames_data = composite_cache.items(count)
     if not frames_data:
         raise HTTPException(status_code=503, detail="No frames cached yet")
 
@@ -211,16 +182,11 @@ def radar_frames(count: int = Query(default=60, ge=1, le=70)):
 
 @app.get("/api/radar/volume")
 async def radar_volume():
-    """
-    Return the latest multi-level radar snapshot as voxel data.
-
-    Each voxel: [lon, lat, altitude_m, dbz]
-    Only cells with reflectivity >= 10 dBZ are included.
-    """
+    """Return the latest multi-level radar snapshot as voxel data."""
     try:
-        from . import mrms_volume
+        from . import pipeline
 
-        volume = await asyncio.to_thread(mrms_volume.fetch_volume_snapshot)
+        volume = await asyncio.to_thread(pipeline.fetch_volume_snapshot)
     except Exception:
         logger.exception("Failed to fetch volume data")
         raise HTTPException(status_code=502, detail="Failed to fetch volume data")
@@ -234,15 +200,10 @@ async def radar_volume():
 
 @app.get("/api/radar/volume/frames")
 async def radar_volume_frames(count: int = Query(default=60, ge=1, le=70)):
-    """
-    Return up to `count` recent volume frames as pre-computed column data.
-    Frames are ordered oldest-first for animation playback, matching the
-    ordering of /api/radar/frames.
-    Each frame: { timestamp, columns: [[lon, lat, max_dbz, echo_top_km], ...] }
-    """
-    from . import mrms_volume
+    """Return recent volume frames as pre-computed voxel data, oldest-first."""
+    from . import pipeline
 
-    frames = mrms_volume.get_volume_frames(count)
+    frames = pipeline.get_volume_frames(count)
     if not frames:
         raise HTTPException(
             status_code=503,
@@ -253,11 +214,11 @@ async def radar_volume_frames(count: int = Query(default=60, ge=1, le=70)):
 
 @app.get("/api/radar/refresh")
 async def radar_refresh():
-    """Force cache invalidation and re-seed."""
-    from . import cache, mrms
+    """Force cache invalidation and re-seed both caches."""
+    from . import pipeline
 
-    cache.invalidate()
-    count = await asyncio.to_thread(mrms.get_recent_frames, 60)
+    pipeline.invalidate_all()
+    count = await asyncio.to_thread(pipeline.seed_frames, 60)
     return {"status": "refreshed", "frames": count}
 
 
@@ -272,10 +233,10 @@ async def api_config():
 
 @app.get("/health")
 async def health():
-    from . import cache, mrms_volume
+    from .cache import composite_cache, volume_cache
 
     return {
         "status": "ok",
-        "cached_frames": cache.frame_count(),
-        "volume_frames": mrms_volume.volume_frame_count(),
+        "cached_frames": composite_cache.count(),
+        "volume_frames": volume_cache.count(),
     }

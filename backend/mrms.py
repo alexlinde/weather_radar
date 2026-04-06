@@ -1,10 +1,8 @@
 """
-MRMS data access: list S3 files, download, decompress, decode, and clip to NYC.
+MRMS data access: S3 client, file listing, download, decode, and clip.
 
-Fetch pipeline (three-tier waterfall):
-  1. In-memory cache (backend.cache)
-  2. Disk cache (backend.disk_cache) — persists across server restarts
-  3. NOAA S3 bucket (noaa-mrms-pds)
+Low-level utilities used by pipeline.py (the primary data pipeline).
+Fetch path: disk cache → S3 bucket (noaa-mrms-pds).
 """
 
 from __future__ import annotations
@@ -19,14 +17,12 @@ import numpy as np
 from botocore import UNSIGNED
 from botocore.config import Config
 
-from . import cache as _cache
 from . import disk_cache
 from .grib2.decoder import decode_grib2
 
 logger = logging.getLogger(__name__)
 
 BUCKET = "noaa-mrms-pds"
-COMPOSITE_PRODUCT = "CONUS/MergedReflectivityQCComposite_00.50"
 
 NYC_BBOX = {
     "north": 42.0,
@@ -43,7 +39,7 @@ def _s3_client():
     )
 
 
-def list_latest_files(product: str = COMPOSITE_PRODUCT, count: int = 10) -> list[str]:
+def list_latest_files(product: str, count: int = 10) -> list[str]:
     """
     List the most recent GRIB2 files for `product` in the MRMS S3 bucket.
 
@@ -107,86 +103,7 @@ def decode_and_clip(
     return clipped, clipped_meta
 
 
-def fetch_and_decode(
-    s3_key: str, bbox: dict | None = None
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """
-    Full pipeline for a single frame.
-    Cache waterfall: memory -> decoded disk -> raw disk -> S3 -> decode -> clip.
-    """
-    bbox = bbox or NYC_BBOX
-    entry = _cache.get(s3_key)
-    if entry is not None:
-        return entry.grid, entry.metadata
-
-    decoded = disk_cache.get_decoded(s3_key)
-    if decoded is not None:
-        grid, metadata = decoded
-        _cache.store(s3_key, metadata, grid)
-        return grid, metadata
-
-    raw_gz = fetch_raw(s3_key)
-    grid, metadata = decode_and_clip(raw_gz, bbox)
-    disk_cache.put_decoded(s3_key, grid, metadata)
-    _cache.store(s3_key, metadata, grid)
-    return grid, metadata
-
-
-def get_recent_frames(count: int = 20) -> int:
-    """
-    Fetch and cache the `count` most recent frames.
-    Uses ThreadPoolExecutor for parallel decoding, then inserts into the
-    memory cache in chronological order.
-    Returns number of frames now in cache.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    keys = list_latest_files(count=count)
-    if not keys:
-        logger.warning("No MRMS files found in S3 bucket")
-        return _cache.frame_count()
-
-    # oldest-first ordering for cache insertion
-    ordered_keys = list(reversed(keys))
-    to_fetch = [k for k in ordered_keys if not _cache.has(k)]
-
-    if not to_fetch:
-        logger.info("All %d frames already cached", len(ordered_keys))
-        return _cache.frame_count()
-
-    logger.info("Loading %d frames (%d need decoding)…", len(ordered_keys), len(to_fetch))
-
-    results: dict[str, tuple[np.ndarray, dict[str, Any]]] = {}
-
-    def _decode_one(key: str) -> tuple[str, np.ndarray, dict[str, Any]]:
-        grid, meta = fetch_and_decode(key)
-        return key, grid, meta
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_decode_one, k): k for k in to_fetch}
-        done = 0
-        for f in as_completed(futures):
-            done += 1
-            try:
-                key, grid, meta = f.result()
-                results[key] = (grid, meta)
-                logger.info("  [%d/%d] decoded %s", done, len(to_fetch), key.split("/")[-1])
-            except Exception:
-                logger.exception("Failed to decode %s, skipping", futures[f])
-
-    # Insert into memory cache in chronological order
-    for key in ordered_keys:
-        if key in results:
-            grid, meta = results[key]
-            _cache.store(key, meta, grid)
-        elif not _cache.has(key):
-            pass  # skip failed keys
-
-    logger.info("Frame cache now has %d frames", _cache.frame_count())
-    return _cache.frame_count()
-
-
-# ── Helpers (unchanged from Phase 1) ─────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def clip_to_bbox(
@@ -251,17 +168,3 @@ def mask_sentinel_values(data: np.ndarray, threshold: float = -30.0) -> np.ndarr
     return data
 
 
-# Keep for backward compat (used by test scripts)
-def fetch_grib2(s3_key: str) -> bytes:
-    """Download a .grib2.gz file from S3 and return decompressed GRIB2 bytes."""
-    raw_gz = fetch_raw(s3_key)
-    return gzip.decompress(raw_gz)
-
-
-def get_latest_frame(bbox: dict | None = None) -> tuple[np.ndarray, dict]:
-    """Fetch, decode, and clip the latest MRMS composite reflectivity frame."""
-    bbox = bbox or NYC_BBOX
-    keys = list_latest_files(COMPOSITE_PRODUCT, count=5)
-    if not keys:
-        raise RuntimeError("No MRMS files found in S3 bucket")
-    return fetch_and_decode(keys[0], bbox)
