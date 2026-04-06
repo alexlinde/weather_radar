@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
     disk_cache.evict_older_than(hours=24)
 
     if DEV_MODE:
-        n = pipeline.warm_from_disk(limit=20)
+        n = pipeline.warm_from_disk(limit=30)
         logger.info("DEV_MODE: warmed %d frames from disk cache (no S3 fetch)", n)
     else:
         def _bg_seed():
@@ -83,7 +83,7 @@ app.add_middleware(
 # ── Atlas tiles (8 tilts packed into one grayscale PNG) ───────────────────────
 
 
-MAX_FRAMES = 20
+MAX_FRAMES = 30
 
 
 @app.get("/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png")

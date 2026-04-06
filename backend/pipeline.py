@@ -24,7 +24,7 @@ from .mrms import S3KeyNotFound, fetch_raw, list_latest_files, mask_sentinel_val
 
 logger = logging.getLogger(__name__)
 
-TILT_LEVELS = ["00.50", "01.50", "02.50", "03.50", "05.00", "07.00", "10.00", "14.00"]
+TILT_LEVELS = ["00.50", "01.00", "01.50", "02.50", "04.00", "07.00", "10.00", "19.00"]
 
 VOLUME_PRODUCT_TEMPLATE = "CONUS/MergedReflectivityQC_{tilt}"
 
@@ -144,7 +144,7 @@ def _conus_tile_coords(z: int = 4) -> list[tuple[int, int, int]]:
     return [(z, x, y) for x in range(x_min, x_max + 1) for y in range(y_min, y_max + 1)]
 
 
-def _rebuild_from_raw(limit: int = 20) -> int:
+def _rebuild_from_raw(limit: int = 30) -> int:
     """Rebuild tilt grids from raw GRIB2 files when tilt_grids/ is missing.
 
     Scans data/raw/ for available timestamps, decodes, and stores as
@@ -216,7 +216,7 @@ def _prerender_atlas_tiles(entries: list[dict], tile_coords: list[tuple[int, int
     return count
 
 
-def warm_from_disk(limit: int = 20) -> int:
+def warm_from_disk(limit: int = 30) -> int:
     """Load the most recent frames from disk into the in-memory cache.
 
     Skips all S3 fetching — useful for dev mode when you already have
@@ -251,10 +251,12 @@ def warm_from_disk(limit: int = 20) -> int:
 
     logger.info("Warmed %d/%d frames from disk into memory", loaded, len(recent))
 
-    tile_coords = _conus_tile_coords(z=4)
-    atlas_count = _prerender_atlas_tiles(recent, tile_coords)
-    logger.info("Pre-rendered %d atlas tiles (%d coords × %d frames)",
-                atlas_count, len(tile_coords), loaded)
+    tile_coords_z4 = _conus_tile_coords(z=4)
+    atlas_count = _prerender_atlas_tiles(recent, tile_coords_z4)
+    tile_coords_z5 = _conus_tile_coords(z=5)
+    recent_z5 = recent[-10:]
+    atlas_count += _prerender_atlas_tiles(recent_z5, tile_coords_z5)
+    logger.info("Pre-rendered %d atlas tiles (z=4 full + z=5 recent)", atlas_count)
 
     compute_all_motion()
     return loaded
@@ -293,11 +295,14 @@ def seed_frames(count: int = 60) -> int:
     logger.info("Frame cache seeded: %d timestamps in memory, %d on disk",
                 total, len(disk_cache.list_tilt_grid_timestamps()))
 
-    tile_coords = _conus_tile_coords(z=4)
+    tile_coords_z4 = _conus_tile_coords(z=4)
     entries = disk_cache.list_tilt_grid_timestamps()
-    recent = entries[-20:]
-    atlas_count = _prerender_atlas_tiles(recent, tile_coords)
-    logger.info("Pre-rendered %d atlas tiles for default viewport", atlas_count)
+    recent = entries[-30:]
+    atlas_count = _prerender_atlas_tiles(recent, tile_coords_z4)
+    tile_coords_z5 = _conus_tile_coords(z=5)
+    recent_z5 = recent[-10:]
+    atlas_count += _prerender_atlas_tiles(recent_z5, tile_coords_z5)
+    logger.info("Pre-rendered %d atlas tiles for default viewport (z=4 + z=5)", atlas_count)
 
     compute_all_motion()
     return total

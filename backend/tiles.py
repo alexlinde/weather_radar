@@ -74,7 +74,7 @@ class TileCache:
 ATLAS_BAND_SIZE = 256
 ATLAS_NUM_BANDS = 8
 
-TILT_ORDER = ["00.50", "01.50", "02.50", "03.50", "05.00", "07.00", "10.00", "14.00"]
+TILT_ORDER = ["00.50", "01.00", "01.50", "02.50", "04.00", "07.00", "10.00", "19.00"]
 
 _EMPTY_ATLAS: bytes | None = None
 

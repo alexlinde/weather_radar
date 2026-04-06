@@ -23,7 +23,7 @@ class ConusTiltCache:
     Each entry holds 8 sparse CSR tilt grids (~39 MB) + metadata.
     """
 
-    def __init__(self, max_size: int = 20) -> None:
+    def __init__(self, max_size: int = 30) -> None:
         self._max = max_size
         self._data: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.Lock()

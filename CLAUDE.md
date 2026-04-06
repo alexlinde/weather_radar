@@ -30,7 +30,7 @@ Responsibilities:
 - Convert to scipy.sparse CSR matrices (95-99% of grid is NaN/sentinel → 20x memory reduction)
 - Serve atlas tiles (`/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png`) — 256×2048 grayscale PNG with 8 tilt bands, dBZ encoded as uint8
 - Compute motion fields between consecutive frames via FFT block matching (`motion.py`) and serve as RGB PNG (`/api/radar/motion/{timestamp}.png`)
-- Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + atlas tile LRU (2000 entries)
+- Two-tier caching: ConusTiltCache (sparse LRU, ~30 entries, ~1.2 GB) + atlas tile LRU (2000 entries)
 - GZip middleware for API responses
 - Background seeding on startup (60 frames across all tilts) + atlas tile pre-rendering + motion field computation for all consecutive pairs
 
@@ -71,14 +71,14 @@ s3://noaa-mrms-pds/CONUS/MergedReflectivityQC_{tilt}/{YYYYMMDD}/MRMS_...grib2.gz
 
 We fetch 8 tilt levels per timestamp:
 ```
-00.50°, 01.50°, 02.50°, 03.50°, 05.00°, 07.00°, 10.00°, 14.00°
+00.50°, 01.00°, 01.50°, 02.50°, 04.00°, 07.00°, 10.00°, 19.00°
 ```
 
 These are mapped to approximate physical heights for 3D rendering:
 ```python
 TILT_TO_HEIGHT_KM = {
-    "00.50": 1.0, "01.50": 2.0, "02.50": 3.5, "03.50": 5.0,
-    "05.00": 7.0, "07.00": 9.0, "10.00": 12.0, "14.00": 15.0,
+ "00.50": 1.0, "01.00": 1.5, "01.50": 2.0, "02.50": 3.5,
+ "04.00": 5.5, "07.00": 9.0, "10.00": 12.0, "19.00": 19.0,
 }
 ```
 
@@ -184,10 +184,10 @@ Atlas tiles and motion PNGs use `Cache-Control: public, max-age=3600, immutable`
 Each atlas tile is a **256×2048 grayscale PNG** — 8 vertical bands of 256×256, one per tilt level:
 
 - Row 0–255: tilt 00.50° (1 km)
-- Row 256–511: tilt 01.50° (2 km)
-- Row 512–767: tilt 02.50° (3.5 km)
+- Row 256–511: tilt 01.00° (1.5 km)
+- Row 512–767: tilt 01.50° (2 km)
 - ...
-- Row 1792–2047: tilt 14.00° (15 km)
+- Row 1792–2047: tilt 19.00° (19 km)
 
 Pixel encoding: `uint8 = round((dBZ + 30) * 2)`, mapping dBZ range [-30, +97.5] to [0, 255]. Value 0 = no echo. The GPU shader reverses this: `dBZ = pixel / 2.0 - 30.0`.
 
@@ -203,7 +203,7 @@ The pipeline is the core orchestration layer. It operates on a single principle:
 4. Decode GRIB2 → mask sentinels (< -30 → NaN) → convert to scipy.sparse CSR (NaN → implicit zero)
 5. Save sparse tilt grids to `data/tilt_grids/{YYYYMMDD-HHMMSS}/` (8 `.npz` + `meta.json`)
 6. Populate in-memory `ConusTiltCache` LRU
-7. Pre-render atlas PNG tiles for the most recent 20 frames at z=4 (CONUS default viewport)
+7. Pre-render atlas PNG tiles for the most recent 30 frames at z=4 (CONUS default viewport)
 8. Compute motion fields for all consecutive frame pairs via FFT block matching, save to disk (`motion.npz` + `motion.png`)
 
 In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetching). Steps 7–8 still run (skipping pairs that already have motion on disk).
@@ -213,7 +213,7 @@ In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetchi
 **ConusTiltCache (`cache.py`):**
 - Thread-safe LRU for sparse tilt grid sets
 - Key: timestamp string → Value: dict of 8 sparse CSR matrices + metadata
-- Max 20 entries (~780 MB: 20 timestamps × 39 MB sparse per timestamp)
+- Max 30 entries (~1.2 GB: 30 timestamps × 39 MB sparse per timestamp)
 - Falls back to `disk_cache.get_tilt_grids()` on miss (33ms disk load)
 
 **Atlas tile cache (`tiles.py`):**
@@ -233,7 +233,7 @@ MRMS data is extremely sparse: 95-99.3% of grid cells are NaN/sentinel after mas
 - Disk load: 33ms (vs 295ms for dense compressed npz)
 - Disk save: 1.2s per timestamp during seeding
 
-This allows the LRU to hold 20 timestamps (~780 MB) rather than just 3 (which would be 2.4 GB dense).
+This allows the LRU to hold 30 timestamps (~1.2 GB) rather than just 3 (which would be 2.4 GB dense).
 
 ### Atlas tile rendering
 
@@ -535,7 +535,7 @@ MRMS reflectivity grids are extremely sparse: after sentinel masking, 95-99.3% o
 - Disk load: 33ms (sparse) vs 295ms (dense compressed)
 - Composite derivation from sparse: 80ms (sparse→dense→fmax, cached)
 
-Sparse is better on every axis: memory, disk, I/O speed, and allows caching 20 frames in memory instead of 3.
+Sparse is better on every axis: memory, disk, I/O speed, and allows caching 30 frames in memory instead of 3.
 
 ### Why atlas tiles with GPU-side rendering (not PointCloudLayer)
 
@@ -579,7 +579,7 @@ data/tilt_grids/20260405-120000/
     00.50.npz
     01.50.npz
     ...
-    14.00.npz
+    19.00.npz
     motion.npz      ← U, V, confidence arrays for this frame → next frame
     motion.png       ← pre-rendered RGB PNG (served directly to frontend)
 ```

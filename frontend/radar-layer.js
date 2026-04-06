@@ -19,7 +19,7 @@ const RADAR_TILE_MAX_ZOOM = 8;
 const RADAR_NUM_BANDS = 8;
 const MAX_TEXTURES = 300;
 
-const TILT_HEIGHTS_M = [1000, 2000, 3500, 5000, 7000, 9000, 12000, 15000];
+const TILT_HEIGHTS_M = [1000, 1500, 2000, 3500, 5500, 9000, 12000, 19000];
 
 function mercToAlt(altMeters) {
   return altMeters / 40075016.686;
