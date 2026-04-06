@@ -113,7 +113,13 @@ async function fetchTimestamps() {
     timestamps = data.timestamps;
     currentAnimationTime = timestamps.length - 1;
 
-    if (radarLayer) radarLayer.setTimestamps(timestamps);
+    if (radarLayer) {
+      radarLayer.setTimestamps(timestamps);
+      if (data.motion && timestamps.length > 0) {
+        const b = timestamps[0].bounds;
+        radarLayer.setMotionConfig(b, data.motion.max_disp_deg);
+      }
+    }
 
     updateScrubber();
     updateFrameDisplay();
@@ -150,6 +156,7 @@ function showFrame() {
   radarLayer.setAnimation(frameA, frameB, mix);
 
   radarLayer.prefetchFrames((frameB + 1) % len, PREFETCH_AHEAD);
+  radarLayer.prefetchMotion(frameA, PREFETCH_AHEAD);
 }
 
 async function loadAndShowFrame() {
@@ -160,7 +167,10 @@ async function loadAndShowFrame() {
   const frameA = Math.floor(t);
   const frameB = (frameA + 1) % len;
 
-  await radarLayer.ensureTextures(frameA, frameB);
+  await Promise.all([
+    radarLayer.ensureTextures(frameA, frameB),
+    radarLayer.ensureMotion(frameA),
+  ]);
   showFrame();
 }
 

@@ -143,14 +143,51 @@ def has_tilt_grids(timestamp: str) -> bool:
     return (TILT_GRIDS_DIR / stem / "meta.json").exists()
 
 
+# ── Motion field cache ────────────────────────────────────────────────────────
+
+
+def put_motion(
+    timestamp: str,
+    u: np.ndarray,
+    v: np.ndarray,
+    confidence: np.ndarray,
+    png_bytes: bytes,
+) -> None:
+    """Save motion field for *timestamp* (displacement toward next frame)."""
+    stem = _ts_to_stem(timestamp)
+    ts_dir = TILT_GRIDS_DIR / stem
+    ts_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        ts_dir / "motion.npz", u=u, v=v, confidence=confidence,
+    )
+    (ts_dir / "motion.png").write_bytes(png_bytes)
+
+
+def get_motion_png(timestamp: str) -> bytes | None:
+    """Return pre-rendered motion PNG for *timestamp*, or None."""
+    stem = _ts_to_stem(timestamp)
+    path = TILT_GRIDS_DIR / stem / "motion.png"
+    if path.exists():
+        return path.read_bytes()
+    return None
+
+
+def has_motion(timestamp: str) -> bool:
+    """Check whether a motion field exists on disk for *timestamp*."""
+    stem = _ts_to_stem(timestamp)
+    return (TILT_GRIDS_DIR / stem / "motion.png").exists()
+
+
 _ts_list_cache: list[dict[str, Any]] | None = None
 _ts_list_lock = threading.Lock()
 
 
 def _meta_to_entry(meta: dict[str, Any]) -> dict[str, Any]:
     """Build a timestamps-list entry from a metadata dict."""
-    return {
-        "timestamp": meta.get("timestamp"),
+    ts = meta.get("timestamp")
+    entry: dict[str, Any] = {
+        "timestamp": ts,
         "bounds": {
             "north": meta.get("north"),
             "south": meta.get("south"),
@@ -158,6 +195,9 @@ def _meta_to_entry(meta: dict[str, Any]) -> dict[str, Any]:
             "west": meta.get("west"),
         },
     }
+    if ts:
+        entry["has_motion"] = has_motion(ts)
+    return entry
 
 
 def _load_ts_list_from_disk() -> list[dict[str, Any]]:

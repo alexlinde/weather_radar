@@ -252,6 +252,8 @@ def warm_from_disk(limit: int = 20) -> int:
 
     logger.info("Pre-rendered %d atlas tiles (%d coords × %d frames)",
                 atlas_count, len(tile_coords), loaded)
+
+    compute_all_motion()
     return loaded
 
 
@@ -307,7 +309,55 @@ def seed_frames(count: int = 60) -> int:
                 atlas_count += 1
 
     logger.info("Pre-rendered %d atlas tiles for default viewport", atlas_count)
+
+    compute_all_motion()
     return total
+
+
+def compute_all_motion() -> int:
+    """Compute motion fields for all consecutive frame pairs.
+
+    Skips pairs that already have motion data on disk.
+    Returns the number of pairs computed.
+    """
+    import time as _time
+    from .motion import compute_composite, compute_motion_field, encode_motion_png
+
+    entries = disk_cache.list_tilt_grid_timestamps()
+    if len(entries) < 2:
+        return 0
+
+    computed = 0
+    t0 = _time.monotonic()
+
+    for i in range(len(entries) - 1):
+        ts_a = entries[i]["timestamp"]
+        ts_b = entries[i + 1]["timestamp"]
+        if not ts_a or not ts_b:
+            continue
+        if disk_cache.has_motion(ts_a):
+            continue
+
+        entry_a = tilt_cache.get(ts_a)
+        entry_b = tilt_cache.get(ts_b)
+        if entry_a is None or entry_b is None:
+            continue
+
+        try:
+            comp_a = compute_composite(entry_a["grids"])
+            comp_b = compute_composite(entry_b["grids"])
+            u, v, conf = compute_motion_field(comp_a, comp_b)
+            png = encode_motion_png(u, v, conf)
+            disk_cache.put_motion(ts_a, u, v, conf, png)
+            computed += 1
+        except Exception:
+            logger.exception("Motion computation failed for %s → %s", ts_a, ts_b)
+
+    elapsed = _time.monotonic() - t0
+    if computed:
+        logger.info("Computed %d motion fields in %.1fs (%.2fs/pair)",
+                     computed, elapsed, elapsed / computed)
+    return computed
 
 
 def invalidate_all() -> None:

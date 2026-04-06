@@ -66,9 +66,19 @@ const RADAR_FRAG = `
   uniform float u_timeMix;
   uniform int u_tiltIndex;
 
+  uniform sampler2D u_motionTex;
+  uniform float u_hasMotion;
+  uniform float u_tileX;
+  uniform float u_tileY;
+  uniform float u_tileZ;
+  uniform vec4  u_motionBounds;
+  uniform float u_maxDispDeg;
+
   varying vec2 v_uv;
 
   ${COLORIZE_GLSL}
+
+  #define M_PI 3.14159265359
 
   float sampleBand(sampler2D tex, vec2 uv, int band) {
     float bandF = float(band);
@@ -78,20 +88,62 @@ const RADAR_FRAG = `
     return texture2D(tex, vec2(uv.x, v)).r;
   }
 
-  float sampleInterp(vec2 uv, int band) {
-    return mix(sampleBand(u_tex0, uv, band), sampleBand(u_tex1, uv, band), u_timeMix);
+  void getMotion(vec2 uv, out vec2 uvDisp, out float conf) {
+    uvDisp = vec2(0.0);
+    conf = 0.0;
+    if (u_hasMotion < 0.5) return;
+
+    float n = pow(2.0, u_tileZ);
+    float lon = (u_tileX + uv.x) / n * 360.0 - 180.0;
+    float mercY = (u_tileY + 1.0 - uv.y) / n;
+    float latRad = atan(sinh(M_PI * (1.0 - 2.0 * mercY)));
+    float lat = latRad * 180.0 / M_PI;
+
+    vec2 mUV = vec2(
+      (lon - u_motionBounds.x) / (u_motionBounds.z - u_motionBounds.x),
+      (lat - u_motionBounds.y) / (u_motionBounds.w - u_motionBounds.y)
+    );
+    if (mUV.x < 0.0 || mUV.x > 1.0 || mUV.y < 0.0 || mUV.y > 1.0) return;
+
+    vec3 mot = texture2D(u_motionTex, mUV).rgb;
+    vec2 disp_deg = (mot.rg - 0.5) * 2.0 * u_maxDispDeg;
+    conf = mot.b;
+
+    float cosLat = max(cos(latRad), 0.01);
+    uvDisp = vec2(
+      disp_deg.x * n / 360.0,
+      disp_deg.y * n / (360.0 * cosLat)
+    );
   }
 
-  float getComposite(vec2 uv) {
+  float sampleInterp(vec2 uv, int band, vec2 uvDisp, float conf) {
+    float alpha = u_timeMix;
+    if (conf > 0.01) {
+      vec2 uvA = clamp(uv - alpha * uvDisp, vec2(0.0), vec2(1.0));
+      vec2 uvB = clamp(uv + (1.0 - alpha) * uvDisp, vec2(0.0), vec2(1.0));
+      float advected = mix(sampleBand(u_tex0, uvA, band), sampleBand(u_tex1, uvB, band), alpha);
+      float crossfade = mix(sampleBand(u_tex0, uv, band), sampleBand(u_tex1, uv, band), alpha);
+      return mix(crossfade, advected, conf);
+    }
+    return mix(sampleBand(u_tex0, uv, band), sampleBand(u_tex1, uv, band), alpha);
+  }
+
+  float getComposite(vec2 uv, vec2 uvDisp, float conf) {
     float maxVal = 0.0;
     for (int i = 0; i < 8; i++) {
-      maxVal = max(maxVal, sampleInterp(uv, i));
+      maxVal = max(maxVal, sampleInterp(uv, i, uvDisp, conf));
     }
     return maxVal;
   }
 
   void main() {
-    float encoded = u_tiltIndex < 0 ? getComposite(v_uv) : sampleInterp(v_uv, u_tiltIndex);
+    vec2 uvDisp;
+    float conf;
+    getMotion(v_uv, uvDisp, conf);
+
+    float encoded = u_tiltIndex < 0
+      ? getComposite(v_uv, uvDisp, conf)
+      : sampleInterp(v_uv, u_tiltIndex, uvDisp, conf);
     vec4 col = colorize(encoded);
     if (col.a < 0.01) discard;
     col.a *= u_opacity;
@@ -275,6 +327,59 @@ class TileTextureCache {
   }
 }
 
+// ── Motion texture cache ────────────────────────────────────────────────────
+
+class MotionTextureCache {
+  constructor(onLoad) {
+    this._textures = new Map();
+    this._loading = new Map();
+    this._onLoad = onLoad;
+  }
+
+  has(ts) { return this._textures.has(ts); }
+
+  get(ts) {
+    const e = this._textures.get(ts);
+    if (e) { e.lu = performance.now(); return e.t; }
+    return null;
+  }
+
+  async load(ts) {
+    if (this._textures.has(ts)) return this._textures.get(ts).t;
+    if (this._loading.has(ts)) return this._loading.get(ts);
+    const p = this._doLoad(ts);
+    this._loading.set(ts, p);
+    try { return await p; } finally { this._loading.delete(ts); }
+  }
+
+  async _doLoad(ts) {
+    const url = `/api/radar/motion/${encodeURIComponent(ts)}.png`;
+    try {
+      const r = await fetch(url, { cache: 'force-cache' });
+      if (!r.ok) return null;
+      const bmp = await createImageBitmap(await r.blob());
+      const t = new THREE.Texture(bmp);
+      t.magFilter = THREE.LinearFilter;
+      t.minFilter = THREE.LinearFilter;
+      t.wrapS = THREE.ClampToEdgeWrapping;
+      t.wrapT = THREE.ClampToEdgeWrapping;
+      t.generateMipmaps = false;
+      t.needsUpdate = true;
+      this._textures.set(ts, { t, lu: performance.now() });
+      this._onLoad?.();
+      return t;
+    } catch (e) {
+      if (e.name !== 'AbortError') console.warn('Motion load failed:', ts, e);
+      return null;
+    }
+  }
+
+  clear() {
+    for (const [, e] of this._textures) e.t.dispose();
+    this._textures.clear();
+  }
+}
+
 // ── Color ramp texture ──────────────────────────────────────────────────────
 
 function buildColorRampTexture() {
@@ -339,6 +444,9 @@ class RadarLayer {
       this._tileLoadGen++;
       this._requestRepaint();
     });
+    this._motionCache = new MotionTextureCache(() => this._requestRepaint());
+    this._motionBounds = new THREE.Vector4(-130, 20, -60, 55);
+    this._maxDispDeg = 0.5;
     this._map = null;
     this._visibleTiles = [];
 
@@ -364,6 +472,37 @@ class RadarLayer {
   // ── Public API ──────────────────────────────────────────────────────────
 
   setTimestamps(ts) { this._timestamps = ts; }
+
+  setMotionConfig(bounds, maxDispDeg) {
+    if (bounds) {
+      this._motionBounds.set(bounds.west, bounds.south, bounds.east, bounds.north);
+    }
+    if (maxDispDeg != null) this._maxDispDeg = maxDispDeg;
+  }
+
+  async ensureMotion(frameIdx) {
+    const entry = this._timestamps[frameIdx];
+    if (!entry?.has_motion || !entry?.timestamp) return;
+    await this._motionCache.load(entry.timestamp);
+  }
+
+  hasMotionForFrame(frameIdx) {
+    const entry = this._timestamps[frameIdx];
+    if (!entry?.has_motion) return true;
+    return this._motionCache.has(entry.timestamp);
+  }
+
+  prefetchMotion(startIdx, count) {
+    const len = this._timestamps.length;
+    if (len === 0) return;
+    for (let i = 0; i < count; i++) {
+      const idx = (startIdx + i) % len;
+      const entry = this._timestamps[idx];
+      if (entry?.has_motion && entry?.timestamp) {
+        this._motionCache.load(entry.timestamp);
+      }
+    }
+  }
 
   setAnimation(frameA, frameB, mix) {
     this._frameA = frameA;
@@ -477,6 +616,7 @@ class RadarLayer {
 
   onRemove() {
     this._tileCache.clear();
+    this._motionCache.clear();
     this._clearMeshes();
     if (this._volAtlasA) { this._volAtlasA.dispose(); this._volAtlasA = null; }
     if (this._volAtlasB) { this._volAtlasB.dispose(); this._volAtlasB = null; }
@@ -579,6 +719,13 @@ class RadarLayer {
         u_tiltIndex: { value: tiltIndex },
         u_dbzMin: { value: this._dbzMin },
         u_dbzMax: { value: this._dbzMax },
+        u_motionTex: { value: this._dummyTex },
+        u_hasMotion: { value: 0.0 },
+        u_tileX: { value: parseFloat(x) },
+        u_tileY: { value: parseFloat(y) },
+        u_tileZ: { value: parseFloat(z) },
+        u_motionBounds: { value: this._motionBounds },
+        u_maxDispDeg: { value: this._maxDispDeg },
       },
     });
 
@@ -701,6 +848,10 @@ class RadarLayer {
       return;
     }
 
+    const entryA = this._timestamps[this._frameA];
+    const motionTex = (entryA?.has_motion) ? this._motionCache.get(tsA) : null;
+    const hasMotion = motionTex ? 1.0 : 0.0;
+
     let anyTextured = false;
     for (const [, mesh] of this._tileMeshes) {
       const { z, x, y } = mesh.userData;
@@ -721,6 +872,9 @@ class RadarLayer {
       u.u_opacity.value = this._opacity;
       u.u_dbzMin.value = this._dbzMin;
       u.u_dbzMax.value = this._dbzMax;
+      u.u_motionTex.value = motionTex || this._dummyTex;
+      u.u_hasMotion.value = hasMotion;
+      u.u_maxDispDeg.value = this._maxDispDeg;
     }
 
     if (anyTextured && this._staleMeshes.length > 0) {

@@ -3,6 +3,7 @@ FastAPI backend for the Weather Radar viewer.
 
 Endpoints:
     GET /api/radar/atlas/{timestamp}/{z}/{x}/{y}.png — atlas tile (8 tilts, grayscale PNG)
+    GET /api/radar/motion/{timestamp}.png            — motion vector field (RGB PNG)
     GET /api/radar/timestamps                        — available timestamps
     GET /api/radar/refresh                           — force re-seed
     GET /api/config                                  — frontend map config
@@ -116,14 +117,33 @@ def radar_atlas_tile(timestamp: str, z: int, x: int, y: int):
     )
 
 
+# ── Motion vector tiles ──────────────────────────────────────────────────────
+
+
+@app.get("/api/radar/motion/{timestamp}.png")
+def radar_motion_tile(timestamp: str):
+    """Serve the motion vector field for *timestamp* → next frame as RGB PNG."""
+    from . import disk_cache
+
+    png = disk_cache.get_motion_png(timestamp)
+    if png is None:
+        raise HTTPException(status_code=404, detail="Motion data not available")
+
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600, immutable"},
+    )
+
 
 # ── Timestamps ───────────────────────────────────────────────────────────────
 
 
 @app.get("/api/radar/timestamps")
 def radar_timestamps():
-    """Return the list of available radar timestamps."""
+    """Return the list of available radar timestamps with motion availability."""
     from . import disk_cache
+    from .motion import MAX_DISP_DEG
 
     entries = disk_cache.list_tilt_grid_timestamps()
     if not entries:
@@ -132,7 +152,11 @@ def radar_timestamps():
             detail="No frames cached yet — server is still seeding",
         )
     entries = entries[-MAX_FRAMES:]
-    return {"timestamps": entries, "count": len(entries)}
+    return {
+        "timestamps": entries,
+        "count": len(entries),
+        "motion": {"max_disp_deg": MAX_DISP_DEG},
+    }
 
 
 # ── Admin / config ───────────────────────────────────────────────────────────
