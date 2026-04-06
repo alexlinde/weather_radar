@@ -160,6 +160,8 @@ def decode_grib2(raw_bytes: bytes) -> tuple[dict, np.ndarray]:
         "scan_j_pos": grid_info["scan_j_pos"],
         "scan_i_neg": grid_info["scan_i_neg"],
         "packing_template": template,
+        "level_type": sec4["level_type"] if sec4 else None,
+        "level_value": sec4["level_value"] if sec4 else None,
     }
 
     return metadata, grid

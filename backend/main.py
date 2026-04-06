@@ -42,12 +42,26 @@ except ImportError:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from . import disk_cache, mrms
+    import threading
+    from . import disk_cache, mrms, mrms_volume
 
     disk_cache.evict_older_than(hours=24)
-    logger.info("Seeding frame cache with latest 60 frames (~2 hours)…")
-    count = await asyncio.to_thread(mrms.get_recent_frames, 60)
-    logger.info("Cache seeded with %d frames — ready to serve", count)
+
+    def _bg_seed():
+        try:
+            n = mrms.get_recent_frames(60)
+            logger.info("Composite seeding complete: %d frames", n)
+        except Exception:
+            logger.exception("Composite seeding failed")
+        try:
+            n = mrms_volume.seed_volume_frames(60)
+            logger.info("Volume seeding complete: %d frames", n)
+        except Exception:
+            logger.exception("Volume seeding failed")
+
+    threading.Thread(target=_bg_seed, daemon=True, name="cache-seed").start()
+    logger.info("Cache seeding started in background — server ready")
+
     yield
 
 
@@ -196,6 +210,49 @@ async def radar_frames(count: int = Query(default=60, ge=1, le=70)):
     return {"frames": result, "count": len(result)}
 
 
+@app.get("/api/radar/volume")
+async def radar_volume():
+    """
+    Return the latest multi-level radar snapshot as a list of 3D columns.
+
+    Each column: [lon, lat, max_dbz, echo_top_km]
+    Only cells with reflectivity >= 5 dBZ are included.
+    """
+    try:
+        from . import mrms_volume
+
+        volume = await asyncio.to_thread(mrms_volume.fetch_volume_snapshot)
+        columns = mrms_volume.compute_columns(volume)
+    except Exception as exc:
+        logger.exception("Failed to fetch volume data")
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return {
+        "timestamp": volume["timestamp"],
+        "bounds": volume["bounds"],
+        "columns": columns,
+    }
+
+
+@app.get("/api/radar/volume/frames")
+async def radar_volume_frames(count: int = Query(default=60, ge=1, le=70)):
+    """
+    Return up to `count` recent volume frames as pre-computed column data.
+    Frames are ordered oldest-first for animation playback, matching the
+    ordering of /api/radar/frames.
+    Each frame: { timestamp, columns: [[lon, lat, max_dbz, echo_top_km], ...] }
+    """
+    from . import mrms_volume
+
+    frames = mrms_volume.get_volume_frames(count)
+    if not frames:
+        raise HTTPException(
+            status_code=503,
+            detail="Volume frames not yet cached — server is still seeding",
+        )
+    return {"frames": frames, "count": len(frames)}
+
+
 @app.get("/api/radar/refresh")
 async def radar_refresh():
     """Force cache invalidation and re-seed."""
@@ -217,6 +274,10 @@ async def api_config():
 
 @app.get("/health")
 async def health():
-    from . import cache
+    from . import cache, mrms_volume
 
-    return {"status": "ok", "cached_frames": cache.frame_count()}
+    return {
+        "status": "ok",
+        "cached_frames": cache.frame_count(),
+        "volume_frames": mrms_volume.volume_frame_count(),
+    }

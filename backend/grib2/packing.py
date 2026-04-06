@@ -18,7 +18,7 @@ from .bitstream import BitstreamReader
 
 def _apply_scale(packed: np.ndarray, R: float, E: int, D: int) -> np.ndarray:
     """Apply the GRIB2 packing formula to convert packed integers to physical values."""
-    return (R + packed.astype(np.float64) * (2.0**E)) / (10.0**D)
+    return (R + packed.astype(np.float32) * (2.0**E)) / (10.0**D)
 
 
 def _expand_bitmap(values: np.ndarray, bitmap_bytes: bytes | None, num_points: int) -> np.ndarray:
@@ -39,7 +39,7 @@ def _expand_bitmap(values: np.ndarray, bitmap_bytes: bytes | None, num_points: i
     # Trim to exact number of grid points (bitmap is padded to byte boundary)
     bits = bits[:num_points]
 
-    full = np.full(num_points, np.nan, dtype=np.float64)
+    full = np.full(num_points, np.nan, dtype=np.float32)
     full[bits == 1] = values
     return full
 
@@ -63,10 +63,10 @@ def unpack_simple(
 
     if bits_per_value == 0:
         # All values are equal to R/10^D (constant field)
-        physical = np.full(num_packed, R / (10.0**D), dtype=np.float64)
+        physical = np.full(num_packed, R / (10.0**D), dtype=np.float32)
     else:
         reader = BitstreamReader(section7_bytes)
-        raw = np.array(reader.read_array(bits_per_value, num_packed), dtype=np.float64)
+        raw = np.array(reader.read_array(bits_per_value, num_packed), dtype=np.float32)
         physical = _apply_scale(raw, R, E, D)
 
     return _expand_bitmap(physical, bitmap_bytes, num_points)
@@ -87,7 +87,7 @@ def unpack_jpeg2000(
     from PIL import Image
 
     img = Image.open(BytesIO(section7_bytes))
-    packed = np.array(img, dtype=np.float64).ravel()
+    packed = np.array(img, dtype=np.float32).ravel()
 
     physical = _apply_scale(packed, R, E, D)
     return _expand_bitmap(physical, bitmap_bytes, num_points)
@@ -108,7 +108,7 @@ def unpack_png(
     from PIL import Image
 
     img = Image.open(BytesIO(section7_bytes))
-    packed = np.array(img, dtype=np.float64).ravel()
+    packed = np.array(img, dtype=np.float32).ravel()
 
     physical = _apply_scale(packed, R, E, D)
     return _expand_bitmap(physical, bitmap_bytes, num_points)

@@ -200,6 +200,55 @@ button:active {
   white-space: nowrap;
 }
 
+/* ── Toggle switch ──────────────────────────────────────────────────────── */
+
+.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.toggle-track {
+  display: inline-block;
+  width: 34px;
+  height: 18px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 9px;
+  position: relative;
+  transition: background 0.2s;
+}
+
+.toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #8b949e;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-track {
+  background: rgba(88,166,255,0.4);
+}
+
+.toggle-switch input:checked + .toggle-track::after {
+  transform: translateX(16px);
+  background: #58a6ff;
+}
+
+.toggle-switch input {
+  display: none;
+}
+
+.volume-status-label {
+  font-size: 11px;
+  color: #8b949e;
+  font-weight: 500;
+}
+
 /* ── Animation Bar ──────────────────────────────────────────────────────── */
 
 #animation-bar {

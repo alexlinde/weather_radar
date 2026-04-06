@@ -9,6 +9,9 @@
   <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 
+  <!-- deck.gl (MapboxOverlay works with MapLibre) -->
+  <script src="https://unpkg.com/deck.gl@9/dist.min.js"></script>
+
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -31,6 +34,32 @@
         id="opacity-slider"
         min="0" max="1" step="0.01" value="0.8"
         aria-label="Radar opacity"
+      />
+    </div>
+
+    <!-- 3D Volume toggle -->
+    <div class="control-row">
+      <div class="control-label">
+        <label for="toggle-volume">3D Volume</label>
+        <span id="volume-status" class="volume-status-label">Off</span>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-volume" />
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <!-- Vertical exaggeration (shown only when 3D is on) -->
+    <div class="control-row" id="row-exaggeration" style="display:none">
+      <div class="control-label">
+        <span>Vert. scale</span>
+        <span id="exag-value">3x</span>
+      </div>
+      <input
+        type="range"
+        id="exag-slider"
+        min="1" max="10" step="0.5" value="3"
+        aria-label="Vertical exaggeration"
       />
     </div>
 

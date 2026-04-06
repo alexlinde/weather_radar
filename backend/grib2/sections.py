@@ -176,7 +176,20 @@ def parse_section3(data: bytes, offset: int) -> dict:
 
 
 def parse_section4(data: bytes, offset: int) -> dict:
-    """Section 4 — Product Definition Section."""
+    """
+    Section 4 — Product Definition Section (Template 4.0).
+
+    Relevant byte offsets within the section (relative to section start):
+      9  : parameter category
+      10 : parameter number
+      22 : first fixed surface type (level type)
+      23 : first fixed surface scale factor (signed byte)
+      24-27: first fixed surface scaled value (signed 32-bit big-endian)
+
+    level_value = scaled_value * 10^(-scale_factor)
+    For MRMS tilt-angle levels: level_type=20 (elevation angle in 0.1°),
+    so a value of 5 with scale_factor=1 means 0.5°.
+    """
     (sec_len,) = _unpack("I", data, offset)
     sec_num = data[offset + 4]
     assert sec_num == 4, f"Expected section 4, got {sec_num}"
@@ -186,8 +199,22 @@ def parse_section4(data: bytes, offset: int) -> dict:
 
     param_category = data[offset + 9]
     param_number = data[offset + 10]
-    # Level type and value (template 4.0 layout)
-    level_type = data[offset + 22] if sec_len > 22 else None
+
+    level_type = None
+    level_value = None
+    if sec_len > 27:
+        level_type = data[offset + 22]
+        # Scale factor is a signed byte (two's complement)
+        scale_factor_raw = data[offset + 23]
+        scale_factor = scale_factor_raw if scale_factor_raw < 128 else scale_factor_raw - 256
+        # Scaled value is a signed 32-bit big-endian integer
+        scaled_val_raw = int.from_bytes(data[offset + 24 : offset + 28], "big")
+        if scaled_val_raw >= 0x80000000:
+            scaled_val_raw -= 0x100000000
+        if scale_factor != 0:
+            level_value = round(scaled_val_raw * (10 ** (-scale_factor)), 6)
+        else:
+            level_value = float(scaled_val_raw)
 
     return {
         "section_length": sec_len,
@@ -195,6 +222,7 @@ def parse_section4(data: bytes, offset: int) -> dict:
         "param_category": param_category,
         "param_number": param_number,
         "level_type": level_type,
+        "level_value": level_value,
     }
 
 

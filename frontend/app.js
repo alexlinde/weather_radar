@@ -1,8 +1,8 @@
 /**
- * NYC Weather Radar — Main application with frame animation.
+ * NYC Weather Radar — Main application with frame animation + 3D volume.
  *
- * Fetches a batch of recent radar frames from the backend, preloads them,
- * and animates through them on a single MapLibre raster layer.
+ * Phase 2: fetches 60 recent radar frames and animates them on a MapLibre raster layer.
+ * Phase 3: adds 3D terrain and a deck.gl ColumnLayer for volumetric radar columns.
  */
 
 const API_BASE = 'http://127.0.0.1:8000';
@@ -80,6 +80,11 @@ async function fetchFrames() {
   setStatus('loading', 'Loading frames…');
   try {
     const resp = await fetch(`${API_BASE}/api/radar/frames?count=${FRAME_COUNT}`, { cache: 'no-store' });
+    if (resp.status === 503) {
+      setStatus('loading', 'Server seeding cache…');
+      setTimeout(fetchFrames, 5_000);
+      return false;
+    }
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
 
@@ -159,6 +164,7 @@ function showFrame(index) {
   }
 
   updateBbox(map, frame.bounds);
+  showVolumeFrame(index);
 }
 
 function updateBbox(map, bounds) {
@@ -252,6 +258,76 @@ function updateFrameDisplay() {
   counterEl.textContent = frames.length > 0 ? `${currentIndex + 1}/${frames.length}` : '0/0';
 }
 
+// ── 3D Volume (deck.gl) ───────────────────────────────────────────────────────
+
+let deckOverlay = null;
+let volumeEnabled = false;
+let verticalExaggeration = 3.0;
+let volumeFrames = [];   // [{timestamp, voxels}] — parallel to frames[]
+const POINT_SIZE_PX = 3;
+
+function dbzToRgba(dbz) {
+  const bands = NWS_DBZ_COLORS;
+  const alpha = Math.min(255, Math.max(100, Math.round(100 + (dbz - 10) * (155 / 50))));
+  for (const band of bands) {
+    if (dbz >= band.min && dbz < band.max) return [band.r, band.g, band.b, alpha];
+  }
+  if (dbz >= 65) return [200, 200, 255, 255];
+  return [0, 0, 0, 0];
+}
+
+function buildPointCloudLayer(voxels, exaggeration) {
+  return new deck.PointCloudLayer({
+    id: 'radar-volume',
+    data: voxels,
+    // d = [lon, lat, altitude_m, dbz]
+    getPosition: d => [d[0], d[1], d[2] * exaggeration],
+    getColor: d => dbzToRgba(d[3]),
+    pointSize: POINT_SIZE_PX,
+    sizeUnits: 'pixels',
+    opacity: 0.9,
+    pickable: true,
+    material: false,
+    parameters: { depthTest: true },
+  });
+}
+
+function showVolumeFrame(index) {
+  if (!volumeEnabled || !deckOverlay || volumeFrames.length === 0) return;
+  const vf = volumeFrames[Math.min(index, volumeFrames.length - 1)];
+  if (!vf) return;
+  deckOverlay.setProps({ layers: [buildPointCloudLayer(vf.voxels, verticalExaggeration)] });
+}
+
+async function fetchVolumeFrames() {
+  if (!volumeEnabled || !deckOverlay) return;
+  document.getElementById('volume-status').textContent = 'Loading…';
+  try {
+    const resp = await fetch(`${API_BASE}/api/radar/volume/frames?count=${FRAME_COUNT}`, { cache: 'no-store' });
+    if (resp.status === 503) {
+      document.getElementById('volume-status').textContent = 'Seeding…';
+      setTimeout(fetchVolumeFrames, 10_000);
+      return;
+    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    volumeFrames = data.frames;
+    const totalVoxels = data.frames.reduce((s, f) => s + f.voxels.length, 0);
+    document.getElementById('volume-status').textContent =
+      `On · ${data.count} frames · ${(totalVoxels / 1000).toFixed(0)}K pts`;
+    showVolumeFrame(currentIndex);
+  } catch (err) {
+    console.error('Volume frames fetch error:', err);
+    document.getElementById('volume-status').textContent = 'Error';
+  }
+}
+
+function clearVolumeLayer() {
+  volumeFrames = [];
+  if (deckOverlay) deckOverlay.setProps({ layers: [] });
+  document.getElementById('volume-status').textContent = 'Off';
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
@@ -262,16 +338,29 @@ async function init() {
     style: styleUrl,
     center: [-73.98, 40.75],
     zoom: 10,
-    pitch: 0,
+    pitch: 45,
     bearing: 0,
     attributionControl: true,
   });
   mapRef = map;
 
+  // Initialise deck.gl overlay (empty layer list until volume is enabled)
+  deckOverlay = new deck.MapboxOverlay({ layers: [] });
+  map.addControl(deckOverlay);
+
   map.addControl(new maplibregl.NavigationControl(), 'top-left');
   map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
   map.on('load', async () => {
+    // 3D terrain
+    map.addSource('terrain', {
+      type: 'raster-dem',
+      tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+      encoding: 'terrarium',
+      tileSize: 256,
+    });
+    map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
+
     ensureRadarLayer(map);
     const ok = await fetchFrames();
     if (ok && frames.length >= 2) {
@@ -283,6 +372,7 @@ async function init() {
       if (wasPlaying) pause();
       await fetchFrames();
       if (wasPlaying && frames.length >= 2) play();
+      if (volumeEnabled) await fetchVolumeFrames();
     }, REFRESH_INTERVAL_MS);
   });
 
@@ -320,6 +410,29 @@ async function init() {
     frameInterval = parseInt(e.target.value, 10);
   });
 
+  // ── 3D Volume toggle ────────────────────────────────────────────────────
+
+  document.getElementById('toggle-volume').addEventListener('change', async (e) => {
+    volumeEnabled = e.target.checked;
+    const rowExag = document.getElementById('row-exaggeration');
+    if (volumeEnabled) {
+      rowExag.style.display = '';
+      await fetchVolumeFrames();
+    } else {
+      rowExag.style.display = 'none';
+      clearVolumeLayer();
+    }
+  });
+
+  // ── Vertical exaggeration ───────────────────────────────────────────────
+
+  document.getElementById('exag-slider').addEventListener('input', (e) => {
+    verticalExaggeration = parseFloat(e.target.value);
+    document.getElementById('exag-value').textContent = `${verticalExaggeration}x`;
+    // Re-render current frame at new scale — no network request needed
+    if (volumeEnabled) showVolumeFrame(currentIndex);
+  });
+
   // ── Refresh button ──────────────────────────────────────────────────────
 
   document.getElementById('btn-refresh').addEventListener('click', async () => {
@@ -327,12 +440,13 @@ async function init() {
     if (wasPlaying) pause();
     await fetchFrames();
     if (wasPlaying && frames.length >= 2) play();
+    if (volumeEnabled) await fetchVolumeFrames();
   });
 
   // ── Reset view ──────────────────────────────────────────────────────────
 
   document.getElementById('btn-reset-view').addEventListener('click', () => {
-    map.flyTo({ center: [-73.98, 40.75], zoom: 10, pitch: 0, bearing: 0, duration: 800 });
+    map.flyTo({ center: [-73.98, 40.75], zoom: 10, pitch: 45, bearing: 0, duration: 800 });
   });
 
   // ── Legend ──────────────────────────────────────────────────────────────

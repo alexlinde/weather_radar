@@ -50,7 +50,8 @@ def list_latest_files(product: str = COMPOSITE_PRODUCT, count: int = 10) -> list
     """
     List the most recent GRIB2 files for `product` in the MRMS S3 bucket.
 
-    Scans today's directory first; falls back to yesterday / day-before.
+    Scans today first, then yesterday, accumulating until we have `count`
+    files so we span across the UTC day boundary.
     Returns up to `count` keys sorted newest-first.
     """
     from datetime import datetime, timedelta, timezone
@@ -59,23 +60,23 @@ def list_latest_files(product: str = COMPOSITE_PRODUCT, count: int = 10) -> list
     paginator = s3.get_paginator("list_objects_v2")
     now = datetime.now(timezone.utc)
 
+    all_keys: list[str] = []
     for delta in range(3):
         day = now - timedelta(days=delta)
         date_str = day.strftime("%Y%m%d")
         prefix = f"{product}/{date_str}/"
 
-        keys: list[str] = []
         for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if key.endswith(".grib2.gz"):
-                    keys.append(key)
+                    all_keys.append(key)
 
-        if keys:
-            keys.sort(reverse=True)
-            return keys[:count]
+        if len(all_keys) >= count:
+            break
 
-    return []
+    all_keys.sort(reverse=True)
+    return all_keys[:count]
 
 
 def fetch_raw(s3_key: str) -> bytes:
@@ -112,15 +113,22 @@ def fetch_and_decode(
     s3_key: str, bbox: dict = NYC_BBOX
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
-    Full pipeline for a single frame: memory cache -> disk cache -> S3 -> decode -> clip.
-    Stores the result in the in-memory cache.
+    Full pipeline for a single frame.
+    Cache waterfall: memory -> decoded disk -> raw disk -> S3 -> decode -> clip.
     """
     if _cache.has(s3_key):
         entry = _cache._cache.get(s3_key)
         return entry.grid, entry.metadata
 
+    decoded = disk_cache.get_decoded(s3_key)
+    if decoded is not None:
+        grid, metadata = decoded
+        _cache.store(s3_key, metadata, grid)
+        return grid, metadata
+
     raw_gz = fetch_raw(s3_key)
     grid, metadata = decode_and_clip(raw_gz, bbox)
+    disk_cache.put_decoded(s3_key, grid, metadata)
     _cache.store(s3_key, metadata, grid)
     return grid, metadata
 
@@ -128,23 +136,52 @@ def fetch_and_decode(
 def get_recent_frames(count: int = 20) -> int:
     """
     Fetch and cache the `count` most recent frames.
+    Uses ThreadPoolExecutor for parallel decoding, then inserts into the
+    memory cache in chronological order.
     Returns number of frames now in cache.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     keys = list_latest_files(count=count)
     if not keys:
         logger.warning("No MRMS files found in S3 bucket")
         return _cache.frame_count()
 
-    logger.info("Loading %d frames (have %d cached)…", len(keys), _cache.frame_count())
+    # oldest-first ordering for cache insertion
+    ordered_keys = list(reversed(keys))
+    to_fetch = [k for k in ordered_keys if not _cache.has(k)]
 
-    for i, key in enumerate(reversed(keys)):  # oldest first so cache ordering is chronological
-        if _cache.has(key):
-            continue
-        try:
-            fetch_and_decode(key)
-            logger.info("  [%d/%d] decoded %s", i + 1, len(keys), key.split("/")[-1])
-        except Exception:
-            logger.exception("Failed to decode %s, skipping", key)
+    if not to_fetch:
+        logger.info("All %d frames already cached", len(ordered_keys))
+        return _cache.frame_count()
+
+    logger.info("Loading %d frames (%d need decoding)…", len(ordered_keys), len(to_fetch))
+
+    results: dict[str, tuple[np.ndarray, dict[str, Any]]] = {}
+
+    def _decode_one(key: str) -> tuple[str, np.ndarray, dict[str, Any]]:
+        grid, meta = fetch_and_decode(key)
+        return key, grid, meta
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_decode_one, k): k for k in to_fetch}
+        done = 0
+        for f in as_completed(futures):
+            done += 1
+            try:
+                key, grid, meta = f.result()
+                results[key] = (grid, meta)
+                logger.info("  [%d/%d] decoded %s", done, len(to_fetch), key.split("/")[-1])
+            except Exception:
+                logger.exception("Failed to decode %s, skipping", futures[f])
+
+    # Insert into memory cache in chronological order
+    for key in ordered_keys:
+        if key in results:
+            grid, meta = results[key]
+            _cache.store(key, meta, grid)
+        elif not _cache.has(key):
+            pass  # skip failed keys
 
     logger.info("Frame cache now has %d frames", _cache.frame_count())
     return _cache.frame_count()
@@ -209,10 +246,9 @@ def clip_to_bbox(
 
 
 def mask_sentinel_values(data: np.ndarray, threshold: float = -30.0) -> np.ndarray:
-    """Replace MRMS sentinel values (e.g. -999) with NaN."""
-    result = data.copy()
-    result[result < threshold] = np.nan
-    return result
+    """Replace MRMS sentinel values (e.g. -999) with NaN, in-place."""
+    data[data < threshold] = np.nan
+    return data
 
 
 # Keep for backward compat (used by test scripts)
