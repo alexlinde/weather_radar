@@ -8,13 +8,9 @@ This is a working prototype, not a production app. Prioritise getting real data 
 
 ## Current status
 
-**Phase 1 (data on screen): COMPLETE**
-**Phase 2 (time animation): COMPLETE**
-**Phase 3 (3D terrain + vertical levels): COMPLETE**
-**Phase 3.5 (atlas tile rendering): COMPLETE**
-**Phase 4 (motion-compensated interpolation): NOT STARTED**
+All planned phases are complete.
 
-The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint. The frontend uses a custom MapLibre `CustomLayerInterface` with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation between frames, and spatial smoothing. Both 2D composite and 3D volumetric modes use the same atlas tile data — the difference is geometry (one ground plane vs 8 altitude planes). Animation uses continuous float time for smooth interpolation between keyframes. The map uses MapLibre GL JS with 3D terrain, starting at a CONUS-wide view.
+The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a custom MapLibre `CustomLayerInterface` with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Both 2D composite and 3D volumetric modes use the same atlas tile data — the difference is geometry (one ground plane vs 8 altitude planes). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS with 3D terrain, starting at a CONUS-wide view.
 
 ## Architecture
 
@@ -33,9 +29,10 @@ Responsibilities:
 - Decode with custom minimal GRIB2 decoder (no eccodes dependency)
 - Convert to scipy.sparse CSR matrices (95-99% of grid is NaN/sentinel → 20x memory reduction)
 - Serve atlas tiles (`/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png`) — 256×2048 grayscale PNG with 8 tilt bands, dBZ encoded as uint8
+- Compute motion fields between consecutive frames via FFT block matching (`motion.py`) and serve as RGB PNG (`/api/radar/motion/{timestamp}.png`)
 - Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + atlas tile LRU (2000 entries)
 - GZip middleware for API responses
-- Background seeding on startup (60 frames across all tilts) + atlas tile pre-rendering for default viewport
+- Background seeding on startup (60 frames across all tilts) + atlas tile pre-rendering + motion field computation for all consecutive pairs
 
 ### Frontend (HTML + JS)
 
@@ -43,10 +40,11 @@ Responsibilities:
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
 - 3D terrain via AWS elevation tiles (always enabled)
 - Custom `RadarLayer` (`CustomLayerInterface`) renders atlas tiles via WebGL with GLSL shaders
-- GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation, spatial smoothing, tile edge blending
+- GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection, spatial smoothing, tile edge blending
+- Motion texture cache loads per-frame-pair CONUS-wide motion vectors; shader converts tile UV → geographic coordinates → motion texture UV, traces pixels backward/forward along displacement field, blends with crossfade weighted by confidence
 - 2D composite mode: single ground-level quad per tile, shader takes fmax across 8 tilt bands
 - 3D layers mode: 8 stacked quads per tile at tilt altitudes, one band per quad
-- Continuous float animation time enables smooth inter-frame interpolation
+- Continuous float animation time with motion-compensated interpolation between keyframes
 - Viewport-based tile loading with browser HTTP cache (`force-cache` + `immutable`)
 - Default CONUS view at z=4, user zooms in to area of interest
 - Time animation with play/pause, scrubber, speed control
@@ -168,14 +166,15 @@ Loaded from CDN:
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png` | GET | Atlas tile — 256×2048 grayscale PNG, 8 tilt bands. z=3–8. |
-| `/api/radar/timestamps` | GET | Available timestamps with bounds. |
+| `/api/radar/motion/{timestamp}.png` | GET | Motion vector field — RGB PNG (U, V, confidence). Keyed by source frame. |
+| `/api/radar/timestamps` | GET | Available timestamps with bounds, `has_motion` flags, and motion config. |
 | `/api/radar/refresh` | GET | Force cache invalidation + re-seed. |
 | `/api/config` | GET | Frontend configuration (map tile API keys). |
 | `/health` | GET | Cache status (in-memory + on-disk counts). |
 
-The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes).
+The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes). Each timestamp entry includes `has_motion: true/false` indicating whether a motion field to the next frame is available. The response also includes `motion.max_disp_deg` for the shader's displacement decoding.
 
-Atlas tiles use `Cache-Control: public, max-age=3600, immutable` — radar data for a given timestamp never changes, so the browser caches aggressively. Combined with `cache: 'force-cache'` on the frontend fetch, animation scrubbing through previously visited frames is nearly instant.
+Atlas tiles and motion PNGs use `Cache-Control: public, max-age=3600, immutable` — radar data for a given timestamp never changes, so the browser caches aggressively. Combined with `cache: 'force-cache'` on the frontend fetch, animation scrubbing through previously visited frames is nearly instant.
 
 ### Atlas tile data format
 
@@ -202,8 +201,9 @@ The pipeline is the core orchestration layer. It operates on a single principle:
 5. Save sparse tilt grids to `data/tilt_grids/{YYYYMMDD-HHMMSS}/` (8 `.npz` + `meta.json`)
 6. Populate in-memory `ConusTiltCache` LRU
 7. Pre-render atlas PNG tiles for the most recent 20 frames at z=4 (CONUS default viewport)
+8. Compute motion fields for all consecutive frame pairs via FFT block matching, save to disk (`motion.npz` + `motion.png`)
 
-In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetching). Step 7 still runs.
+In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetching). Steps 7–8 still run (skipping pairs that already have motion on disk).
 
 ### Caching architecture
 
@@ -219,7 +219,7 @@ In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetchi
 
 **On-disk (`disk_cache.py`):**
 - `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3 (~0.5 MB each)
-- `data/tilt_grids/{YYYYMMDD-HHMMSS}/` — sparse CSR `.npz` per tilt + `meta.json` (~5.4 MB per timestamp)
+- `data/tilt_grids/{YYYYMMDD-HHMMSS}/` — sparse CSR `.npz` per tilt + `meta.json` (~5.4 MB per timestamp) + `motion.npz` / `motion.png` (~50-100 KB per pair)
 - 24-hour eviction on startup
 
 ### Sparse storage rationale
@@ -363,7 +363,7 @@ NWS_DBZ_COLORS = [
 ]
 ```
 
-The PointCloudLayer uses a dynamic alpha ramp from 100–255 based on dBZ value (`colorize_voxels` in `tiles.py`).
+The GLSL shader uses a dBZ-proportional alpha curve shaped by the opacity slider, giving broad visibility at high opacity and showing only strong echoes at low opacity.
 
 ## Sentinel Value Handling
 
@@ -403,12 +403,13 @@ weather_radar/
 ├── backend/
 │   ├── requirements.txt   ← production dependencies (includes scipy)
 │   ├── requirements-dev.txt ← dev/test dependencies
-│   ├── main.py            ← FastAPI app, atlas tile endpoint, timestamps, config
-│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU + atlas pre-render
+│   ├── main.py            ← FastAPI app, atlas/motion tile endpoints, timestamps, config
+│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU + atlas + motion
+│   ├── motion.py          ← FFT block matching, motion field computation + PNG encoding
 │   ├── tiles.py           ← TMS tile math, atlas tile rendering (PNG), tile cache
 │   ├── mrms.py            ← S3 client, file listing, download
 │   ├── cache.py           ← ConusTiltCache (sparse LRU with disk fallback)
-│   ├── disk_cache.py      ← on-disk raw + sparse tilt grid cache
+│   ├── disk_cache.py      ← on-disk raw + sparse tilt grid + motion field cache
 │   ├── render.py          ← NWS reflectivity color scale constants
 │   └── grib2/
 │       ├── __init__.py
@@ -419,8 +420,8 @@ weather_radar/
 ├── frontend/
 │   ├── index.html         ← single-page app
 │   ├── style.css          ← dark theme, glassmorphism panels
-│   ├── radar-layer.js     ← CustomLayerInterface: WebGL atlas tile rendering + GLSL shaders
-│   ├── app.js             ← map init, continuous animation, UI wiring
+│   ├── radar-layer.js     ← CustomLayerInterface: WebGL rendering, motion advection GLSL shaders
+│   ├── app.js             ← map init, continuous animation, motion prefetch, UI wiring
 │   └── colors.js          ← NWS color scale, legend builder, GPU color ramp data
 ├── tests/
 │   ├── __init__.py
@@ -430,12 +431,14 @@ weather_radar/
 │   └── test_fetch.py      ← standalone download + decode diagnostic
 └── data/                  ← runtime cache (gitignored)
     ├── raw/{tilt}/        ← raw .grib2.gz files from S3
-    └── tilt_grids/        ← sparse CSR per tilt + metadata per timestamp
+    └── tilt_grids/        ← sparse CSR per tilt + metadata + motion per timestamp
         └── {YYYYMMDD-HHMMSS}/
             ├── meta.json
             ├── 00.50.npz
             ├── 01.50.npz
-            └── ...
+            ├── ...
+            ├── motion.npz   ← U, V, confidence arrays (raw motion field)
+            └── motion.png   ← pre-rendered RGB PNG served to frontend
 ```
 
 ## Running
@@ -458,7 +461,7 @@ DEV_MODE=1 uvicorn backend.main:app
 open http://localhost:8000
 ```
 
-The server seeds 60 frames on startup in a background thread, then pre-renders voxel tiles for the default CONUS viewport. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second.
+The server seeds 60 frames on startup in a background thread, then pre-renders atlas tiles for the default CONUS viewport and computes motion fields for all consecutive pairs. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second; motion fields are computed for any new pairs.
 
 ## Running Tests
 
@@ -471,22 +474,45 @@ pip install -r backend/requirements-dev.txt
 python -m pytest tests/test_decoder.py -v
 ```
 
-## Build Plan (remaining)
+## Motion-Compensated Interpolation (`motion.py`)
 
-### Phase 4: Motion-compensated frame interpolation
+Between consecutive 2-minute radar frames, a simple crossfade (`mix()`) causes storms to ghost/pulse — sharp at keyframes, blurry between them. Motion-compensated interpolation fixes this by sliding storm cells along their displacement vectors.
 
-9. **Backend: Compute motion fields**
-   - Between consecutive cached frames, compute a 2D displacement field (block matching or optical flow)
-   - MRMS also publishes derived storm motion vectors — evaluate whether these are usable directly
-   - Serve motion vectors alongside tile data
+### Backend: FFT block matching
 
-10. **Frontend: Semi-Lagrangian advection**
-    - For each intermediate frame at time t between keyframes t₀ and t₁:
-      - Trace each pixel backward along the motion vector by α to sample from frame t₀
-      - Trace forward from t₁ by (1 - α) to sample from frame t₁
-      - Blend based on temporal proximity
-    - Storms should slide smoothly across the map instead of ghosting/doubling
-    - Fall back to crossfade locally where the motion field has high residual error (cell splits, new development, decay)
+`compute_motion_field()` in `motion.py`:
+1. Build 2D composite via `fmax` across 8 tilt levels (same as the shader's composite mode)
+2. Downsample 8x → ~438×875 for efficiency
+3. For each 32×32 block (stride 16), find best match in next frame via `scipy.signal.fftconvolve` within a ±12 pixel search window
+4. Record displacement (U east-west, V north-south) in degrees and NCC confidence
+5. Median-filter 3×3 to remove outlier vectors
+6. Output: ~26×53 motion field arrays
+
+### Motion PNG encoding
+
+`encode_motion_png()` encodes U, V, confidence into an RGB PNG:
+- **R** = `clamp(U_deg / 0.5 * 127.5 + 128, 0, 255)` — east-west displacement, ±0.5° range
+- **G** = `clamp(V_deg / 0.5 * 127.5 + 128, 0, 255)` — north-south displacement
+- **B** = `clamp(confidence * 255, 0, 255)` — NCC match quality
+
+Value 128 in R/G = zero displacement. One global CONUS-wide PNG per frame pair (~2-5 KB). All tile meshes reference the same GPU texture.
+
+### Frontend: Semi-Lagrangian advection shader
+
+The GLSL fragment shader's `getMotion()` function:
+1. Converts tile UV → geographic lon/lat (via Mercator inverse)
+2. Maps lon/lat → motion texture UV using the CONUS grid bounds
+3. Samples the motion PNG to get (U, V, confidence)
+4. Converts displacement from degrees to tile UV space (with latitude-dependent Mercator correction: `uvDispY = disp_deg * n / (360 * cos(lat))`)
+
+The `sampleInterp()` function then performs semi-Lagrangian advection:
+- Traces backward from the current position by `α * displacement` to sample frame A
+- Traces forward by `(1-α) * displacement` to sample frame B
+- Blends via `mix(sA, sB, α)` for the advected result
+- Computes a plain crossfade at the original UV position
+- Returns `mix(crossfade, advected, confidence)` — confidence-weighted blend
+
+Fallback: if motion data is unavailable (`u_hasMotion < 0.5`), the shader reverts to plain crossfade. The animation never stalls waiting for motion data.
 
 ## Design Decisions & Learnings
 
@@ -519,10 +545,23 @@ The earlier approach used deck.gl `PointCloudLayer` with `DataFilterExtension` f
 The atlas tile approach, inspired by [MapTiler's 3D weather demo](https://www.maptiler.com/tools/weather/3d/), achieves MapTiler-level visual polish:
 1. **Atlas tiles** — 256×2048 grayscale PNG per tile, 8 tilt bands stacked vertically (~2-10 KB each)
 2. **Custom WebGL** — MapLibre `CustomLayerInterface` renders textured quads directly in the GL context
-3. **GLSL shaders** — GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation, spatial smoothing, tile edge blending
-4. **Continuous animation** — float `currentAnimationTime` enables smooth inter-frame blending via `mix()`
+3. **GLSL shaders** — GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection, spatial smoothing, tile edge blending
+4. **Continuous animation** — float `currentAnimationTime` with motion-compensated interpolation so storms slide smoothly between keyframes
 5. **2D/3D from same data** — composite mode takes `fmax` across 8 bands in the shader; 3D mode renders 8 stacked quads
 6. **Browser HTTP cache** — `Cache-Control: immutable` + `force-cache` makes revisited frames instant
+
+### Why FFT block matching for motion (not optical flow or MRMS products)
+
+We evaluated three approaches for computing inter-frame displacement:
+1. **MRMS storm motion products** — NSSL publishes velocity/direction tables, but no gridded displacement field suitable for pixel-level advection is available in the public S3 bucket.
+2. **Dense optical flow** (e.g. Farnebäck) — accurate but slow on CONUS-scale grids (~3500×7000) and requires OpenCV as a new dependency.
+3. **FFT block matching** — fast (~0.5-1s per pair), uses existing scipy/numpy, produces a low-resolution motion field (~26×53) that's naturally smooth and lightweight to serve as a single PNG.
+
+Block matching on 8x-downsampled composites hits the right trade-off: fast enough for background computation during seeding, accurate enough for the 2-minute inter-frame intervals (storms move ~0.1-0.3° in that time), and the confidence output enables graceful fallback to crossfade where motion estimation is unreliable (cell initiation, dissipation, merging).
+
+### Why one global motion texture per pair (not per-tile)
+
+The motion field is ~26×53 pixels covering all of CONUS — far too small to justify splitting per tile. A single RGB PNG (~2-5 KB) is loaded once per frame pair and bound to all tile meshes as a shared uniform. The GPU's bilinear texture filter interpolates between the coarse motion vectors, which is appropriate given that storm motion is spatially coherent over hundreds of km.
 
 ### Background seeding
 
@@ -530,7 +569,7 @@ The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fet
 
 ### On-disk cache layout
 
-The tilt grid cache uses per-timestamp directories containing 8 sparse `.npz` files (one per tilt) plus a `meta.json`:
+The tilt grid cache uses per-timestamp directories containing 8 sparse `.npz` files (one per tilt), a `meta.json`, and optional motion field files:
 ```
 data/tilt_grids/20260405-120000/
     meta.json
@@ -538,8 +577,10 @@ data/tilt_grids/20260405-120000/
     01.50.npz
     ...
     14.00.npz
+    motion.npz      ← U, V, confidence arrays for this frame → next frame
+    motion.png       ← pre-rendered RGB PNG (served directly to frontend)
 ```
 
-This makes eviction simple (delete entire directory), atomic checks easy (test for `meta.json`), and keeps the raw S3 cache (`data/raw/{tilt}/`) separate.
+This makes eviction simple (delete entire directory), atomic checks easy (test for `meta.json` or `motion.png`), and keeps the raw S3 cache (`data/raw/{tilt}/`) separate.
 
 Legacy caches (`data/decoded/`, `data/composites/`, `data/grib2_cache/`) are automatically removed on startup by the migration logic in `disk_cache.py`.
