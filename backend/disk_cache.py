@@ -128,6 +128,8 @@ def get_tilt_grids(timestamp: str) -> tuple[dict[str, sp.csr_matrix], dict[str, 
 
     grids: dict[str, sp.csr_matrix] = {}
     for npz_path in sorted(ts_dir.glob("*.npz")):
+        if npz_path.stem == "motion":
+            continue
         tilt = npz_path.stem  # e.g. "00.50"
         grids[tilt] = sp.load_npz(npz_path)
 
@@ -254,6 +256,16 @@ def invalidate_ts_list_cache() -> None:
 
 
 # ── Eviction ──────────────────────────────────────────────────────────────────
+
+
+def evict_timestamp(timestamp: str) -> bool:
+    """Remove a single timestamp's tilt grid directory from disk."""
+    stem = _ts_to_stem(timestamp)
+    ts_dir = TILT_GRIDS_DIR / stem
+    if ts_dir.exists():
+        shutil.rmtree(ts_dir)
+        return True
+    return False
 
 
 def evict_older_than(hours: float = 24.0) -> int:

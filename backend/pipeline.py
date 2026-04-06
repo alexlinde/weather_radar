@@ -354,6 +354,89 @@ def compute_all_motion() -> int:
     return computed
 
 
+def refresh_new_frames(count: int = 10) -> int:
+    """Incrementally fetch only new frames from S3 that aren't already cached.
+
+    Checks for the most recent *count* timestamps, skips those already on
+    disk, fetches/decodes/caches only the new ones, pre-renders atlas tiles,
+    and computes motion fields for new consecutive pairs.
+
+    Returns the number of newly fetched frames.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    ref_keys = list_tilt_files("00.50", count=count)
+    if not ref_keys:
+        return 0
+
+    new_keys = []
+    for key in ref_keys:
+        ts = _timestamp_from_key(key)
+        if ts and not disk_cache.has_tilt_grids(ts):
+            new_keys.append(key)
+
+    if not new_keys:
+        return 0
+
+    logger.info("Refresh: %d new frames to fetch", len(new_keys))
+    ordered = list(reversed(new_keys))  # oldest-first
+
+    fetched = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ref_key in ordered:
+            result = _build_frame(ref_key, pool=pool)
+            if result is None:
+                continue
+            timestamp, sparse_grids, meta = result
+            tilt_cache.put(timestamp, sparse_grids, meta)
+            fetched += 1
+            logger.info("  Refresh: fetched %s (%d tilts)", timestamp, len(sparse_grids))
+
+    if fetched == 0:
+        return 0
+
+    tile_coords_z4 = _conus_tile_coords(z=4)
+    tile_coords_z5 = _conus_tile_coords(z=5)
+    entries = disk_cache.list_tilt_grid_timestamps()
+    recent = entries[-fetched:]
+    atlas_count = _prerender_atlas_tiles(recent, tile_coords_z4)
+    atlas_count += _prerender_atlas_tiles(recent, tile_coords_z5)
+    if atlas_count:
+        logger.info("  Refresh: pre-rendered %d atlas tiles", atlas_count)
+
+    motion_count = compute_all_motion()
+    if motion_count:
+        logger.info("  Refresh: computed %d motion fields", motion_count)
+
+    return fetched
+
+
+def purge_stale_data(max_age_hours: float = 3.0, max_frames: int = 60) -> int:
+    """Remove frames older than *max_age_hours* from disk, memory, and ts_list.
+
+    Also trims disk cache to at most *max_frames* entries.
+    Returns the total number of entries removed.
+    """
+    from .tiles import atlas_tile_cache
+
+    removed = disk_cache.evict_older_than(hours=max_age_hours)
+
+    entries = disk_cache.list_tilt_grid_timestamps()
+    if len(entries) > max_frames:
+        excess = entries[: len(entries) - max_frames]
+        for entry in excess:
+            ts = entry.get("timestamp")
+            if ts:
+                disk_cache.evict_timestamp(ts)
+                removed += 1
+
+    if removed:
+        disk_cache.invalidate_ts_list_cache()
+        atlas_tile_cache.clear()
+
+    return removed
+
+
 def invalidate_all() -> None:
     """Clear all in-memory caches."""
     tilt_cache.clear()

@@ -208,6 +208,17 @@ The pipeline is the core orchestration layer. It operates on a single principle:
 
 In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetching). Steps 7–8 still run (skipping pairs that already have motion on disk).
 
+### Periodic refresh (every 60 s)
+
+After the initial seed, a background asyncio task runs every 60 seconds:
+
+1. **Incremental fetch** — lists the 10 most recent S3 keys, skips any already on disk, fetches/decodes/caches only truly new frames
+2. **Atlas pre-render** — renders z=4 and z=5 atlas tiles for newly fetched frames
+3. **Motion computation** — computes motion fields for any new consecutive frame pairs
+4. **Purge** — removes disk entries older than 3 hours and trims to a max of 60 frames; invalidates the in-memory ts_list and atlas tile caches when entries are removed
+
+The periodic refresh runs in both normal and `DEV_MODE`. In `DEV_MODE` the incremental fetch finds nothing new (no S3 keys beyond what's on disk), so it's effectively a no-op.
+
 ### Caching architecture
 
 **ConusTiltCache (`cache.py`):**
@@ -223,7 +234,7 @@ In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetchi
 **On-disk (`disk_cache.py`):**
 - `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3 (~0.5 MB each)
 - `data/tilt_grids/{YYYYMMDD-HHMMSS}/` — sparse CSR `.npz` per tilt + `meta.json` (~5.4 MB per timestamp) + `motion.npz` / `motion.png` (~50-100 KB per pair)
-- 24-hour eviction on startup
+- 24-hour eviction on startup; 3-hour rolling eviction every 60 s via periodic refresh
 
 ### Sparse storage rationale
 
@@ -464,7 +475,7 @@ DEV_MODE=1 uvicorn backend.main:app
 open http://localhost:8000
 ```
 
-The server seeds 60 frames on startup in a background thread, then pre-renders atlas tiles for the default CONUS viewport and computes motion fields for all consecutive pairs. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second; motion fields are computed for any new pairs.
+The server seeds 60 frames on startup in a background thread, then pre-renders atlas tiles for the default CONUS viewport and computes motion fields for all consecutive pairs. After seeding, a background task polls S3 every 60 seconds to pick up new frames and purge data older than 3 hours. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second; motion fields are computed for any new pairs.
 
 ## Running Tests
 
@@ -569,6 +580,8 @@ The motion field is ~26×53 pixels covering all of CONUS — far too small to ju
 ### Background seeding
 
 The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread, followed by atlas tile pre-rendering for the default z=4 CONUS viewport. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
+
+After the seed (or in parallel with it), a periodic refresh task polls S3 every 60 seconds to pick up new 2-minute MRMS frames as they appear. It also purges disk/memory entries older than 3 hours and caps the total frame count at 60, keeping the data directory bounded.
 
 ### On-disk cache layout
 

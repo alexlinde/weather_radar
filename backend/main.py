@@ -44,6 +44,11 @@ except ImportError:
 DEV_MODE = os.getenv("DEV_MODE", "").lower() in ("1", "true", "yes")
 
 
+REFRESH_INTERVAL_S = 60
+PURGE_MAX_AGE_H = 3.0
+PURGE_MAX_FRAMES = 60
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import threading
@@ -51,6 +56,30 @@ async def lifespan(app: FastAPI):
 
     disk_cache.migrate_legacy_cache()
     disk_cache.evict_older_than(hours=24)
+
+    _refresh_stop = asyncio.Event()
+
+    async def _periodic_refresh():
+        """Check S3 for new frames and purge stale data every REFRESH_INTERVAL_S."""
+        while not _refresh_stop.is_set():
+            try:
+                await asyncio.sleep(REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                break
+            if _refresh_stop.is_set():
+                break
+            try:
+                fetched = await asyncio.to_thread(pipeline.refresh_new_frames, 10)
+                purged = await asyncio.to_thread(
+                    pipeline.purge_stale_data, PURGE_MAX_AGE_H, PURGE_MAX_FRAMES,
+                )
+                if fetched or purged:
+                    logger.info(
+                        "Periodic refresh: %d new frames, %d stale entries purged",
+                        fetched, purged,
+                    )
+            except Exception:
+                logger.exception("Periodic refresh failed")
 
     if DEV_MODE:
         n = pipeline.warm_from_disk(limit=30)
@@ -66,7 +95,17 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_bg_seed, daemon=True, name="cache-seed").start()
         logger.info("Cache seeding started in background — server ready")
 
+    refresh_task = asyncio.create_task(_periodic_refresh())
+    logger.info("Periodic refresh task started (every %ds)", REFRESH_INTERVAL_S)
+
     yield
+
+    _refresh_stop.set()
+    refresh_task.cancel()
+    try:
+        await refresh_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(title="Weather Radar API", version="5.0.0", lifespan=lifespan)
