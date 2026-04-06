@@ -48,6 +48,14 @@ let refreshIntervalId = null;
 let radarLayer = null;
 let viewMode = 'composite';
 let verticalExaggeration = 3.0;
+let activePreset = 'all';
+
+const RADAR_PRESETS = {
+  all:    { dbzMin: 5,  dbzMax: 75, intensity: 0.8 },
+  precip: { dbzMin: 15, dbzMax: 75, intensity: 0.85 },
+  severe: { dbzMin: 40, dbzMax: 75, intensity: 0.95 },
+  custom: null,
+};
 
 // ── Status helpers ────────────────────────────────────────────────────────────
 
@@ -365,7 +373,7 @@ async function init() {
 
   map.on('moveend', onViewportChange);
 
-  // ── Opacity slider ──────────────────────────────────────────────────────
+  // ── Intensity slider ─────────────────────────────────────────────────────
 
   const opacitySlider = document.getElementById('opacity-slider');
   const opacityValue  = document.getElementById('opacity-value');
@@ -374,6 +382,7 @@ async function init() {
     userOpacity = parseFloat(opacitySlider.value);
     opacityValue.textContent = Math.round(userOpacity * 100) + '%';
     if (radarLayer) radarLayer.setOpacity(userOpacity);
+    if (activePreset !== 'custom') switchPreset('custom');
   });
 
   // ── Play / Pause ────────────────────────────────────────────────────────
@@ -428,6 +437,37 @@ async function init() {
   dbzMinSlider.addEventListener('input', updateDbzRange);
   dbzMaxSlider.addEventListener('input', updateDbzRange);
 
+  // ── Radar presets ──────────────────────────────────────────────────────
+
+  const presetSeg = document.getElementById('preset-seg');
+  const dbzCutoffRow = document.getElementById('row-dbz-cutoff');
+
+  function switchPreset(key) {
+    activePreset = key;
+    presetSeg.querySelectorAll('.seg-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.preset === key);
+    });
+
+    dbzCutoffRow.style.display = key === 'custom' ? '' : 'none';
+
+    const preset = RADAR_PRESETS[key];
+    if (!preset) return;
+
+    dbzMinSlider.value = preset.dbzMin;
+    dbzMaxSlider.value = preset.dbzMax;
+    dbzRangeValue.textContent = `${preset.dbzMin} – ${preset.dbzMax}`;
+    if (radarLayer) radarLayer.setDbzRange(preset.dbzMin, preset.dbzMax);
+
+    userOpacity = preset.intensity;
+    opacitySlider.value = preset.intensity;
+    opacityValue.textContent = Math.round(preset.intensity * 100) + '%';
+    if (radarLayer) radarLayer.setOpacity(preset.intensity);
+  }
+
+  presetSeg.querySelectorAll('.seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchPreset(btn.dataset.preset));
+  });
+
   // ── Refresh button ──────────────────────────────────────────────────────
 
   document.getElementById('btn-refresh').addEventListener('click', async () => {
@@ -444,7 +484,7 @@ async function init() {
   // ── Reset view ──────────────────────────────────────────────────────────
 
   document.getElementById('btn-reset-view').addEventListener('click', () => {
-    const pitch = viewMode === '3d' ? 50 : 0;
+    const pitch = (viewMode === '3d' || viewMode === 'volume') ? 50 : 0;
     map.flyTo({ center: [-98.5, 39.8], zoom: 4, pitch, bearing: 0, duration: 800 });
   });
 

@@ -28,7 +28,7 @@ html, body {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 10px;
   padding: 14px 16px;
-  width: 220px;
+  width: 240px;
   backdrop-filter: blur(8px);
   color: #e6edf3;
   box-shadow: 0 4px 24px rgba(0,0,0,0.5);
@@ -303,6 +303,12 @@ input[type="range"]::-moz-range-track {
 #controls .seg-btn.active {
   background: rgba(88,166,255,0.2);
   color: #58a6ff;
+}
+
+.seg-control-4 .seg-btn {
+  padding: 5px 2px;
+  font-size: 10.5px;
+  overflow: visible;
 }
 
 .volume-status-label {

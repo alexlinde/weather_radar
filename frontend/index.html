@@ -23,32 +23,42 @@
   <div id="controls">
     <h2>Weather Radar</h2>
 
-    <!-- Opacity slider -->
+    <!-- View mode -->
+    <div class="control-row">
+      <div class="control-label"><span>View</span></div>
+      <div class="seg-control" id="view-mode-seg">
+        <button class="seg-btn active" data-mode="composite">Composite</button>
+        <button class="seg-btn" data-mode="3d">3D</button>
+        <button class="seg-btn" data-mode="volume">Volume</button>
+      </div>
+    </div>
+
+    <!-- Radar preset -->
+    <div class="control-row">
+      <div class="control-label"><span>Filter</span></div>
+      <div class="seg-control seg-control-4" id="preset-seg">
+        <button class="seg-btn active" data-preset="all">All</button>
+        <button class="seg-btn" data-preset="precip">Precip</button>
+        <button class="seg-btn" data-preset="severe">Severe</button>
+        <button class="seg-btn" data-preset="custom">Custom</button>
+      </div>
+    </div>
+
+    <!-- Intensity slider -->
     <div class="control-row">
       <div class="control-label">
-        <span>Opacity</span>
+        <span>Intensity</span>
         <span id="opacity-value">80%</span>
       </div>
       <input
         type="range"
         id="opacity-slider"
         min="0" max="1" step="0.01" value="0.8"
-        aria-label="Radar opacity"
+        aria-label="Radar intensity"
       />
     </div>
 
-    <!-- View mode: Composite (2D) vs 3D -->
-    <div class="control-row">
-      <div class="control-label">
-        <span>View</span>
-      </div>
-      <div class="seg-control" id="view-mode-seg">
-        <button class="seg-btn active" data-mode="composite">Composite</button>
-        <button class="seg-btn" data-mode="3d">3D Layers</button>
-      </div>
-    </div>
-
-    <!-- Vertical exaggeration (shown only when 3D is on) -->
+    <!-- Vertical exaggeration (shown only in 3D/Volume) -->
     <div class="control-row" id="row-exaggeration" style="display:none">
       <div class="control-label">
         <span>Vert. scale</span>
@@ -62,8 +72,8 @@
       />
     </div>
 
-    <!-- dBZ cutoff controls -->
-    <div class="control-row" id="row-dbz-cutoff">
+    <!-- dBZ cutoff controls (shown only for Custom preset) -->
+    <div class="control-row" id="row-dbz-cutoff" style="display:none">
       <div class="control-label">
         <span>dBZ range</span>
         <span id="dbz-range-value">5 – 75</span>
