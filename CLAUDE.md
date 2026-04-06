@@ -171,6 +171,7 @@ Loaded from CDN:
 |---|---|---|
 | `/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png` | GET | 2D composite TMS tile. z=3–8. |
 | `/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json` | GET | 3D voxel tile (JSON array of `[lon, lat, alt_m, dbz]`). z=3–8. Zoom-based downsampling. |
+| `/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.bin` | GET | 3D binary voxel tile. `?base={prev_ts}` for delta (returns 4-byte unchanged sentinel if identical). |
 | `/api/radar/timestamps` | GET | Available timestamps with bounds (for tile URL construction). |
 | `/api/radar/refresh` | GET | Force cache invalidation + re-seed. |
 | `/api/config` | GET | Frontend configuration (map tile API keys). |
@@ -446,11 +447,14 @@ pip install -r backend/requirements.txt
 cp .env.example .env
 # Edit .env to add STADIA_API_KEY or MAPTILER_API_KEY
 
-# Start the server (from project root)
+# Start the server (from project root) — serves both API and frontend
 uvicorn backend.main:app
 
-# Open frontend (served separately, or just open the file)
-open frontend/index.html
+# Or with HTTP/2 via hypercorn (multiplexes tile requests over one connection):
+hypercorn backend.main:app --bind 0.0.0.0:8000
+
+# Open in browser
+open http://localhost:8000
 ```
 
 The server seeds 60 frames on startup in a background thread. The frontend auto-retries until frames are available (~1-2 minutes).

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import math
+import struct
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -19,7 +20,7 @@ import numpy as np
 import scipy.sparse as sp
 from PIL import Image
 
-from .render import colorize_grid
+from .render import NWS_DBZ_COLORS, colorize_grid
 
 TILE_SIZE = 256
 MIN_ZOOM = 3
@@ -180,23 +181,41 @@ def _downsample_step(z: int) -> int:
 _LOW_ZOOM_TILTS = {"00.50", "02.50", "05.00", "10.00"}
 _MAX_VOXELS_PER_TILE = 40_000
 
+_EMPTY_BIN_TILE = struct.pack("<I", 0)
+DELTA_UNCHANGED = struct.pack("<I", 0xFFFFFFFF)
 
-def render_voxel_tile(
+
+def colorize_voxels(dbz_values: np.ndarray) -> np.ndarray:
+    """Vectorized dBZ → RGBA for voxel points. Returns Nx4 uint8 array."""
+    n = len(dbz_values)
+    colors = np.zeros((n, 4), dtype=np.uint8)
+    alphas = np.clip(
+        np.round(100 + (dbz_values - 10) * (155 / 50)), 100, 255
+    ).astype(np.uint8)
+    for min_dbz, max_dbz, r, g, b in NWS_DBZ_COLORS:
+        mask = (dbz_values >= min_dbz) & (dbz_values < max_dbz)
+        colors[mask, :3] = [r, g, b]
+    colors[dbz_values >= 75, :3] = [200, 200, 255]
+    has_color = colors[:, :3].any(axis=1)
+    colors[has_color, 3] = alphas[has_color]
+    return colors
+
+
+def _extract_voxels(
     sparse_grids: dict[str, sp.csr_matrix],
     metadata: dict,
     z: int,
     x: int,
     y: int,
-) -> list[list[float]]:
-    """Extract voxels from all tilt levels for a tile region.
+) -> np.ndarray | None:
+    """Core voxel extraction shared by JSON and binary renderers.
 
-    Returns list of [lon, lat, altitude_m, dbz].
-    Zoom-adaptive: fewer tilts and higher dBZ threshold at low zoom.
+    Returns Nx4 float array of [lon, lat, altitude_m, dbz] or None.
     """
     tb = tile_bounds(z, x, y)
     overlap = _grid_overlap(tb, metadata)
     if overlap is None:
-        return []
+        return None
 
     row_start, row_end, col_start, col_end = overlap
     step = _downsample_step(z)
@@ -241,12 +260,47 @@ def render_voxel_tile(
             break
 
     if not all_voxels:
-        return []
+        return None
 
     result = np.vstack(all_voxels)
     if len(result) > _MAX_VOXELS_PER_TILE:
         result = result[:_MAX_VOXELS_PER_TILE]
-    return result.tolist()
+    return result
+
+
+def render_voxel_tile(
+    sparse_grids: dict[str, sp.csr_matrix],
+    metadata: dict,
+    z: int,
+    x: int,
+    y: int,
+) -> list[list[float]]:
+    """Extract voxels as JSON-serializable list of [lon, lat, altitude_m, dbz]."""
+    result = _extract_voxels(sparse_grids, metadata, z, x, y)
+    return result.tolist() if result is not None else []
+
+
+def render_voxel_tile_binary(
+    sparse_grids: dict[str, sp.csr_matrix],
+    metadata: dict,
+    z: int,
+    x: int,
+    y: int,
+) -> bytes:
+    """Pack voxels as binary: [uint32 count][float32 positions][uint8 colors].
+
+    Count 0xFFFFFFFF is reserved as the delta "unchanged" sentinel.
+    Positions are 3 × float32 (lon, lat, alt_m) per voxel.
+    Colors are 4 × uint8 (R, G, B, A) per voxel, pre-computed from dBZ.
+    """
+    result = _extract_voxels(sparse_grids, metadata, z, x, y)
+    if result is None:
+        return _EMPTY_BIN_TILE
+
+    count = len(result)
+    positions = result[:, :3].astype(np.float32)
+    colors = colorize_voxels(result[:, 3])
+    return struct.pack("<I", count) + positions.tobytes() + colors.tobytes()
 
 
 # ── Tile caches ──────────────────────────────────────────────────────────────
@@ -283,3 +337,4 @@ class TileCache:
 
 tile_cache = TileCache()
 voxel_tile_cache = TileCache(max_size=_VOXEL_TILE_CACHE_MAX)
+bin_tile_cache = TileCache(max_size=_VOXEL_TILE_CACHE_MAX)

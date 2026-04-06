@@ -168,7 +168,8 @@ def seed_frames(count: int = 60) -> int:
 def invalidate_all() -> None:
     """Clear all in-memory caches."""
     tilt_cache.clear()
-    from .tiles import tile_cache, voxel_tile_cache
+    from .tiles import bin_tile_cache, tile_cache, voxel_tile_cache
     tile_cache.clear()
     voxel_tile_cache.clear()
+    bin_tile_cache.clear()
     disk_cache.invalidate_ts_list_cache()
