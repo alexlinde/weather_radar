@@ -1,12 +1,15 @@
 /**
- * RadarLayer — MapLibre CustomLayerInterface for rendering atlas radar tiles.
+ * RadarLayer — three.js overlay renderer for atlas radar tiles.
  *
- * Uses WebGL to render 256×2048 grayscale PNG atlas tiles (8 tilt bands)
- * with GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation,
- * and spatial smoothing.
+ * Renders to a separate canvas using three.js, positioned over the MapLibre
+ * map. Camera projection is synced from MapLibre's render callback matrix.
+ *
+ * Tile meshes use world-space Mercator vertices (no per-mesh transforms)
+ * so that shared tile edges produce bit-identical clip-space positions,
+ * preventing seams.
  *
  * Modes:
- *   - 'composite': single ground-level plane per tile, shader takes fmax across 8 bands
+ *   - 'composite': shader takes fmax across 8 bands
  *   - '3d': 8 stacked planes per tile, one per tilt altitude
  */
 
@@ -17,22 +20,21 @@ const MAX_TEXTURES = 300;
 
 const TILT_HEIGHTS_M = [1000, 2000, 3500, 5000, 7000, 9000, 12000, 15000];
 
+function mercToAlt(altMeters) {
+  return altMeters / 40075016.686;
+}
+
 // ── GLSL Shaders ────────────────────────────────────────────────────────────
 
-const VERT_SHADER = `
-  precision highp float;
-  uniform mat4 u_matrix;
-  attribute vec3 a_pos;
-  attribute vec2 a_uv;
+const RADAR_VERT = `
   varying vec2 v_uv;
-
   void main() {
-    gl_Position = u_matrix * vec4(a_pos, 1.0);
-    v_uv = a_uv;
+    v_uv = uv;
+    gl_Position = projectionMatrix * vec4(position, 1.0);
   }
 `;
 
-const FRAG_SHADER = `
+const RADAR_FRAG = `
   precision highp float;
 
   uniform sampler2D u_tex0;
@@ -40,8 +42,7 @@ const FRAG_SHADER = `
   uniform sampler2D u_colorRamp;
   uniform float u_timeMix;
   uniform float u_opacity;
-  uniform int u_tiltIndex;     // 0-7 for single band, -1 for composite (fmax)
-  uniform float u_smoothRadius; // spatial smoothing radius in UV units
+  uniform int u_tiltIndex;
   uniform float u_dbzMin;
   uniform float u_dbzMax;
 
@@ -49,169 +50,139 @@ const FRAG_SHADER = `
 
   float sampleBand(sampler2D tex, vec2 uv, int band) {
     float bandF = float(band);
-    vec2 atlasUV = vec2(uv.x, uv.y / 8.0 + bandF / 8.0);
+    vec2 atlasUV = vec2(uv.x, (1.0 - uv.y) / 8.0 + bandF / 8.0);
     return texture2D(tex, atlasUV).r;
   }
 
   float sampleInterp(vec2 uv, int band) {
-    float a = sampleBand(u_tex0, uv, band);
-    float b = sampleBand(u_tex1, uv, band);
-    return mix(a, b, u_timeMix);
+    return mix(sampleBand(u_tex0, uv, band), sampleBand(u_tex1, uv, band), u_timeMix);
   }
 
   float getComposite(vec2 uv) {
     float maxVal = 0.0;
     for (int i = 0; i < 8; i++) {
-      float val = sampleInterp(uv, i);
-      maxVal = max(maxVal, val);
+      maxVal = max(maxVal, sampleInterp(uv, i));
     }
     return maxVal;
   }
 
-  float smoothSample(vec2 uv) {
-    float raw;
-    if (u_tiltIndex < 0) {
-      raw = getComposite(uv);
-    } else {
-      raw = sampleInterp(uv, u_tiltIndex);
-    }
-
-    if (u_smoothRadius <= 0.0) return raw;
-
-    // Circular 8-sample spatial smoothing.
-    // Offsets are clamped to [0,1] UV so CLAMP_TO_EDGE handles tile edges
-    // naturally — no hard cutoff that would create a visible seam.
-    float sum = raw;
-    float count = 1.0;
-    float r = u_smoothRadius;
-    for (int i = 0; i < 8; i++) {
-      float angle = float(i) * 0.7854; // PI/4
-      vec2 sampleUV = clamp(uv + vec2(cos(angle), sin(angle)) * r, 0.0, 1.0);
-      float s;
-      if (u_tiltIndex < 0) {
-        s = getComposite(sampleUV);
-      } else {
-        s = sampleInterp(sampleUV, u_tiltIndex);
-      }
-      float w = 0.5;
-      sum += s * w;
-      count += w;
-    }
-    return sum / count;
-  }
-
   void main() {
-    float encoded = smoothSample(v_uv);
+    float encoded = u_tiltIndex < 0 ? getComposite(v_uv) : sampleInterp(v_uv, u_tiltIndex);
 
-    if (encoded < 0.004) { // ~1/255
-      discard;
-    }
-
-    // dBZ decode: pixel_byte = encoded * 255, dBZ = pixel_byte / 2 - 30
+    if (encoded < 0.004) discard;
     float dbz = encoded * 127.5 - 30.0;
-
-    if (dbz < u_dbzMin || dbz > u_dbzMax) {
-      discard;
-    }
+    if (dbz < u_dbzMin || dbz > u_dbzMax) discard;
 
     vec4 color = texture2D(u_colorRamp, vec2(encoded, 0.5));
-
-    if (color.a < 0.01) {
-      discard;
-    }
+    if (color.a < 0.01) discard;
 
     color.a *= u_opacity;
-    gl_FragColor = color;
+    gl_FragColor = vec4(color.rgb * color.a, color.a);
   }
 `;
 
-// ── Tile texture manager ────────────────────────────────────────────────────
+// ── Tile texture cache ──────────────────────────────────────────────────────
 
 class TileTextureCache {
-  constructor() {
-    this._textures = new Map(); // key -> { texture, lastUsed }
-    this._loading = new Map();  // key -> Promise
-    this._gl = null;
+  constructor(onLoad) {
+    this._textures = new Map();
+    this._loading = new Map();
+    this._onLoad = onLoad;
   }
 
-  init(gl) {
-    this._gl = gl;
-  }
+  _key(ts, z, x, y) { return `${ts}/${z}/${x}/${y}`; }
 
-  _key(timestamp, z, x, y) {
-    return `${timestamp}/${z}/${x}/${y}`;
-  }
-
-  get(timestamp, z, x, y) {
-    const key = this._key(timestamp, z, x, y);
-    const entry = this._textures.get(key);
-    if (entry) {
-      entry.lastUsed = performance.now();
-      return entry.texture;
-    }
+  get(ts, z, x, y) {
+    const e = this._textures.get(this._key(ts, z, x, y));
+    if (e) { e.lu = performance.now(); return e.t; }
     return null;
   }
 
-  async load(timestamp, z, x, y) {
-    const key = this._key(timestamp, z, x, y);
-    if (this._textures.has(key)) return this._textures.get(key).texture;
-    if (this._loading.has(key)) return this._loading.get(key);
-
-    const promise = this._doLoad(key, timestamp, z, x, y);
-    this._loading.set(key, promise);
-    try {
-      const tex = await promise;
-      return tex;
-    } finally {
-      this._loading.delete(key);
-    }
+  async load(ts, z, x, y) {
+    const k = this._key(ts, z, x, y);
+    if (this._textures.has(k)) return this._textures.get(k).t;
+    if (this._loading.has(k)) return this._loading.get(k);
+    const p = this._doLoad(k, ts, z, x, y);
+    this._loading.set(k, p);
+    try { return await p; } finally { this._loading.delete(k); }
   }
 
-  async _doLoad(key, timestamp, z, x, y) {
-    const gl = this._gl;
-    if (!gl) return null;
-
-    const url = `/api/radar/atlas/${encodeURIComponent(timestamp)}/${z}/${x}/${y}.png`;
+  async _doLoad(k, ts, z, x, y) {
+    const url = `/api/radar/atlas/${encodeURIComponent(ts)}/${z}/${x}/${y}.png`;
     try {
-      const resp = await fetch(url, { cache: 'force-cache' });
-      if (!resp.ok) return null;
-      const blob = await resp.blob();
-      const bmp = await createImageBitmap(blob);
-
-      const texture = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gl.LUMINANCE, gl.UNSIGNED_BYTE, bmp);
-      bmp.close();
-
-      this._textures.set(key, { texture, lastUsed: performance.now() });
+      const r = await fetch(url, { cache: 'force-cache' });
+      if (!r.ok) return null;
+      const bmp = await createImageBitmap(await r.blob());
+      const t = new THREE.Texture(bmp);
+      t.magFilter = THREE.NearestFilter;
+      t.minFilter = THREE.NearestFilter;
+      t.wrapS = THREE.ClampToEdgeWrapping;
+      t.wrapT = THREE.ClampToEdgeWrapping;
+      t.generateMipmaps = false;
+      t.needsUpdate = true;
+      this._textures.set(k, { t, lu: performance.now() });
       this._evict();
-      return texture;
-    } catch (err) {
-      if (err.name !== 'AbortError') console.warn('Tile load failed:', key, err);
+      this._onLoad?.();
+      return t;
+    } catch (e) {
+      if (e.name !== 'AbortError') console.warn('Tile load failed:', k, e);
       return null;
     }
   }
 
   _evict() {
     if (this._textures.size <= MAX_TEXTURES) return;
-    const entries = [...this._textures.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-    const toRemove = entries.slice(0, entries.length - MAX_TEXTURES);
-    for (const [key, entry] of toRemove) {
-      if (this._gl) this._gl.deleteTexture(entry.texture);
-      this._textures.delete(key);
+    const arr = [...this._textures.entries()].sort((a, b) => a[1].lu - b[1].lu);
+    for (const [k, e] of arr.slice(0, arr.length - MAX_TEXTURES)) {
+      e.t.dispose();
+      this._textures.delete(k);
     }
   }
 
   clear() {
-    for (const [, entry] of this._textures) {
-      if (this._gl) this._gl.deleteTexture(entry.texture);
-    }
+    for (const [, e] of this._textures) e.t.dispose();
     this._textures.clear();
   }
+}
+
+// ── Color ramp texture ──────────────────────────────────────────────────────
+
+function buildColorRampTexture() {
+  const data = createColorRampData();
+  const tex = new THREE.DataTexture(data, 256, 1, THREE.RGBAFormat);
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// ── Build world-space tile geometry ─────────────────────────────────────────
+
+function buildTileGeometry(z, x, y, mz) {
+  const n = 2 ** z;
+  const mx0 = x / n;
+  const mx1 = (x + 1) / n;
+  const my0 = y / n;
+  const my1 = (y + 1) / n;
+
+  const positions = new Float32Array([
+    mx0, my0, mz,
+    mx1, my0, mz,
+    mx0, my1, mz,
+    mx1, my1, mz,
+  ]);
+  const uvs = new Float32Array([
+    0, 1,
+    1, 1,
+    0, 0,
+    1, 0,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex([0, 2, 1, 1, 2, 3]);
+  return geo;
 }
 
 // ── Radar layer ─────────────────────────────────────────────────────────────
@@ -225,7 +196,6 @@ class RadarLayer {
     this._mode = 'composite';
     this._opacity = 0.8;
     this._vertExag = 3.0;
-    this._smoothRadius = 0.003;
     this._dbzMin = -30.0;
     this._dbzMax = 100.0;
 
@@ -234,57 +204,53 @@ class RadarLayer {
     this._timeMix = 0;
     this._timestamps = [];
 
-    this._program = null;
-    this._locations = {};
-    this._colorRampTex = null;
-    this._tileCache = new TileTextureCache();
-    this._quadBuffer = null;
-
+    this._tileCache = new TileTextureCache(() => this._requestRepaint());
     this._map = null;
-    this._gl = null;
     this._visibleTiles = [];
-    this._tileQuads = new Map(); // "z/x/y" -> { buffer, vertCount }
+
+    this._renderer = null;
+    this._scene = null;
+    this._camera = null;
+    this._colorRampTex = null;
+    this._tileMeshes = new Map();
+    this._staleMeshes = [];
+    this._stalePurgeTimer = null;
+    this._dummyTex = null;
+    this._currentMatrix = null;
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
 
-  setTimestamps(ts) {
-    this._timestamps = ts;
-  }
+  setTimestamps(ts) { this._timestamps = ts; }
 
   setAnimation(frameA, frameB, mix) {
     this._frameA = frameA;
     this._frameB = frameB;
     this._timeMix = mix;
-    if (this._map) this._map.triggerRepaint();
+    this._requestRepaint();
   }
 
   setMode(mode) {
     this._mode = mode;
-    this._rebuildQuads();
-    if (this._map) this._map.triggerRepaint();
+    this._rebuildMeshes();
+    this._requestRepaint();
   }
 
   setOpacity(val) {
     this._opacity = val;
-    if (this._map) this._map.triggerRepaint();
+    this._requestRepaint();
   }
 
   setVerticalExaggeration(val) {
     this._vertExag = val;
-    this._rebuildQuads();
-    if (this._map) this._map.triggerRepaint();
-  }
-
-  setSmoothRadius(val) {
-    this._smoothRadius = val;
-    if (this._map) this._map.triggerRepaint();
+    this._rebuildMeshes();
+    this._requestRepaint();
   }
 
   setDbzRange(min, max) {
     this._dbzMin = min;
     this._dbzMax = max;
-    if (this._map) this._map.triggerRepaint();
+    this._requestRepaint();
   }
 
   updateVisibleTiles() {
@@ -308,7 +274,7 @@ class RadarLayer {
       }
     }
     this._visibleTiles = tiles;
-    this._rebuildQuads();
+    this._rebuildMeshes();
   }
 
   async ensureTextures(frameA, frameB) {
@@ -316,233 +282,204 @@ class RadarLayer {
     const tsA = this._timestamps[frameA]?.timestamp;
     const tsB = this._timestamps[frameB]?.timestamp;
     if (!tsA) return;
-
     const promises = [];
     for (const { z, x, y } of this._visibleTiles) {
       promises.push(this._tileCache.load(tsA, z, x, y));
-      if (tsB && tsB !== tsA) {
-        promises.push(this._tileCache.load(tsB, z, x, y));
-      }
+      if (tsB && tsB !== tsA) promises.push(this._tileCache.load(tsB, z, x, y));
     }
     await Promise.all(promises);
-    if (this._map) this._map.triggerRepaint();
   }
 
   prefetchFrame(frameIdx) {
     if (frameIdx < 0 || frameIdx >= this._timestamps.length) return;
     const ts = this._timestamps[frameIdx]?.timestamp;
     if (!ts) return;
-    for (const { z, x, y } of this._visibleTiles) {
-      this._tileCache.load(ts, z, x, y);
-    }
+    for (const { z, x, y } of this._visibleTiles) this._tileCache.load(ts, z, x, y);
   }
 
-  // ── CustomLayerInterface ────────────────────────────────────────────────
+  // ── CustomLayerInterface ───────────────────────────────────────────────
 
-  onAdd(map, gl) {
+  onAdd(map, _gl) {
     this._map = map;
-    this._gl = gl;
-    this._tileCache.init(gl);
-
-    this._program = this._createProgram(gl, VERT_SHADER, FRAG_SHADER);
-    const p = this._program;
-    this._locations = {
-      aPos:         gl.getAttribLocation(p, 'a_pos'),
-      aUv:          gl.getAttribLocation(p, 'a_uv'),
-      uMatrix:      gl.getUniformLocation(p, 'u_matrix'),
-      uTex0:        gl.getUniformLocation(p, 'u_tex0'),
-      uTex1:        gl.getUniformLocation(p, 'u_tex1'),
-      uColorRamp:   gl.getUniformLocation(p, 'u_colorRamp'),
-      uTimeMix:     gl.getUniformLocation(p, 'u_timeMix'),
-      uOpacity:     gl.getUniformLocation(p, 'u_opacity'),
-      uTiltIndex:   gl.getUniformLocation(p, 'u_tiltIndex'),
-      uSmoothRadius: gl.getUniformLocation(p, 'u_smoothRadius'),
-      uDbzMin:      gl.getUniformLocation(p, 'u_dbzMin'),
-      uDbzMax:      gl.getUniformLocation(p, 'u_dbzMax'),
-    };
-
-    this._buildColorRamp(gl);
+    this._initThree(map);
+    map.on('move', () => this._requestRepaint());
+    map.on('resize', () => this._resizeRenderer());
   }
 
-  onRemove(_map, gl) {
+  render(_gl, matrix) {
+    if (!this._renderer || !this._timestamps.length) return;
+    this._currentMatrix = matrix;
+
+    // Sync camera: set projectionMatrix from MapLibre's matrix.
+    // modelViewMatrix is identity because meshes use world-space vertices.
+    this._camera.projectionMatrix.fromArray(new Float32Array(matrix));
+    this._camera.projectionMatrixInverse.copy(this._camera.projectionMatrix).invert();
+
+    this._updateMaterials();
+    this._renderer.resetState();
+    this._renderer.render(this._scene, this._camera);
+  }
+
+  onRemove() {
     this._tileCache.clear();
-    if (this._program) gl.deleteProgram(this._program);
-    if (this._colorRampTex) gl.deleteTexture(this._colorRampTex);
-    for (const [, quad] of this._tileQuads) {
-      gl.deleteBuffer(quad.buffer);
+    this._clearMeshes();
+    if (this._renderer) {
+      this._renderer.dispose();
+      this._renderer.domElement.remove();
     }
-    this._tileQuads.clear();
   }
 
-  render(gl, matrix) {
-    if (!this._program || !this._timestamps.length) return;
+  // ── three.js setup ────────────────────────────────────────────────────
 
-    const tsA = this._timestamps[this._frameA]?.timestamp;
-    const tsB = this._timestamps[this._frameB]?.timestamp;
-    if (!tsA) return;
+  _initThree(map) {
+    const container = map.getCanvasContainer();
 
-    gl.useProgram(this._program);
-    gl.uniformMatrix4fv(this._locations.uMatrix, false, matrix);
-    gl.uniform1f(this._locations.uTimeMix, this._timeMix);
-    gl.uniform1f(this._locations.uOpacity, this._opacity);
-    gl.uniform1f(this._locations.uSmoothRadius, this._smoothRadius);
-    gl.uniform1f(this._locations.uDbzMin, this._dbzMin);
-    gl.uniform1f(this._locations.uDbzMax, this._dbzMax);
+    this._renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      premultipliedAlpha: true,
+      antialias: false,
+      stencil: false,
+      depth: false,
+    });
+    const canvas = this._renderer.domElement;
+    canvas.style.position = 'absolute';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.pointerEvents = 'none';
+    container.appendChild(canvas);
 
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, this._colorRampTex);
-    gl.uniform1i(this._locations.uColorRamp, 2);
+    this._resizeRenderer();
 
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    this._scene = new THREE.Scene();
 
-    if (this._mode === '3d') {
-      gl.enable(gl.DEPTH_TEST);
-      gl.depthFunc(gl.LEQUAL);
-    } else {
-      gl.disable(gl.DEPTH_TEST);
+    // Camera with identity view — projection set per frame from MapLibre
+    this._camera = new THREE.Camera();
+    this._camera.matrixWorldInverse.identity();
+    this._camera.matrixWorldNeedsUpdate = false;
+
+    this._colorRampTex = buildColorRampTexture();
+    this._dummyTex = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
+    this._dummyTex.needsUpdate = true;
+  }
+
+  _resizeRenderer() {
+    if (!this._renderer || !this._map) return;
+    const mc = this._map.getCanvas();
+    this._renderer.setSize(mc.width, mc.height, false);
+    this._renderer.domElement.style.width = mc.style.width;
+    this._renderer.domElement.style.height = mc.style.height;
+  }
+
+  // ── Mesh management ────────────────────────────────────────────────────
+
+  _rebuildMeshes() {
+    if (!this._scene) return;
+
+    for (const [, mesh] of this._tileMeshes) {
+      this._staleMeshes.push(mesh);
     }
-
-    // Stencil: each pixel is drawn by exactly one tile.
-    // With the small epsilon overlap on quad geometry, the stencil
-    // prevents double-blending at tile boundaries.
-    gl.enable(gl.STENCIL_TEST);
-    gl.clearStencil(0);
-    gl.clear(gl.STENCIL_BUFFER_BIT);
-    gl.stencilMask(0xFF);
-    gl.stencilFunc(gl.EQUAL, 0, 0xFF);
-    gl.stencilOp(gl.KEEP, gl.KEEP, gl.INCR);
+    this._tileMeshes.clear();
 
     for (const { z, x, y } of this._visibleTiles) {
-      const texA = this._tileCache.get(tsA, z, x, y);
-      if (!texA) continue;
-      const texB = (tsB && tsB !== tsA) ? this._tileCache.get(tsB, z, x, y) : texA;
-
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, texA);
-      gl.uniform1i(this._locations.uTex0, 0);
-
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, texB || texA);
-      gl.uniform1i(this._locations.uTex1, 1);
-
       if (this._mode === 'composite') {
-        this._drawTileQuad(gl, z, x, y, -1, 0);
+        this._addTileMesh(z, x, y, 0, -1);
       } else {
         for (let band = 0; band < RADAR_NUM_BANDS; band++) {
-          this._drawTileQuad(gl, z, x, y, band, TILT_HEIGHTS_M[band] * this._vertExag);
+          const mz = mercToAlt(TILT_HEIGHTS_M[band] * this._vertExag);
+          this._addTileMesh(z, x, y, mz, band);
         }
       }
     }
 
-    gl.disable(gl.STENCIL_TEST);
-    gl.disable(gl.BLEND);
-    gl.disable(gl.DEPTH_TEST);
+    clearTimeout(this._stalePurgeTimer);
+    this._stalePurgeTimer = setTimeout(() => this._purgeStale(), 3000);
   }
 
-  // ── Internal helpers ────────────────────────────────────────────────────
+  _addTileMesh(z, x, y, mz, tiltIndex) {
+    const geo = buildTileGeometry(z, x, y, mz);
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: RADAR_VERT,
+      fragmentShader: RADAR_FRAG,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneMinusSrcAlphaFactor,
+      uniforms: {
+        u_tex0: { value: this._dummyTex },
+        u_tex1: { value: this._dummyTex },
+        u_colorRamp: { value: this._colorRampTex },
+        u_timeMix: { value: 0 },
+        u_opacity: { value: this._opacity },
+        u_tiltIndex: { value: tiltIndex },
+        u_dbzMin: { value: this._dbzMin },
+        u_dbzMax: { value: this._dbzMax },
+      },
+    });
 
-  _drawTileQuad(gl, z, x, y, tiltIndex, altitudeM) {
-    const key = `${z}/${x}/${y}/${tiltIndex}`;
-    let quad = this._tileQuads.get(key);
-
-    if (!quad) {
-      quad = this._buildQuad(gl, z, x, y, altitudeM);
-      this._tileQuads.set(key, quad);
-    }
-
-    gl.uniform1i(this._locations.uTiltIndex, tiltIndex);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, quad.buffer);
-
-    gl.enableVertexAttribArray(this._locations.aPos);
-    gl.vertexAttribPointer(this._locations.aPos, 3, gl.FLOAT, false, 20, 0);
-
-    gl.enableVertexAttribArray(this._locations.aUv);
-    gl.vertexAttribPointer(this._locations.aUv, 2, gl.FLOAT, false, 20, 12);
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.matrixAutoUpdate = false;
+    mesh.frustumCulled = false;
+    mesh.userData = { z, x, y };
+    this._scene.add(mesh);
+    this._tileMeshes.set(`${z}/${x}/${y}/${tiltIndex}`, mesh);
   }
 
-  _buildQuad(gl, z, x, y, altitudeM) {
-    // Compute in Mercator space with a sub-pixel overlap (~0.5px) to
-    // prevent GPU rasterization gaps at tile boundaries.
-    const n = 2 ** z;
-    const eps = 1 / n / 512;
-    const mx0 = x / n - eps;
-    const mx1 = (x + 1) / n + eps;
-    const my0 = y / n - eps;
-    const my1 = (y + 1) / n + eps;
+  _updateMaterials() {
+    if (!this._timestamps.length) return;
+    const tsA = this._timestamps[this._frameA]?.timestamp;
+    const tsB = this._timestamps[this._frameB]?.timestamp;
+    if (!tsA) return;
 
-    // Altitude: convert meters to Mercator z units using scale at tile center
-    let mz = 0;
-    if (altitudeM > 0) {
-      const centerLat = Math.atan(Math.sinh(Math.PI * (1 - (my0 + my1)))) * 180 / Math.PI;
-      const ref = maplibregl.MercatorCoordinate.fromLngLat([0, centerLat], altitudeM);
-      mz = ref.z;
+    let anyTextured = false;
+    for (const [, mesh] of this._tileMeshes) {
+      const { z, x, y } = mesh.userData;
+      const texA = this._tileCache.get(tsA, z, x, y);
+      const u = mesh.material.uniforms;
+
+      if (texA) {
+        anyTextured = true;
+        const texB = (tsB && tsB !== tsA) ? this._tileCache.get(tsB, z, x, y) : null;
+        u.u_tex0.value = texA;
+        u.u_tex1.value = texB || texA;
+        u.u_timeMix.value = texB ? this._timeMix : 0;
+        mesh.visible = true;
+      } else if (u.u_tex0.value === this._dummyTex) {
+        mesh.visible = false;
+      }
+
+      u.u_opacity.value = this._opacity;
+      u.u_dbzMin.value = this._dbzMin;
+      u.u_dbzMax.value = this._dbzMax;
     }
 
-    // Triangle strip: NW, SW, NE, SE
-    // Each vertex: x, y, z, u, v (5 floats, stride=20 bytes)
-    const data = new Float32Array([
-      mx0, my0, mz, 0, 0,
-      mx0, my1, mz, 0, 1,
-      mx1, my0, mz, 1, 0,
-      mx1, my1, mz, 1, 1,
-    ]);
-
-    const buffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-
-    return { buffer, vertCount: 4 };
+    if (anyTextured && this._staleMeshes.length > 0) {
+      this._purgeStale();
+    }
   }
 
-  _rebuildQuads() {
-    if (!this._gl) return;
-    const gl = this._gl;
-    for (const [, quad] of this._tileQuads) {
-      gl.deleteBuffer(quad.buffer);
+  _purgeStale() {
+    for (const mesh of this._staleMeshes) {
+      mesh.geometry.dispose();
+      mesh.material.dispose();
+      this._scene?.remove(mesh);
     }
-    this._tileQuads.clear();
+    this._staleMeshes.length = 0;
+    clearTimeout(this._stalePurgeTimer);
   }
 
-  _buildColorRamp(gl) {
-    const data = createColorRampData();
-    this._colorRampTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this._colorRampTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  _clearMeshes() {
+    this._purgeStale();
+    for (const [, mesh] of this._tileMeshes) {
+      mesh.geometry.dispose();
+      mesh.material.dispose();
+      this._scene?.remove(mesh);
+    }
+    this._tileMeshes.clear();
   }
 
-  _createProgram(gl, vsrc, fsrc) {
-    const vs = gl.createShader(gl.VERTEX_SHADER);
-    gl.shaderSource(vs, vsrc);
-    gl.compileShader(vs);
-    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
-      console.error('Vertex shader error:', gl.getShaderInfoLog(vs));
-    }
-
-    const fs = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(fs, fsrc);
-    gl.compileShader(fs);
-    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
-      console.error('Fragment shader error:', gl.getShaderInfoLog(fs));
-    }
-
-    const program = gl.createProgram();
-    gl.attachShader(program, vs);
-    gl.attachShader(program, fs);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      console.error('Program link error:', gl.getProgramInfoLog(program));
-    }
-
-    gl.deleteShader(vs);
-    gl.deleteShader(fs);
-    return program;
+  _requestRepaint() {
+    if (this._map) this._map.triggerRepaint();
   }
 }

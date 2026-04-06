@@ -225,7 +225,7 @@ function updateFrameDisplay() {
 
 // ── View mode toggle ──────────────────────────────────────────────────────────
 
-function setViewMode(mode) {
+function setViewMode(mode, { animateCamera = true } = {}) {
   if (mode === viewMode) return;
   viewMode = mode;
 
@@ -239,10 +239,10 @@ function setViewMode(mode) {
   const rowExag = document.getElementById('row-exaggeration');
 
   if (mode === 'composite') {
-    map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+    if (animateCamera) map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
     rowExag.style.display = 'none';
   } else {
-    map.easeTo({ pitch: 50, duration: 600 });
+    if (animateCamera) map.easeTo({ pitch: 50, duration: 600 });
     rowExag.style.display = '';
   }
 
@@ -263,37 +263,84 @@ function onViewportChange() {
   }, VIEWPORT_DEBOUNCE_MS);
 }
 
+// ── URL hash ↔ map view sync ─────────────────────────────────────────────────
+
+function parseHash() {
+  const h = window.location.hash.replace('#', '');
+  if (!h) return null;
+  const parts = h.split('/').map(Number);
+  if (parts.length >= 3 && parts.every(n => !isNaN(n))) {
+    const [zoom, lat, lng, bearing, pitch] = parts;
+    return { center: [lng, lat], zoom, bearing: bearing || 0, pitch: pitch || 0 };
+  }
+  return null;
+}
+
+function updateHash(map) {
+  const c = map.getCenter();
+  const z = map.getZoom().toFixed(2);
+  const lat = c.lat.toFixed(4);
+  const lng = c.lng.toFixed(4);
+  const b = map.getBearing().toFixed(1);
+  const p = map.getPitch().toFixed(1);
+  history.replaceState(null, '', `#${z}/${lat}/${lng}/${b}/${p}`);
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
   const styleUrl = await resolveMapStyle();
 
+  const saved = parseHash();
+  if (saved && saved.pitch > 0) viewMode = '3d';
+
   const map = new maplibregl.Map({
     container: 'map',
     style: styleUrl,
-    center: [-98.5, 39.8],
-    zoom: 4,
-    pitch: 0,
-    bearing: 0,
+    center: saved?.center || [-98.5, 39.8],
+    zoom: saved?.zoom ?? 4,
+    pitch: saved?.pitch ?? 0,
+    bearing: saved?.bearing ?? 0,
     attributionControl: true,
   });
   mapRef = map;
+
+  // Sync button active states with restored view mode
+  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === viewMode);
+  });
+  if (viewMode === '3d') {
+    document.getElementById('row-exaggeration').style.display = '';
+  }
+
+  map.on('moveend', () => updateHash(map));
+  map.on('zoomend', () => updateHash(map));
+  map.on('pitchend', () => {
+    updateHash(map);
+    if (map.getPitch() > 0 && viewMode === 'composite') {
+      setViewMode('3d', { animateCamera: false });
+    }
+  });
+  map.on('rotateend', () => updateHash(map));
+  updateHash(map);
 
   map.addControl(new maplibregl.NavigationControl(), 'top-left');
   map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
   map.on('load', async () => {
-    map.addSource('terrain', {
-      type: 'raster-dem',
-      tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-      encoding: 'terrarium',
-      tileSize: 256,
-      maxzoom: 15,
-    });
-    map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
+    // TODO: re-enable terrain once tile seam issue is resolved
+    // map.addSource('terrain', {
+    //   type: 'raster-dem',
+    //   tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+    //   encoding: 'terrarium',
+    //   tileSize: 256,
+    //   maxzoom: 15,
+    // });
+    // map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
 
     radarLayer = new RadarLayer();
     map.addLayer(radarLayer);
+    if (viewMode !== 'composite') radarLayer.setMode(viewMode);
 
     const ok = await fetchTimestamps();
     if (ok && timestamps.length > 0) {
@@ -340,6 +387,7 @@ async function init() {
     if (playing) pause();
     currentAnimationTime = parseInt(scrubber.value, 10);
     updateFrameDisplay();
+    showFrame();
     loadAndShowFrame();
   });
 

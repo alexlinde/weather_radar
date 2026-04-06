@@ -36,43 +36,6 @@ def tile_bounds(z: int, x: int, y: int) -> dict[str, float]:
     return {"north": lat_max, "south": lat_min, "west": lon_min, "east": lon_max}
 
 
-def _grid_overlap(
-    tb: dict[str, float], meta: dict[str, Any]
-) -> tuple[int, int, int, int] | None:
-    """Compute grid row/col slice indices for the overlap between tile and grid bounds.
-
-    Returns (row_start, row_end, col_start, col_end) or None if no overlap.
-    """
-    grid_n = meta["north"]
-    grid_s = meta["south"]
-    grid_w = meta["west"]
-    grid_e = meta["east"]
-    Dj = meta["Dj"]
-    Di = meta["Di"]
-
-    overlap_n = min(tb["north"], grid_n)
-    overlap_s = max(tb["south"], grid_s)
-    overlap_w = max(tb["west"], grid_w)
-    overlap_e = min(tb["east"], grid_e)
-
-    if overlap_n <= overlap_s or overlap_e <= overlap_w:
-        return None
-
-    Nj = int(meta["Nj"])
-    Ni = int(meta["Ni"])
-    row_start = max(0, math.floor((grid_n - overlap_n) / Dj))
-    row_end = min(Nj, math.ceil((grid_n - overlap_s) / Dj))
-    col_start = max(0, math.floor((overlap_w - grid_w) / Di))
-    col_end = min(Ni, math.ceil((overlap_e - grid_w) / Di))
-
-    if row_start >= row_end or col_start >= col_end:
-        return None
-
-    return row_start, row_end, col_start, col_end
-
-
-# ── Voxel tile renderer ──────────────────────────────────────────────────────
-
 
 # ── Tile cache ────────────────────────────────────────────────────────────────
 
@@ -135,17 +98,6 @@ def _dbz_to_uint8(grid: np.ndarray) -> np.ndarray:
     return encoded.astype(np.uint8)
 
 
-def _resample_to_band(
-    dense: np.ndarray, target_h: int = ATLAS_BAND_SIZE, target_w: int = ATLAS_BAND_SIZE,
-) -> np.ndarray:
-    """Nearest-neighbor resample a 2D array to target_h × target_w."""
-    h, w = dense.shape
-    if h == target_h and w == target_w:
-        return dense
-    row_idx = np.linspace(0, h - 1, target_h).astype(int)
-    col_idx = np.linspace(0, w - 1, target_w).astype(int)
-    return dense[np.ix_(row_idx, col_idx)]
-
 
 def render_atlas_tile(
     sparse_grids: dict[str, sp.csr_matrix],
@@ -157,50 +109,63 @@ def render_atlas_tile(
     """Render an atlas tile: 256×2048 grayscale PNG with 8 tilt bands.
 
     Each 256×256 band holds dBZ data for one tilt level, encoded as uint8.
-    Data is placed at the correct geographic position within each band —
-    partial-coverage tiles (e.g. at CONUS edges) get zeros in uncovered areas.
+    Uses Mercator-correct per-pixel sampling: each pixel row's latitude is
+    computed from its Mercator Y position, ensuring adjacent tiles produce
+    identical values at their shared boundary.
     Returns PNG bytes.
     """
     tb = tile_bounds(z, x, y)
-    overlap = _grid_overlap(tb, metadata)
-    if overlap is None:
-        return _get_empty_atlas()
-
-    row_start, row_end, col_start, col_end = overlap
 
     grid_n = metadata["north"]
+    grid_s = metadata["south"]
     grid_w = metadata["west"]
-    Di = metadata["Di"]
-    Dj = metadata["Dj"]
+    grid_e = metadata["east"]
 
-    # Geographic bounds of the overlap region within the MRMS grid
-    data_n = grid_n - row_start * Dj
-    data_s = grid_n - row_end * Dj
-    data_w = grid_w + col_start * Di
-    data_e = grid_w + col_end * Di
-
-    tile_w = tb["west"]
-    tile_e = tb["east"]
-    tile_n = tb["north"]
-    tile_s = tb["south"]
-    tile_lon_span = tile_e - tile_w
-    tile_lat_span = tile_n - tile_s
-
-    # Pixel coordinates within the 256×256 band where data should be placed
-    px_left = int(round((data_w - tile_w) / tile_lon_span * ATLAS_BAND_SIZE))
-    px_right = int(round((data_e - tile_w) / tile_lon_span * ATLAS_BAND_SIZE))
-    px_top = int(round((tile_n - data_n) / tile_lat_span * ATLAS_BAND_SIZE))
-    px_bottom = int(round((tile_n - data_s) / tile_lat_span * ATLAS_BAND_SIZE))
-
-    px_left = max(0, min(ATLAS_BAND_SIZE, px_left))
-    px_right = max(0, min(ATLAS_BAND_SIZE, px_right))
-    px_top = max(0, min(ATLAS_BAND_SIZE, px_top))
-    px_bottom = max(0, min(ATLAS_BAND_SIZE, px_bottom))
-
-    dest_w = px_right - px_left
-    dest_h = px_bottom - px_top
-    if dest_w <= 0 or dest_h <= 0:
+    if tb["south"] >= grid_n or tb["north"] <= grid_s:
         return _get_empty_atlas()
+    if tb["east"] <= grid_w or tb["west"] >= grid_e:
+        return _get_empty_atlas()
+
+    Dj = metadata["Dj"]
+    Di = metadata["Di"]
+    Nj = int(metadata["Nj"])
+    Ni = int(metadata["Ni"])
+    n_pow = 2.0 ** z
+
+    # Pixel positions spanning [0, 1] inclusive — ensures boundary pixels
+    # from adjacent tiles sample the exact same lat/lon, preventing seams.
+    t = np.linspace(0.0, 1.0, ATLAS_BAND_SIZE)
+
+    # Longitude per pixel column (linear in Mercator X = linear in lon)
+    lons = tb["west"] + t * (tb["east"] - tb["west"])
+
+    # Latitude per pixel row (via Mercator Y → latitude)
+    merc_y0 = y / n_pow
+    merc_y1 = (y + 1) / n_pow
+    merc_ys = merc_y0 + t * (merc_y1 - merc_y0)
+    lats = np.degrees(np.arctan(np.sinh(np.pi * (1.0 - 2.0 * merc_ys))))
+
+    # Nearest-neighbour grid indices
+    col_idx = np.round((lons - grid_w) / Di).astype(int)
+    row_idx = np.round((grid_n - lats) / Dj).astype(int)
+
+    col_ok = (col_idx >= 0) & (col_idx < Ni)
+    row_ok = (row_idx >= 0) & (row_idx < Nj)
+
+    if not np.any(row_ok) or not np.any(col_ok):
+        return _get_empty_atlas()
+
+    col_safe = np.clip(col_idx, 0, Ni - 1)
+    row_safe = np.clip(row_idx, 0, Nj - 1)
+
+    r_min = int(row_safe[row_ok].min())
+    r_max = int(row_safe[row_ok].max()) + 1
+    c_min = int(col_safe[col_ok].min())
+    c_max = int(col_safe[col_ok].max()) + 1
+
+    local_row = np.clip(row_safe - r_min, 0, r_max - r_min - 1)
+    local_col = np.clip(col_safe - c_min, 0, c_max - c_min - 1)
+    invalid_mask = ~(row_ok[:, np.newaxis] & col_ok[np.newaxis, :])
 
     atlas = np.zeros((ATLAS_BAND_SIZE * ATLAS_NUM_BANDS, ATLAS_BAND_SIZE), dtype=np.uint8)
 
@@ -209,14 +174,15 @@ def render_atlas_tile(
         if sgrid is None:
             continue
 
-        sub = sgrid[row_start:row_end, col_start:col_end].toarray().astype(np.float32)
+        sub = sgrid[r_min:r_max, c_min:c_max].toarray().astype(np.float32)
         sub[sub == 0] = np.nan
 
-        encoded = _dbz_to_uint8(sub)
-        resampled = _resample_to_band(encoded, dest_h, dest_w)
+        band = sub[local_row][:, local_col]
+        band[invalid_mask] = np.nan
 
+        encoded = _dbz_to_uint8(band)
         y_off = band_idx * ATLAS_BAND_SIZE
-        atlas[y_off + px_top : y_off + px_bottom, px_left : px_right] = resampled
+        atlas[y_off : y_off + ATLAS_BAND_SIZE] = encoded
 
     if not atlas.any():
         return _get_empty_atlas()

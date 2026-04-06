@@ -146,24 +146,86 @@ def _conus_tile_coords(z: int = 4) -> list[tuple[int, int, int]]:
     return [(z, x, y) for x in range(x_min, x_max + 1) for y in range(y_min, y_max + 1)]
 
 
+def _rebuild_from_raw(limit: int = 20) -> int:
+    """Rebuild tilt grids from raw GRIB2 files when tilt_grids/ is missing.
+
+    Scans data/raw/ for available timestamps, decodes, and stores as
+    sparse grids — no S3 access required.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    raw_dir = disk_cache.RAW_DIR
+    if not raw_dir.exists():
+        return 0
+
+    ref_tilt_dir = raw_dir / "00.50"
+    if not ref_tilt_dir.exists():
+        return 0
+
+    raw_files = sorted(ref_tilt_dir.glob("MRMS_*.grib2.gz"))
+    if not raw_files:
+        return 0
+
+    raw_files = raw_files[-limit:]
+    logger.info("Rebuilding %d frames from raw GRIB2 files…", len(raw_files))
+
+    rebuilt = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for raw_path in raw_files:
+            m = _TS_RE.search(raw_path.name)
+            if not m:
+                continue
+            d, t = m.group(1), m.group(2)
+            timestamp = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6]}Z"
+
+            if disk_cache.has_tilt_grids(timestamp):
+                result = disk_cache.get_tilt_grids(timestamp)
+                if result:
+                    grids, meta = result
+                    tilt_cache.put(timestamp, grids, meta)
+                    rebuilt += 1
+                    continue
+
+            ref_key = f"CONUS/MergedReflectivityQC_00.50/{d}/{raw_path.name}"
+            result = _build_frame(ref_key, pool=pool)
+            if result is None:
+                continue
+            ts, sparse_grids, meta = result
+            tilt_cache.put(ts, sparse_grids, meta)
+            rebuilt += 1
+            logger.info("  Rebuilt %s: %d tilts", ts, len(sparse_grids))
+
+    return rebuilt
+
+
 def warm_from_disk(limit: int = 20) -> int:
     """Load the most recent frames from disk into the in-memory cache.
 
     Skips all S3 fetching — useful for dev mode when you already have
     cached data and don't want to wait for a full re-seed.
-    Pre-renders atlas tiles and legacy voxel tiles for CONUS z=4.
+    Pre-renders atlas tiles for CONUS z=4.
+
+    Falls back to rebuilding from raw GRIB2 files if tilt_grids/ is
+    empty (e.g. after a cache wipe).
     """
     from .tiles import atlas_tile_cache, render_atlas_tile
 
     entries = disk_cache.list_tilt_grid_timestamps()
     if not entries:
-        logger.warning("No frames on disk — nothing to warm")
-        return 0
+        logger.info("No tilt grids on disk — attempting rebuild from raw files")
+        rebuilt = _rebuild_from_raw(limit=limit)
+        if rebuilt == 0:
+            logger.warning("No raw files found either — nothing to warm")
+            return 0
+        entries = disk_cache.list_tilt_grid_timestamps()
 
     recent = entries[-limit:]
     loaded = 0
     for entry in recent:
         ts = entry["timestamp"]
+        if tilt_cache.get(ts) is not None:
+            loaded += 1
+            continue
         result = disk_cache.get_tilt_grids(ts)
         if result is None:
             continue

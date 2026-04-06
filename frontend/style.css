@@ -67,6 +67,7 @@ html, body {
 
 input[type="range"] {
   -webkit-appearance: none;
+  appearance: none;
   width: 100%;
   height: 4px;
   background: rgba(255,255,255,0.15);
@@ -109,11 +110,26 @@ input[type="range"]::-moz-range-track {
   height: 24px;
 }
 
+.dual-range::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 4px;
+  transform: translateY(-50%);
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
 .dual-range input[type="range"] {
   position: absolute;
   left: 0;
   top: 0;
   width: 100%;
+  height: 100%;
+  margin: 0;
   pointer-events: none;
   background: transparent;
 }
@@ -124,6 +140,11 @@ input[type="range"]::-moz-range-track {
 
 .dual-range input[type="range"]::-moz-range-thumb {
   pointer-events: auto;
+}
+
+.dual-range input[type="range"]::-moz-range-track {
+  background: transparent;
+  border: none;
 }
 
 /* ── Status Row ─────────────────────────────────────────────────────────── */
@@ -257,7 +278,7 @@ input[type="range"]::-moz-range-track {
   border: 1px solid rgba(255,255,255,0.15);
 }
 
-.seg-btn {
+#controls .seg-btn {
   flex: 1;
   padding: 5px 10px;
   font-size: 11px;
@@ -270,16 +291,16 @@ input[type="range"]::-moz-range-track {
   border-radius: 0;
 }
 
-.seg-btn:not(:last-child) {
+#controls .seg-btn:not(:last-child) {
   border-right: 1px solid rgba(255,255,255,0.1);
 }
 
-.seg-btn:hover:not(.active) {
+#controls .seg-btn:hover:not(.active) {
   background: rgba(255,255,255,0.08);
   color: #c9d1d9;
 }
 
-.seg-btn.active {
+#controls .seg-btn.active {
   background: rgba(88,166,255,0.2);
   color: #58a6ff;
 }

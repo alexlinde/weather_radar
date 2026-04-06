@@ -15,6 +15,7 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+demo 
 
 # Test fixtures (real GRIB2 files — large, no need to commit)
 tests/fixtures/*.grib2
