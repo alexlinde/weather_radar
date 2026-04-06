@@ -24,8 +24,11 @@ NWS_DBZ_COLORS: list[tuple[float, float, int, int, int]] = [
 ]
 
 
-def grid_to_png(grid: np.ndarray) -> bytes:
-    """Convert a 2D dBZ array to a PNG with NWS color scale. Transparent below 5 dBZ."""
+def colorize_grid(grid: np.ndarray) -> np.ndarray:
+    """Convert a 2D dBZ array to an RGBA uint8 array using the NWS color scale.
+
+    Transparent (alpha 0) below 5 dBZ; alpha 220 for active bands.
+    """
     rows, cols = grid.shape
     rgba = np.zeros((rows, cols, 4), dtype=np.uint8)
 
@@ -34,7 +37,12 @@ def grid_to_png(grid: np.ndarray) -> bytes:
         rgba[mask] = [r, g, b, 220]
 
     rgba[(~np.isnan(grid)) & (grid >= 75)] = [200, 200, 255, 220]
+    return rgba
 
+
+def grid_to_png(grid: np.ndarray) -> bytes:
+    """Convert a 2D dBZ array to a PNG with NWS color scale. Transparent below 5 dBZ."""
+    rgba = colorize_grid(grid)
     img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)

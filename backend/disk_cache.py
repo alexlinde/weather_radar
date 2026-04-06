@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RAW_DIR = _DATA_DIR / "raw"
 DECODED_DIR = _DATA_DIR / "decoded"
+COMPOSITES_DIR = _DATA_DIR / "composites"
 
 _LEGACY_RAW_DIR = _DATA_DIR / "grib2_cache"
 _LEGACY_DECODED_DIR = _DATA_DIR / "decoded_cache"
@@ -109,6 +110,86 @@ def put_decoded(s3_key: str, grid: np.ndarray, metadata: dict[str, Any]) -> None
         json.dump(serialisable, f)
 
 
+# ── CONUS composite cache ────────────────────────────────────────────────
+
+
+def _ts_to_stem(timestamp: str) -> str:
+    """Convert an ISO timestamp to a filesystem-safe stem: ``YYYYMMDD-HHMMSS``."""
+    return (
+        timestamp
+        .replace(":", "")
+        .replace("-", "")
+        .replace("T", "-")
+        .replace(" ", "-")
+        .split("+")[0]
+        .rstrip("Z")
+    )
+
+
+def put_composite(timestamp: str, grid: np.ndarray, metadata: dict[str, Any]) -> None:
+    """Save a full-CONUS composite grid to disk (compressed numpy + JSON metadata)."""
+    stem = _ts_to_stem(timestamp)
+    COMPOSITES_DIR.mkdir(parents=True, exist_ok=True)
+
+    npz_path = COMPOSITES_DIR / f"{stem}.npz"
+    np.savez_compressed(npz_path, grid=grid.astype(np.float32))
+
+    json_path = COMPOSITES_DIR / f"{stem}.json"
+    serialisable: dict[str, Any] = {}
+    for k, v in metadata.items():
+        if isinstance(v, (np.integer, np.floating)):
+            serialisable[k] = v.item()
+        elif isinstance(v, np.bool_):
+            serialisable[k] = bool(v)
+        else:
+            serialisable[k] = v
+    serialisable["timestamp"] = timestamp
+    with open(json_path, "w") as f:
+        json.dump(serialisable, f)
+
+
+def get_composite(timestamp: str) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Load a CONUS composite grid from disk. Returns ``(grid, metadata)`` or None."""
+    stem = _ts_to_stem(timestamp)
+    npz_path = COMPOSITES_DIR / f"{stem}.npz"
+    json_path = COMPOSITES_DIR / f"{stem}.json"
+
+    if not npz_path.exists() or not json_path.exists():
+        return None
+
+    data = np.load(npz_path)
+    grid = data["grid"]
+    with open(json_path) as f:
+        meta = json.load(f)
+    return grid, meta
+
+
+def has_composite(timestamp: str) -> bool:
+    """Check whether a CONUS composite exists on disk for *timestamp*."""
+    stem = _ts_to_stem(timestamp)
+    return (COMPOSITES_DIR / f"{stem}.npz").exists()
+
+
+def list_composites() -> list[dict[str, Any]]:
+    """Return metadata dicts for all composites on disk, oldest-first."""
+    if not COMPOSITES_DIR.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for json_path in sorted(COMPOSITES_DIR.glob("*.json")):
+        with open(json_path) as f:
+            meta = json.load(f)
+        entries.append({
+            "timestamp": meta.get("timestamp"),
+            "bounds": {
+                "north": meta.get("north"),
+                "south": meta.get("south"),
+                "east": meta.get("east"),
+                "west": meta.get("west"),
+            },
+        })
+    return entries
+
+
 # ── Eviction ──────────────────────────────────────────────────────────────────
 
 
@@ -116,7 +197,7 @@ def evict_older_than(hours: float = 24.0) -> int:
     """Remove cached files older than `hours`. Walks tilt subdirectories."""
     cutoff = time.time() - hours * 3600
     removed = 0
-    for top in (RAW_DIR, DECODED_DIR):
+    for top in (RAW_DIR, DECODED_DIR, COMPOSITES_DIR):
         if not top.exists():
             continue
         for path in top.rglob("*"):

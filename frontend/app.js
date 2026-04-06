@@ -1,8 +1,9 @@
 /**
- * NYC Weather Radar — Main application with frame animation + 3D volume.
+ * NYC Weather Radar — Main application with tile-based radar rendering.
  *
- * All radar rendering uses deck.gl on top of a MapLibre base map:
- *   - Composite mode: BitmapLayer (2D reflectivity PNG)
+ * Radar data is served as standard TMS tiles (z/x/y PNG) from the backend.
+ * Rendering uses deck.gl TileLayer on top of a MapLibre base map:
+ *   - Composite mode: TileLayer → BitmapLayer per tile (2D reflectivity)
  *   - 3D Layers mode: PointCloudLayer (volumetric voxels)
  */
 
@@ -11,7 +12,9 @@ const API_BASE = window.location.port === '8000'
   : `${window.location.protocol}//${window.location.hostname}:8000`;
 const FRAME_COUNT = 60;
 const REFRESH_INTERVAL_MS = 120_000;
-const MAX_503_RETRIES = 24; // ~2 minutes at 5s intervals
+const MAX_503_RETRIES = 24;
+const TILE_MIN_ZOOM = 3;
+const TILE_MAX_ZOOM = 8;
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -33,16 +36,16 @@ async function resolveMapStyle() {
 
 // ── Animation state ───────────────────────────────────────────────────────────
 
-let frames = [];           // { timestamp, imageUrl, bounds }
+let timestamps = [];       // { timestamp, bounds }
 let currentIndex = 0;
 let playing = false;
-let frameInterval = 500;   // ms between frames (1x speed)
+let frameInterval = 500;
 let lastFrameTime = 0;
 let animationId = null;
 let mapRef = null;
 let userOpacity = 0.8;
 let fetchAbort = null;
-let frameFetchRetries = 0;
+let timestampFetchRetries = 0;
 let volumeFetchRetries = 0;
 let refreshIntervalId = null;
 
@@ -73,132 +76,87 @@ function formatTimestampFull(iso) {
   });
 }
 
-// ── Frame loading ─────────────────────────────────────────────────────────────
+// ── Timestamp loading ─────────────────────────────────────────────────────────
 
-function preloadImage(dataUri) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = dataUri;
-  });
-}
-
-async function fetchFrames() {
+async function fetchTimestamps() {
   if (fetchAbort) fetchAbort.abort();
   fetchAbort = new AbortController();
 
-  setStatus('loading', 'Loading frames…');
+  setStatus('loading', 'Loading timestamps…');
   try {
     const resp = await fetch(
-      `${API_BASE}/api/radar/frames?count=${FRAME_COUNT}`,
+      `${API_BASE}/api/radar/timestamps`,
       { cache: 'no-store', signal: fetchAbort.signal },
     );
     if (resp.status === 503) {
-      frameFetchRetries++;
-      if (frameFetchRetries < MAX_503_RETRIES) {
+      timestampFetchRetries++;
+      if (timestampFetchRetries < MAX_503_RETRIES) {
         setStatus('loading', 'Server seeding cache…');
-        setTimeout(fetchFrames, 5_000);
+        setTimeout(fetchTimestamps, 5_000);
       } else {
         setStatus('error', 'Server unavailable — try refreshing');
       }
       return false;
     }
-    frameFetchRetries = 0;
+    timestampFetchRetries = 0;
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
 
-    const loaded = await Promise.all(
-      data.frames.map(async (f) => {
-        await preloadImage(f.image);
-        return {
-          timestamp: f.timestamp,
-          imageUrl: f.image,
-          bounds: f.bounds,
-        };
-      })
-    );
-
-    frames = loaded;
-    currentIndex = frames.length - 1;
+    timestamps = data.timestamps;
+    currentIndex = timestamps.length - 1;
 
     updateScrubber();
     updateFrameDisplay();
     showFrame(currentIndex);
 
-    const newest = frames[frames.length - 1];
+    const newest = timestamps[timestamps.length - 1];
     setStatus('', `Latest: ${formatTimestampFull(newest?.timestamp)} ET`);
 
     return true;
   } catch (err) {
     if (err.name === 'AbortError') return false;
-    console.error('Frame fetch error:', err);
+    console.error('Timestamp fetch error:', err);
     setStatus('error', `Error: ${err.message}`);
     return false;
   }
 }
 
-// ── Radar layer rendering (deck.gl for both composite + 3D) ──────────────────
+// ── Radar tile layer (deck.gl TileLayer) ──────────────────────────────────────
 
-function buildBitmapLayer(frame) {
-  const b = frame.bounds;
-  return new deck.BitmapLayer({
-    id: 'radar-composite',
-    image: frame.imageUrl,
-    bounds: [b.west, b.south, b.east, b.north],
+function buildTileLayer(timestamp) {
+  const tileUrl = `${API_BASE}/api/radar/tiles/${encodeURIComponent(timestamp)}/{z}/{x}/{y}.png`;
+  return new deck.TileLayer({
+    id: 'radar-tiles',
+    data: tileUrl,
+    minZoom: TILE_MIN_ZOOM,
+    maxZoom: TILE_MAX_ZOOM,
+    tileSize: 256,
     opacity: userOpacity,
-    pickable: false,
-    textureParameters: {
-      minFilter: 'linear',
-      magFilter: 'linear',
+    loadOptions: { fetch: { cache: 'force-cache' } },
+    renderSubLayers: props => {
+      const { west, south, east, north } = props.tile.bbox;
+      return new deck.BitmapLayer(props, {
+        data: null,
+        image: props.data,
+        bounds: [west, south, east, north],
+        textureParameters: {
+          minFilter: 'linear',
+          magFilter: 'linear',
+        },
+      });
     },
   });
 }
 
 function showFrame(index) {
-  if (!mapRef || !deckOverlay || frames.length === 0) return;
-  const frame = frames[index];
-  if (!frame) return;
+  if (!mapRef || !deckOverlay || timestamps.length === 0) return;
+  const ts = timestamps[index];
+  if (!ts) return;
 
   if (viewMode === 'composite') {
-    deckOverlay.setProps({ layers: [buildBitmapLayer(frame)] });
+    deckOverlay.setProps({ layers: [buildTileLayer(ts.timestamp)] });
   } else {
     showVolumeFrame(index);
-  }
-
-  updateBbox(mapRef, frame.bounds);
-}
-
-function updateBbox(map, bounds) {
-  const bboxGeoJSON = {
-    type: 'Feature',
-    geometry: {
-      type: 'Polygon',
-      coordinates: [[
-        [bounds.west, bounds.south],
-        [bounds.east, bounds.south],
-        [bounds.east, bounds.north],
-        [bounds.west, bounds.north],
-        [bounds.west, bounds.south],
-      ]],
-    },
-  };
-
-  if (map.getSource('radar-bbox')) {
-    map.getSource('radar-bbox').setData(bboxGeoJSON);
-  } else {
-    map.addSource('radar-bbox', { type: 'geojson', data: bboxGeoJSON });
-    map.addLayer({
-      id: 'radar-bbox-line',
-      type: 'line',
-      source: 'radar-bbox',
-      paint: {
-        'line-color': '#58a6ff',
-        'line-width': 1.5,
-        'line-dasharray': [4, 3],
-        'line-opacity': 0.7,
-      },
-    });
   }
 }
 
@@ -209,7 +167,7 @@ function animationTick(now) {
 
   if (now - lastFrameTime >= frameInterval) {
     lastFrameTime = now;
-    currentIndex = (currentIndex + 1) % frames.length;
+    currentIndex = (currentIndex + 1) % timestamps.length;
     showFrame(currentIndex);
     updateFrameDisplay();
   }
@@ -218,7 +176,7 @@ function animationTick(now) {
 }
 
 function play() {
-  if (frames.length < 2) return;
+  if (timestamps.length < 2) return;
   playing = true;
   lastFrameTime = performance.now();
   document.getElementById('icon-play').style.display = 'none';
@@ -244,7 +202,7 @@ function togglePlay() {
 
 function updateScrubber() {
   const scrubber = document.getElementById('frame-scrubber');
-  scrubber.max = Math.max(0, frames.length - 1);
+  scrubber.max = Math.max(0, timestamps.length - 1);
   scrubber.value = currentIndex;
 }
 
@@ -254,10 +212,10 @@ function updateFrameDisplay() {
 
   const timeEl = document.getElementById('frame-time');
   const counterEl = document.getElementById('frame-counter');
-  const frame = frames[currentIndex];
+  const ts = timestamps[currentIndex];
 
-  timeEl.textContent = frame ? formatTimestamp(frame.timestamp) : '--:--';
-  counterEl.textContent = frames.length > 0 ? `${currentIndex + 1}/${frames.length}` : '0/0';
+  timeEl.textContent = ts ? formatTimestamp(ts.timestamp) : '--:--';
+  counterEl.textContent = timestamps.length > 0 ? `${currentIndex + 1}/${timestamps.length}` : '0/0';
 }
 
 // ── 3D Volume (deck.gl) ───────────────────────────────────────────────────────
@@ -265,7 +223,7 @@ function updateFrameDisplay() {
 let deckOverlay = null;
 let viewMode = 'composite'; // 'composite' | '3d'
 let verticalExaggeration = 3.0;
-let volumeFrames = [];   // [{timestamp, voxels}] — parallel to frames[]
+let volumeFrames = [];
 const POINT_SIZE_PX = 3;
 
 function dbzToRgba(dbz) {
@@ -282,7 +240,6 @@ function buildPointCloudLayer(voxels, exaggeration) {
   return new deck.PointCloudLayer({
     id: 'radar-volume',
     data: voxels,
-    // d = [lon, lat, altitude_m, dbz]
     getPosition: d => [d[0], d[1], d[2] * exaggeration],
     getColor: d => dbzToRgba(d[3]),
     pointSize: POINT_SIZE_PX,
@@ -380,7 +337,6 @@ async function init() {
   });
   mapRef = map;
 
-  // Initialise deck.gl overlay (empty layer list until volume is enabled)
   deckOverlay = new deck.MapboxOverlay({ layers: [] });
   map.addControl(deckOverlay);
 
@@ -388,7 +344,6 @@ async function init() {
   map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
   map.on('load', async () => {
-    // 3D terrain
     map.addSource('terrain', {
       type: 'raster-dem',
       tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
@@ -398,16 +353,16 @@ async function init() {
     });
     map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
 
-    const ok = await fetchFrames();
-    if (ok && frames.length >= 2) {
+    const ok = await fetchTimestamps();
+    if (ok && timestamps.length >= 2) {
       play();
     }
 
     refreshIntervalId = setInterval(async () => {
       const wasPlaying = playing;
       if (wasPlaying) pause();
-      await fetchFrames();
-      if (wasPlaying && frames.length >= 2) play();
+      await fetchTimestamps();
+      if (wasPlaying && timestamps.length >= 2) play();
       if (viewMode === '3d') await fetchVolumeFrames();
     }, REFRESH_INTERVAL_MS);
   });
@@ -463,8 +418,8 @@ async function init() {
   document.getElementById('btn-refresh').addEventListener('click', async () => {
     const wasPlaying = playing;
     if (wasPlaying) pause();
-    await fetchFrames();
-    if (wasPlaying && frames.length >= 2) play();
+    await fetchTimestamps();
+    if (wasPlaying && timestamps.length >= 2) play();
     if (viewMode === '3d') await fetchVolumeFrames();
   });
 

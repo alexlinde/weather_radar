@@ -79,7 +79,45 @@ class BoundedCache(Generic[V]):
             self._data.clear()
 
 
+class ConusCompositeCache:
+    """LRU cache for loaded CONUS composite grids (backed by disk via disk_cache).
+
+    Holds a small number of full-CONUS numpy arrays in memory. On miss,
+    falls back to ``disk_cache.get_composite()`` and promotes the result.
+    """
+
+    def __init__(self, max_size: int = 5) -> None:
+        self._max = max_size
+        self._data: OrderedDict[str, tuple[np.ndarray, dict]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, timestamp: str) -> tuple[np.ndarray, dict] | None:
+        with self._lock:
+            if timestamp in self._data:
+                self._data.move_to_end(timestamp)
+                return self._data[timestamp]
+
+        from . import disk_cache
+        result = disk_cache.get_composite(timestamp)
+        if result is None:
+            return None
+
+        with self._lock:
+            if timestamp in self._data:
+                self._data.move_to_end(timestamp)
+                return self._data[timestamp]
+            if len(self._data) >= self._max:
+                self._data.popitem(last=False)
+            self._data[timestamp] = result
+        return result
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
 # ── Module-level instances ────────────────────────────────────────────────────
 
 composite_cache: BoundedCache[FrameEntry] = BoundedCache(MAX_FRAMES)
 volume_cache: BoundedCache[list] = BoundedCache(MAX_FRAMES)
+conus_cache = ConusCompositeCache()

@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="NYC Weather Radar API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="NYC Weather Radar API", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -210,6 +210,53 @@ async def radar_volume_frames(count: int = Query(default=60, ge=1, le=70)):
             detail="Volume frames not yet cached — server is still seeding",
         )
     return {"frames": frames, "count": len(frames)}
+
+
+@app.get("/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png")
+def radar_tile(timestamp: str, z: int, x: int, y: int):
+    """Serve a single 256x256 radar tile for the given timestamp and tile coordinates."""
+    from .cache import conus_cache
+    from .tiles import MAX_ZOOM, MIN_ZOOM, render_tile, tile_cache
+
+    if z < MIN_ZOOM or z > MAX_ZOOM:
+        raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
+
+    cache_key = (timestamp, z, x, y)
+    cached = tile_cache.get(cache_key)
+    if cached is not None:
+        return Response(
+            content=cached,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600, immutable"},
+        )
+
+    result = conus_cache.get(timestamp)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Timestamp not available")
+    grid, meta = result
+
+    png_bytes = render_tile(grid, meta, z, x, y)
+    tile_cache.put(cache_key, png_bytes)
+
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600, immutable"},
+    )
+
+
+@app.get("/api/radar/timestamps")
+def radar_timestamps():
+    """Return the list of available radar timestamps (for tile URL construction)."""
+    from . import disk_cache
+
+    composites = disk_cache.list_composites()
+    if not composites:
+        raise HTTPException(
+            status_code=503,
+            detail="No composites cached yet — server is still seeding",
+        )
+    return {"timestamps": composites, "count": len(composites)}
 
 
 @app.get("/api/radar/refresh")
