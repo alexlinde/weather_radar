@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -25,7 +26,7 @@ import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
 
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).resolve().parent.parent / "data"))
 RAW_DIR = _DATA_DIR / "raw"
 TILT_GRIDS_DIR = _DATA_DIR / "tilt_grids"
 

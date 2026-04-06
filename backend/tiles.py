@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -20,7 +21,7 @@ from PIL import Image
 
 MIN_ZOOM = 3
 MAX_ZOOM = 8
-_TILE_CACHE_MAX = 2000
+_TILE_CACHE_MAX = int(os.environ.get("TILE_CACHE_SIZE", "2000"))
 
 
 # ── Tile math ────────────────────────────────────────────────────────────────

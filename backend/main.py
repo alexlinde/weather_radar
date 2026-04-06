@@ -232,6 +232,17 @@ async def health():
     }
 
 
+@app.get("/ready")
+async def ready():
+    """Readiness probe: returns 200 once frames are available, 503 during seeding."""
+    from . import disk_cache
+
+    entries = disk_cache.list_tilt_grid_timestamps()
+    if not entries:
+        raise HTTPException(status_code=503, detail="Seeding in progress")
+    return {"status": "ready", "frames": len(entries)}
+
+
 # ── Serve frontend static files ──────────────────────────────────────────────
 
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"

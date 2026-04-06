@@ -1,0 +1,9 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8080"
+    volumes:
+      - ./data:/tmp/data
+    env_file:
+      - .env

@@ -8,6 +8,7 @@ Falls back to disk_cache on LRU miss (~33ms load from sparse .npz).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -76,4 +77,4 @@ class ConusTiltCache:
 
 
 # Module-level singleton
-tilt_cache = ConusTiltCache()
+tilt_cache = ConusTiltCache(max_size=int(os.environ.get("TILT_CACHE_SIZE", "30")))

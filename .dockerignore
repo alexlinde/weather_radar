@@ -1,0 +1,12 @@
+data/
+.env
+.git/
+__pycache__/
+*.pyc
+tests/
+scripts/
+demo/
+.pytest_cache/
+*.egg-info/
+CLAUDE.md
+GR2Analyst.md
