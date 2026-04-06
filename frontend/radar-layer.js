@@ -146,6 +146,11 @@ const RADAR_FRAG = `
       : sampleInterp(v_uv, u_tiltIndex, uvDisp, conf);
     vec4 col = colorize(encoded);
     if (col.a < 0.01) discard;
+    if (u_tiltIndex < 0) {
+      col.a = 1.0 - pow(1.0 - col.a, 6.0);
+    } else {
+      col.a = min(1.0, col.a + col.a * col.a * col.a);
+    }
     col.a *= u_opacity;
     gl_FragColor = vec4(col.rgb * col.a, col.a);
   }
@@ -244,7 +249,8 @@ const VOLUME_FRAG = `
       float val = sampleVolume(pos);
       vec4 col = colorize(val);
       if (col.a > 0.0) {
-        col.a = min(1.0, col.a * 10.0 / u_steps);
+        col.a = min(1.0, col.a + col.a * col.a * col.a);
+        col.a = min(1.0, col.a * 12.0 / u_steps);
         float f = col.a * (1.0 - acc.a);
         acc.rgb = (acc.a * acc.rgb + f * col.rgb) / max(acc.a + f, 0.001);
         acc.a  += f;
@@ -430,7 +436,7 @@ class RadarLayer {
 
     this._mode = 'composite';
     this._opacity = 0.8;
-    this._vertExag = 3.0;
+    this._vertExag = 1.0;
     this._dbzMin = -30.0;
     this._dbzMax = 100.0;
 

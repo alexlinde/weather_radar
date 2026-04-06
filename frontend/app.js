@@ -47,7 +47,7 @@ let refreshIntervalId = null;
 
 let radarLayer = null;
 let viewMode = 'composite';
-let verticalExaggeration = 3.0;
+let verticalExaggeration = 1.0;
 let activePreset = 'all';
 
 const RADAR_PRESETS = {
