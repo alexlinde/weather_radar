@@ -18,7 +18,8 @@ const REFRESH_INTERVAL_MS = 120_000;
 const MAX_503_RETRIES = 24;
 const TILE_MIN_ZOOM = 3;
 const TILE_MAX_ZOOM = 8;
-const POINT_SIZE_PX = 3;
+const VOXEL_MIN_ZOOM = 4;
+const POINT_SIZE_PX = 4;
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -169,9 +170,11 @@ function dbzToRgba(dbz) {
 
 function buildVoxelTileLayer(timestamp) {
   const exag = verticalExaggeration;
+  const tileUrl = `${API_BASE}/api/radar/volume/tiles/${encodeURIComponent(timestamp)}/{z}/{x}/{y}.json`;
   return new deck.TileLayer({
     id: 'radar-volume-tiles',
-    minZoom: TILE_MIN_ZOOM,
+    data: tileUrl,
+    minZoom: VOXEL_MIN_ZOOM,
     maxZoom: TILE_MAX_ZOOM,
     tileSize: 256,
     getTileData: (tile) => {
@@ -368,12 +371,13 @@ async function init() {
   // ── Frame scrubber ──────────────────────────────────────────────────────
 
   const scrubber = document.getElementById('frame-scrubber');
+  let scrubTimer = null;
   scrubber.addEventListener('input', () => {
-    const wasPlaying = playing;
-    if (wasPlaying) pause();
+    if (playing) pause();
     currentIndex = parseInt(scrubber.value, 10);
-    showFrame(currentIndex);
     updateFrameDisplay();
+    if (scrubTimer) clearTimeout(scrubTimer);
+    scrubTimer = setTimeout(() => showFrame(currentIndex), 150);
   });
 
   // ── Speed select ────────────────────────────────────────────────────────

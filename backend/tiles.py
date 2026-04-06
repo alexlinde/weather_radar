@@ -173,7 +173,12 @@ def _downsample_step(z: int) -> int:
 
     At low zoom (CONUS view), skip grid cells to keep voxel counts manageable.
     """
-    return max(1, 2 ** (6 - z))
+    return max(1, 2 ** (7 - z))
+
+
+# At low zoom, only render a subset of tilts to halve voxel count
+_LOW_ZOOM_TILTS = {"00.50", "02.50", "05.00", "10.00"}
+_MAX_VOXELS_PER_TILE = 40_000
 
 
 def render_voxel_tile(
@@ -182,11 +187,11 @@ def render_voxel_tile(
     z: int,
     x: int,
     y: int,
-    min_dbz: float = 10.0,
 ) -> list[list[float]]:
     """Extract voxels from all tilt levels for a tile region.
 
     Returns list of [lon, lat, altitude_m, dbz].
+    Zoom-adaptive: fewer tilts and higher dBZ threshold at low zoom.
     """
     tb = tile_bounds(z, x, y)
     overlap = _grid_overlap(tb, metadata)
@@ -195,14 +200,20 @@ def render_voxel_tile(
 
     row_start, row_end, col_start, col_end = overlap
     step = _downsample_step(z)
+    min_dbz = 15.0 if z <= 5 else 10.0
     grid_n = metadata["north"]
     grid_w = metadata["west"]
     Dj = metadata["Dj"]
     Di = metadata["Di"]
 
+    use_low_zoom_tilts = z <= 5
     all_voxels: list[np.ndarray] = []
+    total_count = 0
 
     for tilt, sgrid in sparse_grids.items():
+        if use_low_zoom_tilts and tilt not in _LOW_ZOOM_TILTS:
+            continue
+
         height_km = TILT_TO_HEIGHT_KM.get(tilt)
         if height_km is None:
             continue
@@ -224,11 +235,18 @@ def render_voxel_tile(
         dbz = np.round(sub[rows, cols], 1)
 
         all_voxels.append(np.column_stack([lons, lats, alts, dbz]))
+        total_count += len(rows)
+
+        if total_count >= _MAX_VOXELS_PER_TILE:
+            break
 
     if not all_voxels:
         return []
 
-    return np.vstack(all_voxels).tolist()
+    result = np.vstack(all_voxels)
+    if len(result) > _MAX_VOXELS_PER_TILE:
+        result = result[:_MAX_VOXELS_PER_TILE]
+    return result.tolist()
 
 
 # ── Tile caches ──────────────────────────────────────────────────────────────

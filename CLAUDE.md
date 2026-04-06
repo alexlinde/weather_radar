@@ -225,15 +225,23 @@ This allows the LRU to hold 20 timestamps (~780 MB) rather than just 3 (which wo
 
 ### 3D voxel tile zoom-based downsampling
 
-At CONUS zoom (z=3-4), full-resolution voxel tiles would contain millions of points. The downsample step `max(1, 2^(6-z))` keeps counts manageable:
+At CONUS zoom (z=3-4), full-resolution voxel tiles would contain millions of points. Several strategies keep voxel counts manageable:
 
-| Zoom | Step | Voxels/tile | JSON size |
-|------|------|-------------|-----------|
-| z=3 | 8 | ~3,700 | ~120 KB |
-| z=5 | 2 | ~39,000 | ~1,255 KB |
-| z=8 | 1 | ~1,100 | ~36 KB |
+1. **Spatial downsampling:** `max(1, 2^(7-z))` — more aggressive step at each zoom level
+2. **Tilt reduction:** At z≤5, only 4 of 8 tilts are used (00.50, 02.50, 05.00, 10.00)
+3. **dBZ threshold:** At z≤5, min_dbz=15 instead of 10 to filter weak echoes
+4. **Hard cap:** 40K voxels per tile maximum
 
-GZip middleware compresses JSON by ~87% over the wire.
+| Zoom | Step | Tilts | Min dBZ | Approx voxels/tile |
+|------|------|-------|---------|--------------------|
+| z=3 | 16 | 4 | 15 | ~500 |
+| z=4 | 8 | 4 | 15 | ~2,000 |
+| z=5 | 4 | 4 | 15 | ~8,000 |
+| z=6 | 2 | 8 | 10 | ~15,000 |
+| z=7 | 1 | 8 | 10 | ~20,000 |
+| z=8 | 1 | 8 | 10 | ~1,000 |
+
+The frontend uses `VOXEL_MIN_ZOOM=4` (skips z=3 for 3D entirely). GZip middleware compresses JSON by ~87% over the wire.
 
 ## Custom GRIB2 Decoder
 

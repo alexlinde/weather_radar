@@ -171,3 +171,4 @@ def invalidate_all() -> None:
     from .tiles import tile_cache, voxel_tile_cache
     tile_cache.clear()
     voxel_tile_cache.clear()
+    disk_cache.invalidate_ts_list_cache()

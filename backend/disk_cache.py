@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,8 @@ def put_tilt_grids(
     with open(ts_dir / "meta.json", "w") as f:
         json.dump(meta, f)
 
+    _notify_ts_list(meta)
+
 
 def get_tilt_grids(timestamp: str) -> tuple[dict[str, sp.csr_matrix], dict[str, Any]] | None:
     """Load all tilt grids for a timestamp. Returns (sparse_dict, metadata) or None."""
@@ -140,8 +143,25 @@ def has_tilt_grids(timestamp: str) -> bool:
     return (TILT_GRIDS_DIR / stem / "meta.json").exists()
 
 
-def list_tilt_grid_timestamps() -> list[dict[str, Any]]:
-    """Return metadata dicts for all tilt grid sets on disk, oldest-first."""
+_ts_list_cache: list[dict[str, Any]] | None = None
+_ts_list_lock = threading.Lock()
+
+
+def _meta_to_entry(meta: dict[str, Any]) -> dict[str, Any]:
+    """Build a timestamps-list entry from a metadata dict."""
+    return {
+        "timestamp": meta.get("timestamp"),
+        "bounds": {
+            "north": meta.get("north"),
+            "south": meta.get("south"),
+            "east": meta.get("east"),
+            "west": meta.get("west"),
+        },
+    }
+
+
+def _load_ts_list_from_disk() -> list[dict[str, Any]]:
+    """One-time disk scan to bootstrap the timestamps list."""
     if not TILT_GRIDS_DIR.exists():
         return []
     entries: list[dict[str, Any]] = []
@@ -151,16 +171,46 @@ def list_tilt_grid_timestamps() -> list[dict[str, Any]]:
             continue
         with open(meta_path) as f:
             meta = json.load(f)
-        entries.append({
-            "timestamp": meta.get("timestamp"),
-            "bounds": {
-                "north": meta.get("north"),
-                "south": meta.get("south"),
-                "east": meta.get("east"),
-                "west": meta.get("west"),
-            },
-        })
+        entries.append(_meta_to_entry(meta))
     return entries
+
+
+def list_tilt_grid_timestamps() -> list[dict[str, Any]]:
+    """Return metadata dicts for all tilt grid sets on disk, oldest-first.
+
+    The list is loaded from disk once, then maintained incrementally
+    by put_tilt_grids() as new frames are written.
+    """
+    global _ts_list_cache
+    with _ts_list_lock:
+        if _ts_list_cache is None:
+            _ts_list_cache = _load_ts_list_from_disk()
+        return _ts_list_cache
+
+
+def _notify_ts_list(metadata: dict[str, Any]) -> None:
+    """Append a new entry to the cached timestamps list after a disk write.
+
+    Deduplicates by timestamp and maintains sorted order.
+    """
+    global _ts_list_cache
+    entry = _meta_to_entry(metadata)
+    ts = entry["timestamp"]
+    with _ts_list_lock:
+        if _ts_list_cache is None:
+            _ts_list_cache = _load_ts_list_from_disk()
+            return
+        if any(e["timestamp"] == ts for e in _ts_list_cache):
+            return
+        _ts_list_cache.append(entry)
+        _ts_list_cache.sort(key=lambda e: e["timestamp"] or "")
+
+
+def invalidate_ts_list_cache() -> None:
+    """Force the timestamps list to re-scan disk on next call."""
+    global _ts_list_cache
+    with _ts_list_lock:
+        _ts_list_cache = None
 
 
 # ── Eviction ──────────────────────────────────────────────────────────────────
