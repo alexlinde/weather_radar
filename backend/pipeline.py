@@ -151,10 +151,9 @@ def warm_from_disk(limit: int = 20) -> int:
 
     Skips all S3 fetching — useful for dev mode when you already have
     cached data and don't want to wait for a full re-seed.
-    Also pre-extracts binary voxel tiles for CONUS z=4 so the bulk
-    endpoint serves instantly on first request.
+    Pre-renders atlas tiles and legacy voxel tiles for CONUS z=4.
     """
-    from .tiles import bin_tile_cache, render_voxel_tile_binary
+    from .tiles import atlas_tile_cache, render_atlas_tile
 
     entries = disk_cache.list_tilt_grid_timestamps()
     if not entries:
@@ -175,36 +174,33 @@ def warm_from_disk(limit: int = 20) -> int:
     logger.info("Warmed %d/%d frames from disk into memory", loaded, len(recent))
 
     tile_coords = _conus_tile_coords(z=4)
-    prerendered = 0
+    atlas_count = 0
     for entry in recent:
         ts = entry["timestamp"]
         tilt_entry = tilt_cache.get(ts)
         if tilt_entry is None:
             continue
+        grids, meta = tilt_entry["grids"], tilt_entry["meta"]
         for z, x, y in tile_coords:
             cache_key = (ts, z, x, y)
-            if bin_tile_cache.get(cache_key) is not None:
-                continue
-            data = render_voxel_tile_binary(
-                tilt_entry["grids"], tilt_entry["meta"], z, x, y,
-            )
-            bin_tile_cache.put(cache_key, data)
-            prerendered += 1
+            if atlas_tile_cache.get(cache_key) is None:
+                data = render_atlas_tile(grids, meta, z, x, y)
+                atlas_tile_cache.put(cache_key, data)
+                atlas_count += 1
 
-    logger.info("Pre-rendered %d voxel tiles (%d tiles × %d frames)",
-                prerendered, len(tile_coords), loaded)
+    logger.info("Pre-rendered %d atlas tiles (%d coords × %d frames)",
+                atlas_count, len(tile_coords), loaded)
     return loaded
 
 
 def seed_frames(count: int = 60) -> int:
     """Pre-fetch and cache tilt grids for the most recent timestamps.
 
-    After fetching, pre-renders binary voxel tiles for the default CONUS
-    viewport (z=4) so the bulk endpoint serves instantly on first request.
-    Returns number of timestamps now cached.
+    After fetching, pre-renders atlas and legacy voxel tiles for the
+    default CONUS viewport (z=4).  Returns number of timestamps cached.
     """
     from concurrent.futures import ThreadPoolExecutor
-    from .tiles import bin_tile_cache, render_voxel_tile_binary
+    from .tiles import atlas_tile_cache, render_atlas_tile
 
     logger.info("Seeding frame cache (%d frames across %d tilts)…", count, len(TILT_LEVELS))
     ref_keys = list_tilt_files("00.50", count=count)
@@ -234,29 +230,27 @@ def seed_frames(count: int = 60) -> int:
     tile_coords = _conus_tile_coords(z=4)
     entries = disk_cache.list_tilt_grid_timestamps()
     recent = entries[-20:]
-    prerendered = 0
+    atlas_count = 0
     for entry in recent:
         ts = entry["timestamp"]
         tilt_entry = tilt_cache.get(ts)
         if tilt_entry is None:
             continue
+        grids, meta = tilt_entry["grids"], tilt_entry["meta"]
         for z, x, y in tile_coords:
             cache_key = (ts, z, x, y)
-            if bin_tile_cache.get(cache_key) is not None:
-                continue
-            data = render_voxel_tile_binary(
-                tilt_entry["grids"], tilt_entry["meta"], z, x, y,
-            )
-            bin_tile_cache.put(cache_key, data)
-            prerendered += 1
+            if atlas_tile_cache.get(cache_key) is None:
+                data = render_atlas_tile(grids, meta, z, x, y)
+                atlas_tile_cache.put(cache_key, data)
+                atlas_count += 1
 
-    logger.info("Pre-rendered %d voxel tiles for default viewport", prerendered)
+    logger.info("Pre-rendered %d atlas tiles for default viewport", atlas_count)
     return total
 
 
 def invalidate_all() -> None:
     """Clear all in-memory caches."""
     tilt_cache.clear()
-    from .tiles import bin_tile_cache
-    bin_tile_cache.clear()
+    from .tiles import atlas_tile_cache
+    atlas_tile_cache.clear()
     disk_cache.invalidate_ts_list_cache()

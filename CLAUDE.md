@@ -11,18 +11,18 @@ This is a working prototype, not a production app. Prioritise getting real data 
 **Phase 1 (data on screen): COMPLETE**
 **Phase 2 (time animation): COMPLETE**
 **Phase 3 (3D terrain + vertical levels): COMPLETE**
-**Phase 3.5 (unified voxel architecture): COMPLETE**
+**Phase 3.5 (atlas tile rendering): COMPLETE**
 **Phase 4 (motion-compensated interpolation): NOT STARTED**
 
-The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves all 20 frames of voxel data for each tile coordinate in a single bulk binary response. The frontend loads all voxels for visible tiles into GPU buffers once, then uses deck.gl `DataFilterExtension` to switch frames by updating a single GPU uniform — achieving zero-cost scrubbing with no per-frame network requests or buffer re-uploads. Both 2D composite and 3D volumetric views use the same `PointCloudLayer`, differing only in pitch, point size, and depth testing. The map uses MapLibre GL JS with 3D terrain, starting at a CONUS-wide view.
+The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint. The frontend uses a custom MapLibre `CustomLayerInterface` with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation between frames, and spatial smoothing. Both 2D composite and 3D volumetric modes use the same atlas tile data — the difference is geometry (one ground plane vs 8 altitude planes). Animation uses continuous float time for smooth interpolation between keyframes. The map uses MapLibre GL JS with 3D terrain, starting at a CONUS-wide view.
 
 ## Architecture
 
 ```
 ┌─────────────────┐      ┌──────────────────────┐      ┌────────────────────┐
 │  NOAA S3 Bucket  │─────▶│  Python Backend       │─────▶│  Browser Frontend   │
-│  noaa-mrms-pds   │      │  (FastAPI)             │      │  (MapLibre + deck.gl)│
-│  Public, no auth │      │  Fetch, decode, sparse │      │  Map + radar overlay │
+│  noaa-mrms-pds   │      │  (FastAPI)             │      │  (MapLibre + WebGL) │
+│  Public, no auth │      │  Fetch, decode, atlas  │      │  Map + radar overlay │
 └─────────────────┘      └──────────────────────┘      └────────────────────┘
 ```
 
@@ -32,25 +32,25 @@ Responsibilities:
 - Fetch MRMS tilt-level GRIB2 files from S3 across 8 elevation angles
 - Decode with custom minimal GRIB2 decoder (no eccodes dependency)
 - Convert to scipy.sparse CSR matrices (95-99% of grid is NaN/sentinel → 20x memory reduction)
-- Serve bulk voxel tiles (`/api/radar/volume/bulk/{z}/{x}/{y}.bin`) — all 20 frames packed in one binary response per tile coordinate
-- Zoom-based spatial downsampling keeps voxel counts manageable
-- Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + binary voxel tile LRU (2000 entries)
-- GZip middleware compresses binary voxel responses (~80-90% reduction)
-- Background seeding on startup (60 frames across all tilts) + voxel tile pre-rendering for default viewport
+- Serve atlas tiles (`/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png`) — 256×2048 grayscale PNG with 8 tilt bands, dBZ encoded as uint8
+- Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + atlas tile LRU (2000 entries)
+- GZip middleware for API responses
+- Background seeding on startup (60 frames across all tilts) + atlas tile pre-rendering for default viewport
 
 ### Frontend (HTML + JS)
 
 Responsibilities:
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
 - 3D terrain via AWS elevation tiles (always enabled)
-- Bulk-fetch all frames' voxels for visible tiles on load → build combined typed arrays
-- Single `deck.PointCloudLayer` with `DataFilterExtension` renders both 2D and 3D views
-- Frame scrubbing updates a single GPU `filterRange` uniform — zero-cost, no network or buffer work
-- 2D/3D toggle changes pitch, point size, and depth testing on the same layer
-- Re-fetches bulk voxel data when zoom level changes (debounced)
+- Custom `RadarLayer` (`CustomLayerInterface`) renders atlas tiles via WebGL with GLSL shaders
+- GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation, spatial smoothing, tile edge blending
+- 2D composite mode: single ground-level quad per tile, shader takes fmax across 8 tilt bands
+- 3D layers mode: 8 stacked quads per tile at tilt altitudes, one band per quad
+- Continuous float animation time enables smooth inter-frame interpolation
+- Viewport-based tile loading with browser HTTP cache (`force-cache` + `immutable`)
 - Default CONUS view at z=4, user zooms in to area of interest
-- Time animation with 20 frames, play/pause, scrubber, speed control
-- Opacity slider, vertical exaggeration slider (3D mode)
+- Time animation with play/pause, scrubber, speed control
+- Opacity slider, vertical exaggeration slider (3D mode), dBZ min/max cutoff sliders
 - NWS reflectivity color scale legend
 - Auto-refresh every 2 minutes
 
@@ -154,21 +154,20 @@ No eccodes, no cfgrib, no system-level C dependencies.
 
 ### Frontend
 - **MapLibre GL JS** (~v4) — base map + 3D terrain
-- **deck.gl** (~v9) — PointCloudLayer, DataFilterExtension, MapboxOverlay
-- **Vanilla JS** — no framework, no build step
+- **Custom WebGL** — `CustomLayerInterface` with GLSL shaders for atlas tile rendering
+- **Vanilla JS** — no framework, no build step, no deck.gl
 
 Loaded from CDN:
 ```html
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
-<script src="https://unpkg.com/deck.gl@9/dist.min.js"></script>
 ```
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/radar/volume/bulk/{z}/{x}/{y}.bin` | GET | All frames' voxels for a tile coordinate in one binary response. z=3–8. |
+| `/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png` | GET | Atlas tile — 256×2048 grayscale PNG, 8 tilt bands. z=3–8. |
 | `/api/radar/timestamps` | GET | Available timestamps with bounds. |
 | `/api/radar/refresh` | GET | Force cache invalidation + re-seed. |
 | `/api/config` | GET | Frontend configuration (map tile API keys). |
@@ -176,11 +175,23 @@ Loaded from CDN:
 
 The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes).
 
-The bulk endpoint packs all 20 frames into one response: `[uint16 frame_count][per-frame: [uint32 count][float32 positions[3*N]][uint8 colors[4*N]]]`. GZip middleware compresses the binary data ~80-90%. The response uses `Cache-Control: public, max-age=120` since new frames appear every 2 minutes.
+Atlas tiles use `Cache-Control: public, max-age=3600, immutable` — radar data for a given timestamp never changes, so the browser caches aggressively. Combined with `cache: 'force-cache'` on the frontend fetch, animation scrubbing through previously visited frames is nearly instant.
+
+### Atlas tile data format
+
+Each atlas tile is a **256×2048 grayscale PNG** — 8 vertical bands of 256×256, one per tilt level:
+
+- Row 0–255: tilt 00.50° (1 km)
+- Row 256–511: tilt 01.50° (2 km)
+- Row 512–767: tilt 02.50° (3.5 km)
+- ...
+- Row 1792–2047: tilt 14.00° (15 km)
+
+Pixel encoding: `uint8 = round((dBZ + 30) * 2)`, mapping dBZ range [-30, +97.5] to [0, 255]. Value 0 = no echo. The GPU shader reverses this: `dBZ = pixel / 2.0 - 30.0`.
 
 ## Data Pipeline (`pipeline.py`)
 
-The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, store as sparse matrices, pre-render voxel tiles for the default viewport.**
+The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, store as sparse matrices, derive atlas tiles on demand.**
 
 ### Seed flow (startup)
 
@@ -190,7 +201,7 @@ The pipeline is the core orchestration layer. It operates on a single principle:
 4. Decode GRIB2 → mask sentinels (< -30 → NaN) → convert to scipy.sparse CSR (NaN → implicit zero)
 5. Save sparse tilt grids to `data/tilt_grids/{YYYYMMDD-HHMMSS}/` (8 `.npz` + `meta.json`)
 6. Populate in-memory `ConusTiltCache` LRU
-7. Pre-render binary voxel tiles for the most recent 20 frames at z=4 (CONUS default viewport)
+7. Pre-render atlas PNG tiles for the most recent 20 frames at z=4 (CONUS default viewport)
 
 In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetching). Step 7 still runs.
 
@@ -202,9 +213,9 @@ In `DEV_MODE`, steps 1–6 are replaced by loading from disk cache (no S3 fetchi
 - Max 20 entries (~780 MB: 20 timestamps × 39 MB sparse per timestamp)
 - Falls back to `disk_cache.get_tilt_grids()` on miss (33ms disk load)
 
-**Binary tile cache (`tiles.py`):**
-- `bin_tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → binary voxel bytes
-- Pre-populated at startup for z=4 CONUS tiles; cache misses at other zoom levels are computed on demand
+**Atlas tile cache (`tiles.py`):**
+- `atlas_tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → PNG bytes
+- Pre-populated at startup for z=4 CONUS tiles; cache misses at other zoom levels are rendered on demand
 
 **On-disk (`disk_cache.py`):**
 - `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3 (~0.5 MB each)
@@ -221,25 +232,17 @@ MRMS data is extremely sparse: 95-99.3% of grid cells are NaN/sentinel after mas
 
 This allows the LRU to hold 20 timestamps (~780 MB) rather than just 3 (which would be 2.4 GB dense).
 
-### 3D voxel tile zoom-based downsampling
+### Atlas tile rendering
 
-At CONUS zoom (z=3-4), full-resolution voxel tiles would contain millions of points. Several strategies keep voxel counts manageable:
+Atlas tiles are rendered on demand from sparse tilt grids. For each tile:
 
-1. **Spatial downsampling:** `max(1, 2^(7-z))` — more aggressive step at each zoom level
-2. **Tilt reduction:** At z≤5, only 4 of 8 tilts are used (00.50, 02.50, 05.00, 10.00)
-3. **dBZ threshold:** At z≤5, min_dbz=15 instead of 10 to filter weak echoes
-4. **Hard cap:** 40K voxels per tile maximum
+1. Compute geographic overlap between the tile bounds and the MRMS grid
+2. For each of the 8 tilt levels, extract the sparse subgrid, convert to dense, resample to 256×256 (nearest-neighbor)
+3. Encode dBZ to uint8: `round((dBZ + 30) * 2)`, NaN/zero → 0
+4. Stack 8 bands vertically into a 256×2048 array
+5. Encode as grayscale PNG via Pillow
 
-| Zoom | Step | Tilts | Min dBZ | Approx voxels/tile |
-|------|------|-------|---------|--------------------|
-| z=3 | 16 | 4 | 15 | ~500 |
-| z=4 | 8 | 4 | 15 | ~2,000 |
-| z=5 | 4 | 4 | 15 | ~8,000 |
-| z=6 | 2 | 8 | 10 | ~15,000 |
-| z=7 | 1 | 8 | 10 | ~20,000 |
-| z=8 | 1 | 8 | 10 | ~1,000 |
-
-GZip middleware compresses the binary voxel data ~80-90% over the wire.
+The resulting PNG is typically 2-10 KB per tile (much smaller than raw binary voxel data). All colorisation, compositing, and smoothing happens on the GPU via GLSL shaders.
 
 ## Custom GRIB2 Decoder
 
@@ -400,9 +403,9 @@ weather_radar/
 ├── backend/
 │   ├── requirements.txt   ← production dependencies (includes scipy)
 │   ├── requirements-dev.txt ← dev/test dependencies
-│   ├── main.py            ← FastAPI app, bulk voxel endpoint, timestamps, config
-│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU + voxel pre-render
-│   ├── tiles.py           ← TMS tile math, voxel extraction + binary packing, tile cache
+│   ├── main.py            ← FastAPI app, atlas tile endpoint, timestamps, config
+│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU + atlas pre-render
+│   ├── tiles.py           ← TMS tile math, atlas tile rendering (PNG), tile cache
 │   ├── mrms.py            ← S3 client, file listing, download
 │   ├── cache.py           ← ConusTiltCache (sparse LRU with disk fallback)
 │   ├── disk_cache.py      ← on-disk raw + sparse tilt grid cache
@@ -416,8 +419,9 @@ weather_radar/
 ├── frontend/
 │   ├── index.html         ← single-page app
 │   ├── style.css          ← dark theme, glassmorphism panels
-│   ├── app.js             ← map init, bulk voxel loading, GPU-filtered animation
-│   └── colors.js          ← NWS color scale + legend builder
+│   ├── radar-layer.js     ← CustomLayerInterface: WebGL atlas tile rendering + GLSL shaders
+│   ├── app.js             ← map init, continuous animation, UI wiring
+│   └── colors.js          ← NWS color scale, legend builder, GPU color ramp data
 ├── tests/
 │   ├── __init__.py
 │   ├── fixtures/          ← real MRMS .grib2.gz file (gitignored)
@@ -504,34 +508,25 @@ MRMS reflectivity grids are extremely sparse: after sentinel masking, 95-99.3% o
 
 Sparse is better on every axis: memory, disk, I/O speed, and allows caching 20 frames in memory instead of 3.
 
-### Why unified voxel architecture (not per-frame tile fetching)
+### Why atlas tiles with GPU-side rendering (not PointCloudLayer)
 
-The earlier approach used deck.gl `TileLayer` to fetch PNG (2D) or binary (3D) tiles per frame per visible tile coordinate. This had poor scrubbing performance because every frame change triggered:
-- HTTP requests for each visible tile × the new frame
-- Decoding/uploading new GPU textures or buffers
-- Layer re-creation or prop invalidation in deck.gl
+The earlier approach used deck.gl `PointCloudLayer` with `DataFilterExtension` for GPU-driven frame switching. While scrubbing was fast once data was loaded, it had several visual and architectural limitations:
+- At CONUS zoom, the 2D composite showed a "dot grid" rather than a continuous raster field
+- Bulk binary responses were large (~5-20 MB per tile coordinate for all frames)
+- No temporal interpolation between frames (discrete jumps)
+- deck.gl added ~500 KB of JavaScript overhead for a single layer type
 
-The unified approach, inspired by the [deck.gl animated flight demo](https://deck.gl/examples/maplibre), loads all data up front and animates entirely on the GPU:
-1. **Bulk binary endpoint** — one request per tile coordinate returns all 20 frames' voxels
-2. **Combined typed arrays** — positions, colors, and frame indices concatenated into single buffers
-3. **`DataFilterExtension`** — each voxel has a `frameIndex` attribute; `filterRange` selects the visible frame
-4. **Frame scrubbing** — updates one GPU uniform, no buffer re-uploads, no network requests
-5. **Both 2D and 3D** — same `PointCloudLayer`, different pitch/pointSize/depthTest settings
-
-Trade-off: at CONUS zoom (z=4), the 2D composite view shows a "dot grid" rather than continuous raster. Acceptable for a prototype; could be addressed with custom shaders or screen-space splatting later.
-
-### Why PointCloudLayer instead of ColumnLayer
-
-deck.gl `PointCloudLayer` turned out to work better than `ColumnLayer` for volumetric radar:
-- Each voxel is a single point with a color — simpler data format (just `[lon, lat, alt, dbz]`)
-- Handles irregular sampling (not all cells are active at all levels)
-- Performs well with 100K+ points
-- Vertical exaggeration is just a multiplier on the altitude
-- `DataFilterExtension` integrates cleanly for frame filtering
+The atlas tile approach, inspired by [MapTiler's 3D weather demo](https://www.maptiler.com/tools/weather/3d/), achieves MapTiler-level visual polish:
+1. **Atlas tiles** — 256×2048 grayscale PNG per tile, 8 tilt bands stacked vertically (~2-10 KB each)
+2. **Custom WebGL** — MapLibre `CustomLayerInterface` renders textured quads directly in the GL context
+3. **GLSL shaders** — GPU-side dBZ decoding, NWS color ramp lookup, temporal interpolation, spatial smoothing, tile edge blending
+4. **Continuous animation** — float `currentAnimationTime` enables smooth inter-frame blending via `mix()`
+5. **2D/3D from same data** — composite mode takes `fmax` across 8 bands in the shader; 3D mode renders 8 stacked quads
+6. **Browser HTTP cache** — `Cache-Control: immutable` + `force-cache` makes revisited frames instant
 
 ### Background seeding
 
-The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread, followed by voxel pre-rendering for the default z=4 CONUS viewport. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
+The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread, followed by atlas tile pre-rendering for the default z=4 CONUS viewport. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
 
 ### On-disk cache layout
 

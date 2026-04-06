@@ -1,38 +1,26 @@
 """
-TMS voxel tile rendering for CONUS radar data.
+TMS atlas tile rendering for CONUS radar data.
 
-Extracts subregions from sparse tilt grids, downsamples by zoom,
-colorizes via NWS scale, and packs into binary format.
-Tiles follow the standard {z}/{x}/{y} convention.
+Atlas tiles are 256×2048 grayscale PNGs packing 8 tilt levels vertically.
+Pixel encoding: uint8 = round((dBZ + 30) * 2), 0 = no echo.
+Used by the custom WebGL radar layer for GPU-side colorisation.
 """
 
 from __future__ import annotations
 
+import io
 import math
-import struct
 import threading
 from collections import OrderedDict
 from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
-
-from .render import NWS_DBZ_COLORS
+from PIL import Image
 
 MIN_ZOOM = 3
 MAX_ZOOM = 8
-_BIN_TILE_CACHE_MAX = 2000
-
-TILT_TO_HEIGHT_KM: dict[str, float] = {
-    "00.50": 1.0,
-    "01.50": 2.0,
-    "02.50": 3.5,
-    "03.50": 5.0,
-    "05.00": 7.0,
-    "07.00": 9.0,
-    "10.00": 12.0,
-    "14.00": 15.0,
-}
+_TILE_CACHE_MAX = 2000
 
 
 # ── Tile math ────────────────────────────────────────────────────────────────
@@ -72,10 +60,10 @@ def _grid_overlap(
 
     Nj = int(meta["Nj"])
     Ni = int(meta["Ni"])
-    row_start = max(0, int(round((grid_n - overlap_n) / Dj)))
-    row_end = min(Nj, int(round((grid_n - overlap_s) / Dj)))
-    col_start = max(0, int(round((overlap_w - grid_w) / Di)))
-    col_end = min(Ni, int(round((overlap_e - grid_w) / Di)))
+    row_start = max(0, math.floor((grid_n - overlap_n) / Dj))
+    row_end = min(Nj, math.ceil((grid_n - overlap_s) / Dj))
+    col_start = max(0, math.floor((overlap_w - grid_w) / Di))
+    col_end = min(Ni, math.ceil((overlap_e - grid_w) / Di))
 
     if row_start >= row_end or col_start >= col_end:
         return None
@@ -86,133 +74,13 @@ def _grid_overlap(
 # ── Voxel tile renderer ──────────────────────────────────────────────────────
 
 
-def _downsample_step(z: int) -> int:
-    """Spatial downsample factor based on zoom level.
-
-    At low zoom (CONUS view), skip grid cells to keep voxel counts manageable.
-    """
-    return max(1, 2 ** (7 - z))
-
-
-# At low zoom, only render a subset of tilts to halve voxel count
-_LOW_ZOOM_TILTS = {"00.50", "02.50", "05.00", "10.00"}
-_MAX_VOXELS_PER_TILE = 40_000
-
-_EMPTY_BIN_TILE = struct.pack("<I", 0)
-
-
-def colorize_voxels(dbz_values: np.ndarray) -> np.ndarray:
-    """Vectorized dBZ → RGBA for voxel points. Returns Nx4 uint8 array."""
-    n = len(dbz_values)
-    colors = np.zeros((n, 4), dtype=np.uint8)
-    alphas = np.clip(
-        np.round(100 + (dbz_values - 10) * (155 / 50)), 100, 255
-    ).astype(np.uint8)
-    for min_dbz, max_dbz, r, g, b in NWS_DBZ_COLORS:
-        mask = (dbz_values >= min_dbz) & (dbz_values < max_dbz)
-        colors[mask, :3] = [r, g, b]
-    colors[dbz_values >= 75, :3] = [200, 200, 255]
-    has_color = colors[:, :3].any(axis=1)
-    colors[has_color, 3] = alphas[has_color]
-    return colors
-
-
-def _extract_voxels(
-    sparse_grids: dict[str, sp.csr_matrix],
-    metadata: dict,
-    z: int,
-    x: int,
-    y: int,
-) -> np.ndarray | None:
-    """Extract voxels from sparse tilt grids for a tile region.
-
-    Returns Nx4 float array of [lon, lat, altitude_m, dbz] or None.
-    """
-    tb = tile_bounds(z, x, y)
-    overlap = _grid_overlap(tb, metadata)
-    if overlap is None:
-        return None
-
-    row_start, row_end, col_start, col_end = overlap
-    step = _downsample_step(z)
-    min_dbz = 15.0 if z <= 5 else 10.0
-    grid_n = metadata["north"]
-    grid_w = metadata["west"]
-    Dj = metadata["Dj"]
-    Di = metadata["Di"]
-
-    use_low_zoom_tilts = z <= 5
-    all_voxels: list[np.ndarray] = []
-    total_count = 0
-
-    for tilt, sgrid in sparse_grids.items():
-        if use_low_zoom_tilts and tilt not in _LOW_ZOOM_TILTS:
-            continue
-
-        height_km = TILT_TO_HEIGHT_KM.get(tilt)
-        if height_km is None:
-            continue
-        height_m = height_km * 1000.0
-
-        sub = sgrid[row_start:row_end, col_start:col_end].toarray()
-        if step > 1:
-            sub = sub[::step, ::step]
-
-        sub[sub == 0] = np.nan
-        mask = (~np.isnan(sub)) & (sub >= min_dbz)
-        rows, cols = np.where(mask)
-        if len(rows) == 0:
-            continue
-
-        lons = np.round(grid_w + (col_start + cols * step) * Di + Di / 2, 5)
-        lats = np.round(grid_n - (row_start + rows * step) * Dj - Dj / 2, 5)
-        alts = np.full(len(rows), height_m)
-        dbz = np.round(sub[rows, cols], 1)
-
-        all_voxels.append(np.column_stack([lons, lats, alts, dbz]))
-        total_count += len(rows)
-
-        if total_count >= _MAX_VOXELS_PER_TILE:
-            break
-
-    if not all_voxels:
-        return None
-
-    result = np.vstack(all_voxels)
-    if len(result) > _MAX_VOXELS_PER_TILE:
-        result = result[:_MAX_VOXELS_PER_TILE]
-    return result
-
-
-def render_voxel_tile_binary(
-    sparse_grids: dict[str, sp.csr_matrix],
-    metadata: dict,
-    z: int,
-    x: int,
-    y: int,
-) -> bytes:
-    """Pack voxels as binary: [uint32 count][float32 positions][uint8 colors].
-
-    Positions are 3 × float32 (lon, lat, alt_m) per voxel.
-    Colors are 4 × uint8 (R, G, B, A) per voxel, pre-computed from dBZ.
-    """
-    result = _extract_voxels(sparse_grids, metadata, z, x, y)
-    if result is None:
-        return _EMPTY_BIN_TILE
-
-    count = len(result)
-    positions = result[:, :3].astype(np.float32)
-    colors = colorize_voxels(result[:, 3])
-    return struct.pack("<I", count) + positions.tobytes() + colors.tobytes()
-
-
-# ── Tile caches ──────────────────────────────────────────────────────────────
+# ── Tile cache ────────────────────────────────────────────────────────────────
 
 
 class TileCache:
-    """Thread-safe LRU cache for rendered binary voxel tile data."""
+    """Thread-safe LRU cache for rendered tile data (PNG bytes)."""
 
-    def __init__(self, max_size: int = _BIN_TILE_CACHE_MAX) -> None:
+    def __init__(self, max_size: int = _TILE_CACHE_MAX) -> None:
         self._max = max_size
         self._data: OrderedDict[tuple, bytes] = OrderedDict()
         self._lock = threading.Lock()
@@ -238,4 +106,124 @@ class TileCache:
             self._data.clear()
 
 
-bin_tile_cache = TileCache(max_size=_BIN_TILE_CACHE_MAX)
+# ── Atlas tile renderer ───────────────────────────────────────────────────────
+
+ATLAS_BAND_SIZE = 256
+ATLAS_NUM_BANDS = 8
+
+TILT_ORDER = ["00.50", "01.50", "02.50", "03.50", "05.00", "07.00", "10.00", "14.00"]
+
+_EMPTY_ATLAS: bytes | None = None
+
+
+def _get_empty_atlas() -> bytes:
+    """Return a cached all-zero 256×2048 grayscale PNG (no echo)."""
+    global _EMPTY_ATLAS
+    if _EMPTY_ATLAS is None:
+        arr = np.zeros((ATLAS_BAND_SIZE * ATLAS_NUM_BANDS, ATLAS_BAND_SIZE), dtype=np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="L").save(buf, format="PNG", compress_level=1)
+        _EMPTY_ATLAS = buf.getvalue()
+    return _EMPTY_ATLAS
+
+
+def _dbz_to_uint8(grid: np.ndarray) -> np.ndarray:
+    """Encode dBZ values to uint8: val = round((dBZ + 30) * 2), 0 = no echo."""
+    mask = np.isnan(grid) | (grid == 0)
+    encoded = np.where(mask, 0.0, np.round((grid + 30.0) * 2.0))
+    np.clip(encoded, 0, 255, out=encoded)
+    return encoded.astype(np.uint8)
+
+
+def _resample_to_band(
+    dense: np.ndarray, target_h: int = ATLAS_BAND_SIZE, target_w: int = ATLAS_BAND_SIZE,
+) -> np.ndarray:
+    """Nearest-neighbor resample a 2D array to target_h × target_w."""
+    h, w = dense.shape
+    if h == target_h and w == target_w:
+        return dense
+    row_idx = np.linspace(0, h - 1, target_h).astype(int)
+    col_idx = np.linspace(0, w - 1, target_w).astype(int)
+    return dense[np.ix_(row_idx, col_idx)]
+
+
+def render_atlas_tile(
+    sparse_grids: dict[str, sp.csr_matrix],
+    metadata: dict,
+    z: int,
+    x: int,
+    y: int,
+) -> bytes:
+    """Render an atlas tile: 256×2048 grayscale PNG with 8 tilt bands.
+
+    Each 256×256 band holds dBZ data for one tilt level, encoded as uint8.
+    Data is placed at the correct geographic position within each band —
+    partial-coverage tiles (e.g. at CONUS edges) get zeros in uncovered areas.
+    Returns PNG bytes.
+    """
+    tb = tile_bounds(z, x, y)
+    overlap = _grid_overlap(tb, metadata)
+    if overlap is None:
+        return _get_empty_atlas()
+
+    row_start, row_end, col_start, col_end = overlap
+
+    grid_n = metadata["north"]
+    grid_w = metadata["west"]
+    Di = metadata["Di"]
+    Dj = metadata["Dj"]
+
+    # Geographic bounds of the overlap region within the MRMS grid
+    data_n = grid_n - row_start * Dj
+    data_s = grid_n - row_end * Dj
+    data_w = grid_w + col_start * Di
+    data_e = grid_w + col_end * Di
+
+    tile_w = tb["west"]
+    tile_e = tb["east"]
+    tile_n = tb["north"]
+    tile_s = tb["south"]
+    tile_lon_span = tile_e - tile_w
+    tile_lat_span = tile_n - tile_s
+
+    # Pixel coordinates within the 256×256 band where data should be placed
+    px_left = int(round((data_w - tile_w) / tile_lon_span * ATLAS_BAND_SIZE))
+    px_right = int(round((data_e - tile_w) / tile_lon_span * ATLAS_BAND_SIZE))
+    px_top = int(round((tile_n - data_n) / tile_lat_span * ATLAS_BAND_SIZE))
+    px_bottom = int(round((tile_n - data_s) / tile_lat_span * ATLAS_BAND_SIZE))
+
+    px_left = max(0, min(ATLAS_BAND_SIZE, px_left))
+    px_right = max(0, min(ATLAS_BAND_SIZE, px_right))
+    px_top = max(0, min(ATLAS_BAND_SIZE, px_top))
+    px_bottom = max(0, min(ATLAS_BAND_SIZE, px_bottom))
+
+    dest_w = px_right - px_left
+    dest_h = px_bottom - px_top
+    if dest_w <= 0 or dest_h <= 0:
+        return _get_empty_atlas()
+
+    atlas = np.zeros((ATLAS_BAND_SIZE * ATLAS_NUM_BANDS, ATLAS_BAND_SIZE), dtype=np.uint8)
+
+    for band_idx, tilt in enumerate(TILT_ORDER):
+        sgrid = sparse_grids.get(tilt)
+        if sgrid is None:
+            continue
+
+        sub = sgrid[row_start:row_end, col_start:col_end].toarray().astype(np.float32)
+        sub[sub == 0] = np.nan
+
+        encoded = _dbz_to_uint8(sub)
+        resampled = _resample_to_band(encoded, dest_h, dest_w)
+
+        y_off = band_idx * ATLAS_BAND_SIZE
+        atlas[y_off + px_top : y_off + px_bottom, px_left : px_right] = resampled
+
+    if not atlas.any():
+        return _get_empty_atlas()
+
+    buf = io.BytesIO()
+    Image.fromarray(atlas, mode="L").save(buf, format="PNG", compress_level=1)
+    return buf.getvalue()
+
+
+atlas_tile_cache = TileCache(max_size=_TILE_CACHE_MAX)

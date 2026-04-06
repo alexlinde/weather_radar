@@ -9,8 +9,6 @@
   <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 
-  <!-- deck.gl (MapboxOverlay works with MapLibre) -->
-  <script src="https://unpkg.com/deck.gl@9/dist.min.js"></script>
 
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -60,6 +58,28 @@
         min="1" max="10" step="0.5" value="3"
         aria-label="Vertical exaggeration"
       />
+    </div>
+
+    <!-- dBZ cutoff controls -->
+    <div class="control-row" id="row-dbz-cutoff">
+      <div class="control-label">
+        <span>dBZ range</span>
+        <span id="dbz-range-value">5 – 75</span>
+      </div>
+      <div class="dual-range">
+        <input
+          type="range"
+          id="dbz-min-slider"
+          min="-30" max="75" step="5" value="5"
+          aria-label="Minimum dBZ cutoff"
+        />
+        <input
+          type="range"
+          id="dbz-max-slider"
+          min="-30" max="75" step="5" value="75"
+          aria-label="Maximum dBZ cutoff"
+        />
+      </div>
     </div>
 
     <!-- Action buttons -->
@@ -115,6 +135,7 @@
 
   <!-- App scripts -->
   <script src="colors.js"></script>
+  <script src="radar-layer.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -22,6 +22,60 @@ const NWS_DBZ_COLORS = [
 ];
 
 /**
+ * Create a 256-entry RGBA Uint8Array for use as a 256×1 GPU color ramp texture.
+ *
+ * Index maps to the encoded pixel value from the atlas tile.
+ * Encoding: pixel = round((dBZ + 30) * 2), so dBZ = pixel / 2 - 30.
+ * Index 0 is always transparent (no echo).
+ */
+function createColorRampData() {
+  const data = new Uint8Array(256 * 4);
+
+  for (let i = 1; i < 256; i++) {
+    const dbz = i / 2.0 - 30.0;
+    const off = i * 4;
+
+    if (dbz < 5) {
+      // Below display threshold — transparent
+      continue;
+    }
+
+    let r = 0, g = 0, b = 0, matched = false;
+    for (const band of NWS_DBZ_COLORS) {
+      if (dbz >= band.min && dbz < band.max) {
+        // Interpolate within the band for smooth gradients
+        const t = (dbz - band.min) / (band.max - band.min);
+        const nextIdx = NWS_DBZ_COLORS.indexOf(band) + 1;
+        if (nextIdx < NWS_DBZ_COLORS.length) {
+          const next = NWS_DBZ_COLORS[nextIdx];
+          r = Math.round(band.r + (next.r - band.r) * t);
+          g = Math.round(band.g + (next.g - band.g) * t);
+          b = Math.round(band.b + (next.b - band.b) * t);
+        } else {
+          r = band.r; g = band.g; b = band.b;
+        }
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched && dbz >= 75) {
+      r = 200; g = 200; b = 255;
+    }
+
+    if (r || g || b) {
+      const alpha = Math.min(255, Math.max(100, Math.round(100 + (dbz - 10) * (155 / 50))));
+      data[off]     = r;
+      data[off + 1] = g;
+      data[off + 2] = b;
+      data[off + 3] = alpha;
+    }
+  }
+
+  return data;
+}
+
+/**
  * Build the legend DOM entries — call once on page load.
  * @param {HTMLElement} container
  */

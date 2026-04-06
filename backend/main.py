@@ -2,11 +2,11 @@
 FastAPI backend for the Weather Radar viewer.
 
 Endpoints:
-    GET /api/radar/volume/bulk/{z}/{x}/{y}.bin  — all frames' voxels for a tile
-    GET /api/radar/timestamps                   — available timestamps
-    GET /api/radar/refresh                      — force re-seed
-    GET /api/config                             — frontend map config
-    GET /health                                 — cache status
+    GET /api/radar/atlas/{timestamp}/{z}/{x}/{y}.png — atlas tile (8 tilts, grayscale PNG)
+    GET /api/radar/timestamps                        — available timestamps
+    GET /api/radar/refresh                           — force re-seed
+    GET /api/config                                  — frontend map config
+    GET /health                                      — cache status
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import struct
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -79,63 +79,42 @@ app.add_middleware(
 )
 
 
-# ── Bulk voxel tiles (all frames in one response) ────────────────────────────
+# ── Atlas tiles (8 tilts packed into one grayscale PNG) ───────────────────────
 
 
 MAX_FRAMES = 20
 
 
-@app.get("/api/radar/volume/bulk/{z}/{x}/{y}.bin")
-def radar_voxel_bulk(z: int, x: int, y: int):
-    """Serve ALL frames' voxels for a tile coordinate in one binary response.
-
-    Format: [uint16 frame_count][per-frame: existing binary tile format]
-    Each frame block is [uint32 count][float32 positions[3*N]][uint8 colors[4*N]].
-    GZip middleware compresses the response (~80-90% reduction).
-    """
+@app.get("/api/radar/atlas/{timestamp}/{z}/{x}/{y}.png")
+def radar_atlas_tile(timestamp: str, z: int, x: int, y: int):
+    """Serve a 256×2048 grayscale PNG atlas tile with 8 tilt bands."""
     from .cache import tilt_cache
     from .tiles import (
         MAX_ZOOM, MIN_ZOOM,
-        bin_tile_cache, render_voxel_tile_binary,
+        atlas_tile_cache, render_atlas_tile,
     )
-    from . import disk_cache
 
     if z < MIN_ZOOM or z > MAX_ZOOM:
         raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
 
-    entries = disk_cache.list_tilt_grid_timestamps()
-    entries = entries[-MAX_FRAMES:]
+    tilt_entry = tilt_cache.get(timestamp)
+    if tilt_entry is None:
+        raise HTTPException(status_code=404, detail="Timestamp not found")
 
-    if not entries:
-        raise HTTPException(
-            status_code=503,
-            detail="No frames cached yet — server is still seeding",
+    cache_key = (timestamp, z, x, y)
+    cached = atlas_tile_cache.get(cache_key)
+    if cached is None:
+        cached = render_atlas_tile(
+            tilt_entry["grids"], tilt_entry["meta"], z, x, y,
         )
+        atlas_tile_cache.put(cache_key, cached)
 
-    frame_chunks: list[bytes] = []
-    for entry in entries:
-        ts = entry["timestamp"]
-        cache_key = (ts, z, x, y)
-        cached = bin_tile_cache.get(cache_key)
-
-        if cached is None:
-            tilt_entry = tilt_cache.get(ts)
-            if tilt_entry is None:
-                cached = struct.pack("<I", 0)
-            else:
-                cached = render_voxel_tile_binary(
-                    tilt_entry["grids"], tilt_entry["meta"], z, x, y,
-                )
-                bin_tile_cache.put(cache_key, cached)
-
-        frame_chunks.append(cached)
-
-    header = struct.pack("<H", len(frame_chunks))
     return Response(
-        content=header + b"".join(frame_chunks),
-        media_type="application/octet-stream",
-        headers={"Cache-Control": "public, max-age=120"},
+        content=cached,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600, immutable"},
     )
+
 
 
 # ── Timestamps ───────────────────────────────────────────────────────────────
