@@ -1,10 +1,13 @@
 /**
- * NYC Weather Radar — Main application with tile-based radar rendering.
+ * Weather Radar — Main application with tile-based radar rendering.
  *
- * Radar data is served as standard TMS tiles (z/x/y PNG) from the backend.
- * Rendering uses deck.gl TileLayer on top of a MapLibre base map:
- *   - Composite mode: TileLayer → BitmapLayer per tile (2D reflectivity)
- *   - 3D Layers mode: PointCloudLayer (volumetric voxels)
+ * Both 2D composite and 3D voxel modes use deck.gl TileLayer for
+ * viewport-based lazy loading. deck.gl manages tile lifecycle,
+ * request cancellation (AbortSignal), and viewport culling.
+ *
+ * Modes:
+ *   - Composite: TileLayer → BitmapLayer per tile (2D reflectivity PNG)
+ *   - 3D Layers: TileLayer → PointCloudLayer per tile (volumetric voxels)
  */
 
 const API_BASE = window.location.port === '8000'
@@ -15,6 +18,7 @@ const REFRESH_INTERVAL_MS = 120_000;
 const MAX_503_RETRIES = 24;
 const TILE_MIN_ZOOM = 3;
 const TILE_MAX_ZOOM = 8;
+const POINT_SIZE_PX = 3;
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -36,7 +40,7 @@ async function resolveMapStyle() {
 
 // ── Animation state ───────────────────────────────────────────────────────────
 
-let timestamps = [];       // { timestamp, bounds }
+let timestamps = [];
 let currentIndex = 0;
 let playing = false;
 let frameInterval = 500;
@@ -46,7 +50,6 @@ let mapRef = null;
 let userOpacity = 0.8;
 let fetchAbort = null;
 let timestampFetchRetries = 0;
-let volumeFetchRetries = 0;
 let refreshIntervalId = null;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -121,7 +124,7 @@ async function fetchTimestamps() {
   }
 }
 
-// ── Radar tile layer (deck.gl TileLayer) ──────────────────────────────────────
+// ── 2D Composite tile layer ──────────────────────────────────────────────────
 
 function buildTileLayer(timestamp) {
   const tileUrl = `${API_BASE}/api/radar/tiles/${encodeURIComponent(timestamp)}/{z}/{x}/{y}.png`;
@@ -148,6 +151,64 @@ function buildTileLayer(timestamp) {
   });
 }
 
+// ── 3D Voxel tile layer ─────────────────────────────────────────────────────
+
+let deckOverlay = null;
+let viewMode = 'composite';
+let verticalExaggeration = 3.0;
+
+function dbzToRgba(dbz) {
+  const bands = NWS_DBZ_COLORS;
+  const alpha = Math.min(255, Math.max(100, Math.round(100 + (dbz - 10) * (155 / 50))));
+  for (const band of bands) {
+    if (dbz >= band.min && dbz < band.max) return [band.r, band.g, band.b, alpha];
+  }
+  if (dbz >= 65) return [200, 200, 255, 255];
+  return [0, 0, 0, 0];
+}
+
+function buildVoxelTileLayer(timestamp) {
+  const exag = verticalExaggeration;
+  return new deck.TileLayer({
+    id: 'radar-volume-tiles',
+    minZoom: TILE_MIN_ZOOM,
+    maxZoom: TILE_MAX_ZOOM,
+    tileSize: 256,
+    getTileData: (tile) => {
+      const { x, y, z } = tile.index;
+      const url = `${API_BASE}/api/radar/volume/tiles/${encodeURIComponent(timestamp)}/${z}/${x}/${y}.json`;
+      return fetch(url, { signal: tile.signal, cache: 'force-cache' })
+        .then(res => {
+          if (!res.ok) return null;
+          return res.json();
+        })
+        .catch(err => {
+          if (err.name === 'AbortError') return null;
+          console.warn('Voxel tile fetch error:', err);
+          return null;
+        });
+    },
+    renderSubLayers: props => {
+      if (!props.data?.voxels?.length) return null;
+      return new deck.PointCloudLayer({
+        ...props,
+        id: `${props.id}-points`,
+        data: props.data.voxels,
+        getPosition: d => [d[0], d[1], d[2] * exag],
+        getColor: d => dbzToRgba(d[3]),
+        pointSize: POINT_SIZE_PX,
+        sizeUnits: 'pixels',
+        opacity: 0.9,
+        pickable: false,
+        material: false,
+        parameters: { depthTest: true },
+      });
+    },
+  });
+}
+
+// ── Frame display ────────────────────────────────────────────────────────────
+
 function showFrame(index) {
   if (!mapRef || !deckOverlay || timestamps.length === 0) return;
   const ts = timestamps[index];
@@ -156,7 +217,7 @@ function showFrame(index) {
   if (viewMode === 'composite') {
     deckOverlay.setProps({ layers: [buildTileLayer(ts.timestamp)] });
   } else {
-    showVolumeFrame(index);
+    deckOverlay.setProps({ layers: [buildVoxelTileLayer(ts.timestamp)] });
   }
 }
 
@@ -218,85 +279,9 @@ function updateFrameDisplay() {
   counterEl.textContent = timestamps.length > 0 ? `${currentIndex + 1}/${timestamps.length}` : '0/0';
 }
 
-// ── 3D Volume (deck.gl) ───────────────────────────────────────────────────────
+// ── View mode toggle ──────────────────────────────────────────────────────────
 
-let deckOverlay = null;
-let viewMode = 'composite'; // 'composite' | '3d'
-let verticalExaggeration = 3.0;
-let volumeFrames = [];
-const POINT_SIZE_PX = 3;
-
-function dbzToRgba(dbz) {
-  const bands = NWS_DBZ_COLORS;
-  const alpha = Math.min(255, Math.max(100, Math.round(100 + (dbz - 10) * (155 / 50))));
-  for (const band of bands) {
-    if (dbz >= band.min && dbz < band.max) return [band.r, band.g, band.b, alpha];
-  }
-  if (dbz >= 65) return [200, 200, 255, 255];
-  return [0, 0, 0, 0];
-}
-
-function buildPointCloudLayer(voxels, exaggeration) {
-  return new deck.PointCloudLayer({
-    id: 'radar-volume',
-    data: voxels,
-    getPosition: d => [d[0], d[1], d[2] * exaggeration],
-    getColor: d => dbzToRgba(d[3]),
-    pointSize: POINT_SIZE_PX,
-    sizeUnits: 'pixels',
-    opacity: 0.9,
-    pickable: false,
-    material: false,
-    parameters: { depthTest: true },
-  });
-}
-
-function showVolumeFrame(index) {
-  if (viewMode !== '3d' || !deckOverlay || volumeFrames.length === 0) return;
-  const vf = volumeFrames[Math.min(index, volumeFrames.length - 1)];
-  if (!vf) return;
-  deckOverlay.setProps({ layers: [buildPointCloudLayer(vf.voxels, verticalExaggeration)] });
-}
-
-async function fetchVolumeFrames() {
-  if (viewMode !== '3d' || !deckOverlay) return;
-  document.getElementById('volume-status').textContent = 'Loading…';
-  try {
-    const resp = await fetch(
-      `${API_BASE}/api/radar/volume/frames?count=${FRAME_COUNT}`,
-      { cache: 'no-store' },
-    );
-    if (resp.status === 503) {
-      volumeFetchRetries++;
-      if (volumeFetchRetries < MAX_503_RETRIES) {
-        document.getElementById('volume-status').textContent = 'Seeding…';
-        setTimeout(fetchVolumeFrames, 10_000);
-      } else {
-        document.getElementById('volume-status').textContent = 'Unavailable';
-      }
-      return;
-    }
-    volumeFetchRetries = 0;
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    volumeFrames = data.frames;
-    const totalVoxels = data.frames.reduce((s, f) => s + f.voxels.length, 0);
-    document.getElementById('volume-status').textContent =
-      `${data.count} frames · ${(totalVoxels / 1000).toFixed(0)}K pts`;
-    showVolumeFrame(currentIndex);
-  } catch (err) {
-    console.error('Volume frames fetch error:', err);
-    document.getElementById('volume-status').textContent = 'Error';
-  }
-}
-
-function clearVolumeLayer() {
-  volumeFrames = [];
-  if (deckOverlay) deckOverlay.setProps({ layers: [] });
-  document.getElementById('volume-status').textContent = '';
-}
-
-async function setViewMode(mode) {
+function setViewMode(mode) {
   if (mode === viewMode) return;
   viewMode = mode;
 
@@ -312,13 +297,12 @@ async function setViewMode(mode) {
   if (mode === 'composite') {
     map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
     rowExag.style.display = 'none';
-    volumeFrames = [];
-    showFrame(currentIndex);
   } else {
     map.easeTo({ pitch: 50, duration: 600 });
     rowExag.style.display = '';
-    await fetchVolumeFrames();
   }
+
+  showFrame(currentIndex);
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -329,8 +313,8 @@ async function init() {
   const map = new maplibregl.Map({
     container: 'map',
     style: styleUrl,
-    center: [-73.98, 40.75],
-    zoom: 10,
+    center: [-98.5, 39.8],
+    zoom: 4,
     pitch: 0,
     bearing: 0,
     attributionControl: true,
@@ -363,7 +347,6 @@ async function init() {
       if (wasPlaying) pause();
       await fetchTimestamps();
       if (wasPlaying && timestamps.length >= 2) play();
-      if (viewMode === '3d') await fetchVolumeFrames();
     }, REFRESH_INTERVAL_MS);
   });
 
@@ -410,7 +393,7 @@ async function init() {
   document.getElementById('exag-slider').addEventListener('input', (e) => {
     verticalExaggeration = parseFloat(e.target.value);
     document.getElementById('exag-value').textContent = `${verticalExaggeration}x`;
-    if (viewMode === '3d') showVolumeFrame(currentIndex);
+    if (viewMode === '3d') showFrame(currentIndex);
   });
 
   // ── Refresh button ──────────────────────────────────────────────────────
@@ -420,14 +403,13 @@ async function init() {
     if (wasPlaying) pause();
     await fetchTimestamps();
     if (wasPlaying && timestamps.length >= 2) play();
-    if (viewMode === '3d') await fetchVolumeFrames();
   });
 
   // ── Reset view ──────────────────────────────────────────────────────────
 
   document.getElementById('btn-reset-view').addEventListener('click', () => {
     const pitch = viewMode === '3d' ? 50 : 0;
-    map.flyTo({ center: [-73.98, 40.75], zoom: 10, pitch, bearing: 0, duration: 800 });
+    map.flyTo({ center: [-98.5, 39.8], zoom: 4, pitch, bearing: 0, duration: 800 });
   });
 
   // ── Legend ──────────────────────────────────────────────────────────────

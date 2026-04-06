@@ -1,12 +1,10 @@
 """
-TMS tile rendering for CONUS radar composites.
+TMS tile rendering for CONUS radar data (2D composites and 3D voxel tiles).
 
-Converts slippy-map tile coordinates (z/x/y) to geographic bounds,
-extracts the corresponding region from a CONUS composite grid,
-colorizes with the NWS reflectivity scale, and returns a 256x256 PNG.
+2D tiles: extract subgrid from composite → colorize → 256x256 PNG.
+3D tiles: extract subregion from each tilt → downsample → filter → voxel JSON.
 
-Tiles follow the standard {z}/{x}/{y} convention used by Leaflet,
-MapLibre, OpenLayers, and other map clients.
+Both tile types follow the standard {z}/{x}/{y} convention.
 """
 
 from __future__ import annotations
@@ -15,8 +13,10 @@ import io
 import math
 import threading
 from collections import OrderedDict
+from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
 from PIL import Image
 
 from .render import colorize_grid
@@ -25,6 +25,18 @@ TILE_SIZE = 256
 MIN_ZOOM = 3
 MAX_ZOOM = 8
 _TILE_CACHE_MAX = 2000
+_VOXEL_TILE_CACHE_MAX = 2000
+
+TILT_TO_HEIGHT_KM: dict[str, float] = {
+    "00.50": 1.0,
+    "01.50": 2.0,
+    "02.50": 3.5,
+    "03.50": 5.0,
+    "05.00": 7.0,
+    "07.00": 9.0,
+    "10.00": 12.0,
+    "14.00": 15.0,
+}
 
 
 # ── Tile math ────────────────────────────────────────────────────────────────
@@ -38,6 +50,41 @@ def tile_bounds(z: int, x: int, y: int) -> dict[str, float]:
     lat_max = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n))))
     lat_min = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * (y + 1) / n))))
     return {"north": lat_max, "south": lat_min, "west": lon_min, "east": lon_max}
+
+
+def _grid_overlap(
+    tb: dict[str, float], meta: dict[str, Any]
+) -> tuple[int, int, int, int] | None:
+    """Compute grid row/col slice indices for the overlap between tile and grid bounds.
+
+    Returns (row_start, row_end, col_start, col_end) or None if no overlap.
+    """
+    grid_n = meta["north"]
+    grid_s = meta["south"]
+    grid_w = meta["west"]
+    grid_e = meta["east"]
+    Dj = meta["Dj"]
+    Di = meta["Di"]
+
+    overlap_n = min(tb["north"], grid_n)
+    overlap_s = max(tb["south"], grid_s)
+    overlap_w = max(tb["west"], grid_w)
+    overlap_e = min(tb["east"], grid_e)
+
+    if overlap_n <= overlap_s or overlap_e <= overlap_w:
+        return None
+
+    Nj = int(meta["Nj"])
+    Ni = int(meta["Ni"])
+    row_start = max(0, int(round((grid_n - overlap_n) / Dj)))
+    row_end = min(Nj, int(round((grid_n - overlap_s) / Dj)))
+    col_start = max(0, int(round((overlap_w - grid_w) / Di)))
+    col_end = min(Ni, int(round((overlap_e - grid_w) / Di)))
+
+    if row_start >= row_end or col_start >= col_end:
+        return None
+
+    return row_start, row_end, col_start, col_end
 
 
 # ── Pre-computed transparent tile ────────────────────────────────────────────
@@ -57,7 +104,7 @@ def _get_transparent_tile() -> bytes:
     return _TRANSPARENT_TILE
 
 
-# ── Tile renderer ────────────────────────────────────────────────────────────
+# ── 2D tile renderer ─────────────────────────────────────────────────────────
 
 
 def render_tile(
@@ -67,40 +114,26 @@ def render_tile(
     x: int,
     y: int,
 ) -> bytes:
-    """Render a 256x256 PNG tile from a CONUS composite grid.
-
-    Returns a transparent PNG when the tile falls entirely outside the grid.
-    Handles partial overlap (grid covers only part of the tile).
-    """
+    """Render a 256x256 PNG tile from a CONUS composite grid."""
     tb = tile_bounds(z, x, y)
-
-    grid_n = metadata["north"]
-    grid_s = metadata["south"]
-    grid_w = metadata["west"]
-    grid_e = metadata["east"]
-    Dj = metadata["Dj"]
-    Di = metadata["Di"]
-
-    overlap_n = min(tb["north"], grid_n)
-    overlap_s = max(tb["south"], grid_s)
-    overlap_w = max(tb["west"], grid_w)
-    overlap_e = min(tb["east"], grid_e)
-
-    if overlap_n <= overlap_s or overlap_e <= overlap_w:
+    overlap = _grid_overlap(tb, metadata)
+    if overlap is None:
         return _get_transparent_tile()
 
-    row_start = max(0, int(round((grid_n - overlap_n) / Dj)))
-    row_end = min(grid.shape[0], int(round((grid_n - overlap_s) / Dj)))
-    col_start = max(0, int(round((overlap_w - grid_w) / Di)))
-    col_end = min(grid.shape[1], int(round((overlap_e - grid_w) / Di)))
-
-    if row_start >= row_end or col_start >= col_end:
-        return _get_transparent_tile()
-
+    row_start, row_end, col_start, col_end = overlap
     subgrid = grid[row_start:row_end, col_start:col_end]
 
     tile_lon_span = tb["east"] - tb["west"]
     tile_lat_span = tb["north"] - tb["south"]
+    Di = metadata["Di"]
+    Dj = metadata["Dj"]
+    grid_n = metadata["north"]
+    grid_w = metadata["west"]
+
+    overlap_n = grid_n - row_start * Dj
+    overlap_s = grid_n - row_end * Dj
+    overlap_w = grid_w + col_start * Di
+    overlap_e = grid_w + col_end * Di
 
     px_left = int(round((overlap_w - tb["west"]) / tile_lon_span * TILE_SIZE))
     px_right = int(round((overlap_e - tb["west"]) / tile_lon_span * TILE_SIZE))
@@ -132,11 +165,77 @@ def render_tile(
     return buf.read()
 
 
-# ── Tile cache ───────────────────────────────────────────────────────────────
+# ── 3D voxel tile renderer ──────────────────────────────────────────────────
+
+
+def _downsample_step(z: int) -> int:
+    """Spatial downsample factor based on zoom level.
+
+    At low zoom (CONUS view), skip grid cells to keep voxel counts manageable.
+    """
+    return max(1, 2 ** (6 - z))
+
+
+def render_voxel_tile(
+    sparse_grids: dict[str, sp.csr_matrix],
+    metadata: dict,
+    z: int,
+    x: int,
+    y: int,
+    min_dbz: float = 10.0,
+) -> list[list[float]]:
+    """Extract voxels from all tilt levels for a tile region.
+
+    Returns list of [lon, lat, altitude_m, dbz].
+    """
+    tb = tile_bounds(z, x, y)
+    overlap = _grid_overlap(tb, metadata)
+    if overlap is None:
+        return []
+
+    row_start, row_end, col_start, col_end = overlap
+    step = _downsample_step(z)
+    grid_n = metadata["north"]
+    grid_w = metadata["west"]
+    Dj = metadata["Dj"]
+    Di = metadata["Di"]
+
+    all_voxels: list[np.ndarray] = []
+
+    for tilt, sgrid in sparse_grids.items():
+        height_km = TILT_TO_HEIGHT_KM.get(tilt)
+        if height_km is None:
+            continue
+        height_m = height_km * 1000.0
+
+        sub = sgrid[row_start:row_end, col_start:col_end].toarray()
+        if step > 1:
+            sub = sub[::step, ::step]
+
+        sub[sub == 0] = np.nan
+        mask = (~np.isnan(sub)) & (sub >= min_dbz)
+        rows, cols = np.where(mask)
+        if len(rows) == 0:
+            continue
+
+        lons = np.round(grid_w + (col_start + cols * step) * Di + Di / 2, 5)
+        lats = np.round(grid_n - (row_start + rows * step) * Dj - Dj / 2, 5)
+        alts = np.full(len(rows), height_m)
+        dbz = np.round(sub[rows, cols], 1)
+
+        all_voxels.append(np.column_stack([lons, lats, alts, dbz]))
+
+    if not all_voxels:
+        return []
+
+    return np.vstack(all_voxels).tolist()
+
+
+# ── Tile caches ──────────────────────────────────────────────────────────────
 
 
 class TileCache:
-    """Thread-safe LRU cache for rendered tile PNGs."""
+    """Thread-safe LRU cache for rendered tile data (PNG bytes or JSON bytes)."""
 
     def __init__(self, max_size: int = _TILE_CACHE_MAX) -> None:
         self._max = max_size
@@ -165,3 +264,4 @@ class TileCache:
 
 
 tile_cache = TileCache()
+voxel_tile_cache = TileCache(max_size=_VOXEL_TILE_CACHE_MAX)

@@ -1,8 +1,8 @@
-# CLAUDE.md — NYC Weather Radar Prototype
+# CLAUDE.md — Weather Radar Prototype
 
 ## What we're building
 
-A web-based weather radar viewer that pulls live MRMS (Multi-Radar Multi-Sensor) data from NOAA's public AWS bucket and renders it over a map of New York City. The goal is to show real radar data the way a meteorologist would see it — full reflectivity at multiple vertical levels, with smooth animation — on top of a base map that gives geographic context (terrain, water, urban areas).
+A web-based weather radar viewer that pulls live MRMS (Multi-Radar Multi-Sensor) data from NOAA's public AWS bucket and renders it over a map of the continental US (CONUS). The goal is to show real radar data the way a meteorologist would see it — full reflectivity at multiple vertical levels, with smooth animation — on top of a base map that gives geographic context (terrain, water, urban areas).
 
 This is a working prototype, not a production app. Prioritise getting real data on screen over polish.
 
@@ -11,10 +11,10 @@ This is a working prototype, not a production app. Prioritise getting real data 
 **Phase 1 (data on screen): COMPLETE**
 **Phase 2 (time animation): COMPLETE**
 **Phase 3 (3D terrain + vertical levels): COMPLETE**
-**Phase 3.5 (CONUS tile serving): COMPLETE**
+**Phase 3.5 (CONUS tile serving — 2D and 3D): COMPLETE**
 **Phase 4 (motion-compensated interpolation): NOT STARTED**
 
-The app fetches 60 frames of tilt-level reflectivity data across 8 vertical levels, derives CONUS-wide 2D composites and NYC-region 3D voxel volumes. 2D composites are served as standard TMS tiles (`{z}/{x}/{y}.png`) — any map client can consume them. The frontend uses deck.gl TileLayer for viewport-based lazy tile loading over a MapLibre base map with 3D terrain. Animation plays through ~2 hours of history with play/pause, scrubber, and speed controls. A toggle switches between 2D composite tiles and 3D point cloud views.
+The app fetches 60 frames of tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). Both 2D composites and 3D voxel tiles are served on-demand as standard TMS tiles. The frontend uses deck.gl TileLayer for viewport-based lazy tile loading over a MapLibre base map with 3D terrain, starting at a CONUS-wide view. Animation plays through ~2 hours of history with play/pause, scrubber, and speed controls. A toggle switches between 2D composite tiles and 3D volumetric voxel tiles — both use the same tile-based architecture with deck.gl's built-in AbortSignal request cancellation.
 
 ## Architecture
 
@@ -22,7 +22,7 @@ The app fetches 60 frames of tilt-level reflectivity data across 8 vertical leve
 ┌─────────────────┐      ┌──────────────────────┐      ┌────────────────────┐
 │  NOAA S3 Bucket  │─────▶│  Python Backend       │─────▶│  Browser Frontend   │
 │  noaa-mrms-pds   │      │  (FastAPI)             │      │  (MapLibre + deck.gl)│
-│  Public, no auth │      │  Fetch, decode, clip   │      │  Map + radar overlay │
+│  Public, no auth │      │  Fetch, decode, sparse │      │  Map + radar overlay │
 └─────────────────┘      └──────────────────────┘      └────────────────────┘
 ```
 
@@ -31,11 +31,11 @@ The app fetches 60 frames of tilt-level reflectivity data across 8 vertical leve
 Responsibilities:
 - Fetch MRMS tilt-level GRIB2 files from S3 across 8 elevation angles
 - Decode with custom minimal GRIB2 decoder (no eccodes dependency)
-- Derive CONUS-wide 2D composite via `nanmax` across tilt levels
-- Serve composites as standard TMS tiles (`/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png`)
-- On-demand tile rendering: extract grid region → resize to 256×256 → NWS colorize → PNG
-- Clip to NYC bounding box for 3D voxel volumes (deck.gl PointCloudLayer)
-- Three-tier caching: rendered tile LRU + in-memory composite LRU + on-disk compressed composites + raw S3 cache
+- Convert to scipy.sparse CSR matrices (95-99% of grid is NaN/sentinel → 20x memory reduction)
+- Serve 2D composite tiles (`/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png`) — composite derived lazily via `np.fmax` across tilt grids
+- Serve 3D voxel tiles (`/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json`) — zoom-based spatial downsampling keeps voxel counts manageable
+- Two-tier caching: ConusTiltCache (sparse LRU, ~20 entries, ~780 MB) + rendered tile LRUs (PNG + JSON, 2000 entries each)
+- GZip middleware compresses JSON voxel tiles (~87% reduction)
 - Background seeding on startup (60 frames across all tilts)
 
 ### Frontend (HTML + JS)
@@ -43,10 +43,13 @@ Responsibilities:
 Responsibilities:
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
 - 3D terrain via AWS elevation tiles (always enabled)
-- Overlay radar tiles using deck.gl TileLayer → BitmapLayer per tile (2D composite mode)
-- Overlay voxels using deck.gl PointCloudLayer (3D mode)
-- Viewport-based lazy tile loading — only visible tiles are fetched
-- View mode toggle: Composite (2D tiles) vs 3D Layers (volumetric points)
+- Overlay 2D radar tiles using deck.gl TileLayer → BitmapLayer per tile
+- Overlay 3D radar voxels using deck.gl TileLayer → PointCloudLayer per tile
+- Both modes use viewport-based lazy loading — only visible tiles are fetched
+- deck.gl AbortSignal cancels in-flight requests when tiles leave viewport or frame changes
+- Browser HTTP cache (`Cache-Control: immutable` + `force-cache`) makes revisited frames instant
+- Default CONUS view at z=4, user zooms in to area of interest
+- View mode toggle: Composite (2D) vs 3D Layers (volumetric)
 - Time animation with 60 frames, play/pause, scrubber, speed control
 - Opacity slider, vertical exaggeration slider (3D mode)
 - NWS reflectivity color scale legend
@@ -81,7 +84,7 @@ TILT_TO_HEIGHT_KM = {
 }
 ```
 
-The 2D composite is derived via `nanmax` across all tilt grids at each grid point — equivalent to the pre-computed `MergedReflectivityQCComposite` product, but we get 3D for free.
+The 2D composite is derived via `np.fmax` across all tilt grids at each grid point — equivalent to the pre-computed `MergedReflectivityQCComposite` product, but we get 3D for free.
 
 ### File naming convention
 ```
@@ -105,16 +108,6 @@ for page in paginator.paginate(Bucket='noaa-mrms-pds', Prefix=prefix):
     for obj in page.get('Contents', []):
         print(obj['Key'])
 ```
-
-### NYC bounding box (used for 3D voxels and legacy endpoints)
-```
-North: 42.0
-South: 39.44
-East:  -72.67
-West:  -75.23
-```
-
-This is larger than the original plan — covers NYC, most of NJ, Long Island, the Hudson Valley, and parts of CT. Used for the 3D voxel pipeline and legacy single-frame endpoints. The 2D tile serving uses the full CONUS grid without clipping.
 
 ## Base Map
 
@@ -140,8 +133,8 @@ map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
 
 ### Map initial view
 ```javascript
-center: [-73.98, 40.75],  // Midtown Manhattan
-zoom: 10,                  // Shows all 5 boroughs + surroundings
+center: [-98.5, 39.8],    // Center of CONUS
+zoom: 4,                   // Shows full continental US
 pitch: 0,                  // Flat in composite mode; 50° in 3D mode
 bearing: 0
 ```
@@ -151,7 +144,8 @@ bearing: 0
 ### Backend
 - **Python 3.11+**
 - **FastAPI** — API server
-- **numpy** — array operations, clipping, voxel computation
+- **numpy** — array operations
+- **scipy** — sparse matrix storage (CSR format, 20x memory reduction for MRMS data)
 - **boto3** — S3 access (unsigned requests, no credentials needed)
 - **Pillow** — PNG rendering + JPEG2000 decoding (ships with openjpeg)
 - **uvicorn** — ASGI server
@@ -161,7 +155,7 @@ No eccodes, no cfgrib, no system-level C dependencies.
 
 ### Frontend
 - **MapLibre GL JS** (~v4) — base map + 3D terrain
-- **deck.gl** (~v9) — BitmapLayer (2D), PointCloudLayer (3D), MapboxOverlay integration
+- **deck.gl** (~v9) — TileLayer (both 2D and 3D), BitmapLayer, PointCloudLayer, MapboxOverlay
 - **Vanilla JS** — no framework, no build step
 
 Loaded from CDN:
@@ -175,61 +169,71 @@ Loaded from CDN:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png` | GET | **Primary.** Standard TMS tile for a given timestamp and tile coords. z=3–8. |
-| `/api/radar/timestamps` | GET | **Primary.** List of available timestamps with bounds (for tile URL construction). |
-| `/api/radar/latest` | GET | Latest clipped NYC radar as JSON (grid + metadata) — legacy |
-| `/api/radar/image` | GET | Latest radar as PNG with NWS color scale — legacy |
-| `/api/radar/frames?count=60` | GET | Recent frames as base64 PNGs, oldest-first — legacy |
-| `/api/radar/volume` | GET | Latest multi-level snapshot as voxel data |
-| `/api/radar/volume/frames?count=60` | GET | Recent volume frames as pre-computed voxels |
-| `/api/radar/refresh` | GET | Force cache invalidation + re-seed |
-| `/api/config` | GET | Frontend configuration (map tile API keys) |
-| `/health` | GET | Cache status (frame counts) |
+| `/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png` | GET | 2D composite TMS tile. z=3–8. |
+| `/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json` | GET | 3D voxel tile (JSON array of `[lon, lat, alt_m, dbz]`). z=3–8. Zoom-based downsampling. |
+| `/api/radar/timestamps` | GET | Available timestamps with bounds (for tile URL construction). |
+| `/api/radar/refresh` | GET | Force cache invalidation + re-seed. |
+| `/api/config` | GET | Frontend configuration (map tile API keys). |
+| `/health` | GET | Cache status (in-memory + on-disk counts). |
 
-The `/timestamps` and `/volume/frames` endpoints return 503 while the server is still seeding on startup. The frontend retries automatically (up to ~2 minutes).
+The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes).
 
-Tile responses include `Cache-Control: public, max-age=3600, immutable` — radar tiles are immutable once generated, so the browser caches them aggressively. This makes animation scrubbing through previously visited frames nearly instant.
+Both tile types include `Cache-Control: public, max-age=3600, immutable` — radar tiles are immutable once generated, so the browser caches them aggressively. Combined with `cache: 'force-cache'` on the frontend fetch, animation scrubbing through previously visited frames is nearly instant.
 
 ## Data Pipeline (`pipeline.py`)
 
-The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, derive both 2D and 3D outputs.**
+The pipeline is the core orchestration layer. It operates on a single principle: **fetch tilt-level data once, store as sparse matrices, derive everything else on demand.**
 
 ### Seed flow (startup)
 
 1. List the 60 most recent `00.50` tilt keys from S3
 2. For each timestamp, derive S3 keys for all 8 tilt levels
 3. Fetch each tilt in parallel (ThreadPoolExecutor, 8 workers)
-4. If CONUS composite not already on disk for this timestamp:
-   - Decode each tilt to full CONUS grid (no clip)
-   - Compute `nanmax` across all tilts → CONUS composite
-   - Save CONUS composite to `data/composites/` (compressed `.npz` + `.json`)
-   - Also clip each tilt to NYC and cache in `data/decoded/`
-5. If CONUS composite already on disk: use NYC decoded cache for voxels only
-6. Compute voxels from NYC-clipped tilt grids → `volume_cache`
-7. Compute NYC composite → `composite_cache` (legacy endpoints)
+4. Decode GRIB2 → mask sentinels (< -30 → NaN) → convert to scipy.sparse CSR (NaN → implicit zero)
+5. Save sparse tilt grids to `data/tilt_grids/{YYYYMMDD-HHMMSS}/` (8 `.npz` + `meta.json`)
+6. Populate in-memory `ConusTiltCache` LRU
+
+No pre-computation of composites or voxels — these are derived per-tile on request.
 
 ### Caching architecture
 
-**Tile cache (`tiles.py`):**
-- `TileCache` — thread-safe LRU, max 2000 entries, keyed by `(timestamp, z, x, y)` → PNG bytes
-- ~20 MB typical memory usage
+**ConusTiltCache (`cache.py`):**
+- Single unified LRU for all tile serving (both 2D and 3D)
+- Key: timestamp string → Value: dict of 8 sparse CSR matrices + metadata + lazy composite
+- Max 20 entries (~780 MB: 20 timestamps × 39 MB sparse per timestamp)
+- Falls back to `disk_cache.get_tilt_grids()` on miss (33ms disk load)
+- 2D composite derived lazily via `np.fmax` across tilt grids (~80ms, cached in entry)
 
-**CONUS composite cache (`cache.py` + `disk_cache.py`):**
-- `ConusCompositeCache` — in-memory LRU of 5 loaded numpy arrays (~500 MB peak)
-- Falls back to `disk_cache.get_composite()` on miss
-- Disk: `data/composites/{YYYYMMDD-HHMMSS}.npz` + `.json` (~2–5 MB compressed per frame)
-
-**NYC caches (`cache.py`):**
-- `BoundedCache` — thread-safe OrderedDict with max 70 entries, oldest-first eviction
-- `composite_cache` — keyed by S3 ref_key, stores `FrameEntry(metadata, grid)` — used by legacy endpoints
-- `volume_cache` — keyed by ISO timestamp, stores voxel lists — used by 3D mode
+**Tile caches (`tiles.py`):**
+- `tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → PNG bytes
+- `voxel_tile_cache` — thread-safe LRU, max 2000, keyed by `(timestamp, z, x, y)` → JSON bytes
 
 **On-disk (`disk_cache.py`):**
-- `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3
-- `data/decoded/{tilt}/` — `.npy` + `.json` per NYC-clipped decoded frame
-- `data/composites/` — compressed CONUS composite grids (`.npz` + `.json`)
+- `data/raw/{tilt}/` — raw `.grib2.gz` bytes from S3 (~0.5 MB each)
+- `data/tilt_grids/{YYYYMMDD-HHMMSS}/` — sparse CSR `.npz` per tilt + `meta.json` (~5.4 MB per timestamp)
 - 24-hour eviction on startup
-- Legacy cache migration from flat layout to per-tilt layout
+
+### Sparse storage rationale
+
+MRMS data is extremely sparse: 95-99.3% of grid cells are NaN/sentinel after masking. scipy.sparse CSR exploits this:
+- Memory: 39 MB per timestamp (vs 784 MB dense) — **20x reduction**
+- Disk: 5.4 MB per timestamp (60 frames = 324 MB)
+- Disk load: 33ms (vs 295ms for dense compressed npz)
+- Disk save: 1.2s per timestamp during seeding
+
+This allows the LRU to hold 20 timestamps (~780 MB) rather than just 3 (which would be 2.4 GB dense).
+
+### 3D voxel tile zoom-based downsampling
+
+At CONUS zoom (z=3-4), full-resolution voxel tiles would contain millions of points. The downsample step `max(1, 2^(6-z))` keeps counts manageable:
+
+| Zoom | Step | Voxels/tile | JSON size |
+|------|------|-------------|-----------|
+| z=3 | 8 | ~3,700 | ~120 KB |
+| z=5 | 2 | ~39,000 | ~1,255 KB |
+| z=8 | 1 | ~1,100 | ~36 KB |
+
+GZip middleware compresses JSON by ~87% over the wire.
 
 ## Custom GRIB2 Decoder
 
@@ -369,13 +373,15 @@ The -30 dBZ threshold preserves legitimate weak reflectivity values while catchi
 - **Day boundary spanning.** List files from today, yesterday, and 2 days ago to handle UTC boundaries.
 - **Coordinate system.** MRMS uses lat/lon on a regular 0.01° grid. MapLibre handles EPSG:4326.
 - **Data freshness.** Files appear in S3 with ~2-3 min latency. The latest file may be 2-5 min old.
-- **File size.** A single CONUS tilt frame is ~2-3 MB compressed. The NYC clip is a few KB.
+- **File size.** A single CONUS tilt frame is ~0.5 MB compressed (.grib2.gz). The full CONUS grid is 3500×7000 at 0.01° resolution.
+- **Data sparsity.** 95-99% of CONUS grid cells are NaN/sentinel. This is why scipy.sparse is so effective.
 - **CORS.** S3 bucket does not serve CORS headers. All data flows through the backend.
 - **No credentials.** S3 access uses unsigned requests (`botocore.UNSIGNED`).
 - **Terrain tiles.** AWS `elevation-tiles-prod` is public and free.
 - **Scanning direction.** MRMS grids scan left→right, top→bottom (NW corner first). The decoder checks scanning mode flags and flips the array if needed.
 - **Startup time.** Seeding 60 frames across 8 tilt levels (480 files) takes 1-2 minutes. The server starts accepting requests immediately; the frontend retries on 503.
-- **Thread safety.** `BoundedCache` uses `threading.Lock`. Seeding runs in a daemon thread. Pipeline uses `ThreadPoolExecutor` for concurrent S3 fetches.
+- **Thread safety.** `ConusTiltCache` uses `threading.Lock`. Seeding runs in a daemon thread. Pipeline uses `ThreadPoolExecutor` for concurrent S3 fetches.
+- **Sparse zero = NaN.** When converting to CSR, NaN becomes implicit zero. When reading back for rendering, explicit zeros are treated as NaN (no echo). This is valid because dBZ < -30 is already masked.
 
 ## File Structure
 
@@ -386,14 +392,14 @@ weather_radar/
 ├── .env.example           ← template for .env
 ├── .gitignore
 ├── backend/
-│   ├── requirements.txt   ← production dependencies
+│   ├── requirements.txt   ← production dependencies (includes scipy)
 │   ├── requirements-dev.txt ← dev/test dependencies
-│   ├── main.py            ← FastAPI app, routes, lifespan
-│   ├── pipeline.py        ← data pipeline: fetch tilts → CONUS composite + NYC voxels
-│   ├── tiles.py           ← TMS tile math, rendering, and LRU tile cache
-│   ├── mrms.py            ← S3 client, GRIB2 decode, clip to bbox
-│   ├── cache.py           ← BoundedCache + ConusCompositeCache (in-memory, thread-safe)
-│   ├── disk_cache.py      ← on-disk raw + decoded + composite cache
+│   ├── main.py            ← FastAPI app, routes (2D tiles, 3D voxel tiles, timestamps)
+│   ├── pipeline.py        ← data pipeline: fetch tilts → sparse CSR → disk + LRU
+│   ├── tiles.py           ← TMS tile math, 2D render, 3D voxel render, tile caches
+│   ├── mrms.py            ← S3 client, file listing, download
+│   ├── cache.py           ← ConusTiltCache (unified sparse LRU with lazy composite)
+│   ├── disk_cache.py      ← on-disk raw + sparse tilt grid cache
 │   ├── render.py          ← NWS color scale: colorize_grid() + grid_to_png()
 │   └── grib2/
 │       ├── __init__.py
@@ -404,18 +410,22 @@ weather_radar/
 ├── frontend/
 │   ├── index.html         ← single-page app
 │   ├── style.css          ← dark theme, glassmorphism panels
-│   ├── app.js             ← map init, animation, 2D/3D rendering
+│   ├── app.js             ← map init, animation, 2D tiles + 3D voxel tiles
 │   └── colors.js          ← NWS color scale + legend builder
 ├── tests/
 │   ├── __init__.py
 │   ├── fixtures/          ← real MRMS .grib2.gz file (gitignored)
-│   └── test_decoder.py    ← shape, bounds, value range, clip tests
+│   └── test_decoder.py    ← shape, bounds, value range tests
 ├── scripts/
 │   └── test_fetch.py      ← standalone download + decode diagnostic
 └── data/                  ← runtime cache (gitignored)
     ├── raw/{tilt}/        ← raw .grib2.gz files from S3
-    ├── decoded/{tilt}/    ← .npy + .json per NYC-clipped decoded frame
-    └── composites/        ← .npz + .json per CONUS composite (for tile serving)
+    └── tilt_grids/        ← sparse CSR per tilt + metadata per timestamp
+        └── {YYYYMMDD-HHMMSS}/
+            ├── meta.json
+            ├── 00.50.npz
+            ├── 01.50.npz
+            └── ...
 ```
 
 ## Running
@@ -455,7 +465,7 @@ python -m pytest tests/test_decoder.py -v
 9. **Backend: Compute motion fields**
    - Between consecutive cached frames, compute a 2D displacement field (block matching or optical flow)
    - MRMS also publishes derived storm motion vectors — evaluate whether these are usable directly
-   - Serve motion vectors alongside frame data in `GET /api/radar/frames`
+   - Serve motion vectors alongside tile data
 
 10. **Frontend: Semi-Lagrangian advection**
     - For each intermediate frame at time t between keyframes t₀ and t₁:
@@ -470,9 +480,35 @@ python -m pytest tests/test_decoder.py -v
 ### Why tilt-level data instead of the pre-computed composite
 
 The original plan was to start with `MergedReflectivityQCComposite` (2D) and add `MergedReflectivityQC` (3D) later. We skipped straight to tilt-level data because:
-- One fetch path gives both 2D and 3D output — `nanmax` across tilts produces an equivalent composite
+- One fetch path gives both 2D and 3D output — `fmax` across tilts produces an equivalent composite
 - Avoids maintaining two separate S3 listing/download paths
 - 3D volume data was the eventual goal anyway
+
+### Why scipy.sparse for MRMS data
+
+MRMS reflectivity grids are extremely sparse: after sentinel masking, 95-99.3% of grid cells are NaN (no echo). Profiling showed:
+- Dense float32: 784 MB per timestamp (8 tilts × 98 MB) — LRU of 3 = 2.4 GB
+- Sparse CSR: 39 MB per timestamp — LRU of 20 = 780 MB
+- Disk save: 1.2s / 5.4 MB (sparse) vs 2.8s / 7.1 MB (dense compressed)
+- Disk load: 33ms (sparse) vs 295ms (dense compressed)
+- Composite derivation from sparse: 80ms (sparse→dense→fmax, cached)
+
+Sparse is better on every axis: memory, disk, I/O speed, and allows caching 20 frames in memory instead of 3.
+
+### Why tile-based 3D instead of bulk voxel fetch
+
+The original 3D approach pre-computed all voxels for a fixed NYC bounding box and sent them as a single bulk JSON response. This had several problems:
+- Locked to one geographic region
+- Full 60-frame bulk fetch regardless of viewport (~5-20 MB per frame)
+- No request cancellation — switching frames couldn't abort in-flight data
+- Memory-intensive: all 60 frames of voxel data in the frontend
+
+The tile-based approach mirrors the 2D system:
+- deck.gl TileLayer manages viewport-based loading, AbortSignal cancellation, and tile lifecycle
+- Only visible tiles are fetched — pan/zoom is smooth
+- Zoom-based downsampling keeps voxel counts manageable (3.7K at z=3, 39K at z=5, 1.1K at z=8)
+- Browser HTTP cache makes animation scrubbing through previously viewed frames instant
+- Same UX for both 2D and 3D — just swap the TileLayer sublayer type
 
 ### Why PointCloudLayer instead of ColumnLayer
 
@@ -482,33 +518,22 @@ deck.gl `PointCloudLayer` turned out to work better than `ColumnLayer` for volum
 - Performs well with 100K+ points
 - Vertical exaggeration is just a multiplier on the altitude
 
-### Bounding box size
-
-Expanded from the original tight NYC box (40.4–41.0°N, 74.3–73.6°W) to a wider region (39.44–42.0°N, 75.23–72.67°W) to show enough surrounding area to see weather systems approaching. This roughly covers from Trenton to Hartford, Sandy Hook to the eastern tip of Long Island.
-
-### On-disk cache layout
-
-Originally used a flat `data/grib2_cache/` directory. Migrated to per-tilt subdirectories (`data/raw/00.50/`, `data/decoded/00.50/`, etc.) once we started fetching 8 tilt levels — the flat layout became unmanageable at ~1000+ files. The `disk_cache.py` module includes legacy migration logic.
-
 ### Background seeding
 
 The server starts accepting HTTP requests immediately. Frame seeding (480 S3 fetches for 60 timestamps × 8 tilts) runs in a daemon thread. The frontend handles the 503→retry loop transparently. This avoids a long startup delay while still serving a full frame history once warmed.
 
-### CONUS tile serving instead of single-image frames
+### On-disk cache layout
 
-The original approach served entire NYC-clipped frames as base64-encoded PNGs. This locked the viewer to one geographic region and sent the full image regardless of viewport or zoom. The tile-based approach:
-- Serves standard TMS tiles (`{z}/{x}/{y}.png`) that any map client can consume (Leaflet, OpenLayers, MapLibre, etc.)
-- Covers the full CONUS region, not just NYC
-- Only fetches tiles visible in the current viewport (lazy loading via deck.gl TileLayer)
-- Tiles are generated on demand from stored CONUS composite grids, not pre-generated for all zoom levels
-- Three effective zoom tiers: z 3–5 (coarse, heavy downsampling), z 6–7 (medium), z 8+ (full 0.01° resolution, maxzoom)
-- Browser HTTP cache (`Cache-Control: immutable`) makes revisited animation frames load instantly
-- CONUS composites are ~2–5 MB compressed on disk (vs ~98 MB uncompressed float32) thanks to radar data being mostly NaN
+The tilt grid cache uses per-timestamp directories containing 8 sparse `.npz` files (one per tilt) plus a `meta.json`:
+```
+data/tilt_grids/20260405-120000/
+    meta.json
+    00.50.npz
+    01.50.npz
+    ...
+    14.00.npz
+```
 
-### Memory management for full CONUS data
+This makes eviction simple (delete entire directory), atomic checks easy (test for `meta.json`), and keeps the raw S3 cache (`data/raw/{tilt}/`) separate.
 
-Full CONUS MRMS grids are ~7000×3500 at 0.01° resolution (~98 MB float32 each). Storing all 60 frames in memory is impractical (~5.9 GB). The tiered caching strategy keeps memory bounded:
-- CONUS composites live on disk as compressed `.npz` files (~180 MB total for 60 frames)
-- Only ~5 composites are held in memory at once via `ConusCompositeCache` LRU (~500 MB peak)
-- Rendered tile PNGs (~5–15 KB each) are cached in a 2000-entry LRU (~20 MB)
-- On warm starts, existing CONUS composites on disk are reused — only NYC voxels are recomputed from the per-tilt decoded cache
+Legacy caches (`data/decoded/`, `data/composites/`, `data/grib2_cache/`) are automatically removed on startup by the migration logic in `disk_cache.py`.

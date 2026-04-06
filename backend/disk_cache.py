@@ -1,12 +1,12 @@
 """
-Two-tier on-disk cache with per-tilt-level folder organisation:
+On-disk cache with per-tilt-level folder organisation:
 
-1. Raw cache   — stores .grib2.gz bytes from S3 (avoids re-downloading).
-2. Decoded cache — stores clipped numpy grids + metadata (avoids re-decoding).
+1. Raw cache       — stores .grib2.gz bytes from S3 (avoids re-downloading).
+2. Tilt grid cache — stores sparse CSR matrices per tilt per timestamp (avoids re-decoding).
 
 Layout:
     data/raw/{tilt}/MRMS_...grib2.gz
-    data/decoded/{tilt}/MRMS_...npy  + .json
+    data/tilt_grids/{YYYYMMDD-HHMMSS}/{tilt}.npz  + meta.json
 """
 
 from __future__ import annotations
@@ -20,38 +20,29 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RAW_DIR = _DATA_DIR / "raw"
-DECODED_DIR = _DATA_DIR / "decoded"
-COMPOSITES_DIR = _DATA_DIR / "composites"
+TILT_GRIDS_DIR = _DATA_DIR / "tilt_grids"
 
 _LEGACY_RAW_DIR = _DATA_DIR / "grib2_cache"
 _LEGACY_DECODED_DIR = _DATA_DIR / "decoded_cache"
+_LEGACY_DECODED_DIR2 = _DATA_DIR / "decoded"
+_LEGACY_COMPOSITES_DIR = _DATA_DIR / "composites"
 
 _TILT_RE = re.compile(r"MergedReflectivityQC(?!Composite)_(\d{2}\.\d{2})")
 
 
 def _key_to_path(s3_key: str) -> Path:
-    """Extract tilt subfolder and filename from an S3 key.
-
-    'CONUS/MergedReflectivityQC_00.50/20260405/MRMS_...grib2.gz'
-    → Path('00.50/MRMS_...grib2.gz')
-    """
+    """Extract tilt subfolder and filename from an S3 key."""
     parts = s3_key.split("/")
-    product = parts[1]  # e.g. 'MergedReflectivityQC_00.50'
+    product = parts[1]
     tilt = product.split("_")[-1]
     filename = parts[-1]
     return Path(tilt) / filename
-
-
-def _decoded_stem(s3_key: str) -> Path:
-    """Return the tilt-relative path without the .grib2.gz extension."""
-    p = _key_to_path(s3_key)
-    name = p.name.removesuffix(".grib2.gz").removesuffix(".grib2")
-    return p.parent / name
 
 
 # ── Raw GRIB2 cache ──────────────────────────────────────────────────────────
@@ -72,45 +63,7 @@ def put(s3_key: str, data: bytes) -> None:
     path.write_bytes(data)
 
 
-# ── Decoded array cache ───────────────────────────────────────────────────────
-
-
-def _decoded_paths(s3_key: str) -> tuple[Path, Path]:
-    stem = _decoded_stem(s3_key)
-    return DECODED_DIR / f"{stem}.npy", DECODED_DIR / f"{stem}.json"
-
-
-def get_decoded(s3_key: str) -> tuple[np.ndarray, dict[str, Any]] | None:
-    """Load a previously decoded + clipped grid from disk."""
-    npy_path, json_path = _decoded_paths(s3_key)
-    if npy_path.exists() and json_path.exists():
-        grid = np.load(npy_path, allow_pickle=False)
-        with open(json_path) as f:
-            meta = json.load(f)
-        return grid, meta
-    return None
-
-
-def put_decoded(s3_key: str, grid: np.ndarray, metadata: dict[str, Any]) -> None:
-    """Save a decoded + clipped grid and its metadata to disk."""
-    npy_path, json_path = _decoded_paths(s3_key)
-    npy_path.parent.mkdir(parents=True, exist_ok=True)
-
-    np.save(npy_path, grid.astype(np.float32))
-
-    serialisable = {}
-    for k, v in metadata.items():
-        if isinstance(v, (np.integer, np.floating)):
-            serialisable[k] = v.item()
-        elif isinstance(v, np.bool_):
-            serialisable[k] = bool(v)
-        else:
-            serialisable[k] = v
-    with open(json_path, "w") as f:
-        json.dump(serialisable, f)
-
-
-# ── CONUS composite cache ────────────────────────────────────────────────
+# ── Tilt grid cache (scipy.sparse CSR) ───────────────────────────────────────
 
 
 def _ts_to_stem(timestamp: str) -> str:
@@ -126,57 +79,77 @@ def _ts_to_stem(timestamp: str) -> str:
     )
 
 
-def put_composite(timestamp: str, grid: np.ndarray, metadata: dict[str, Any]) -> None:
-    """Save a full-CONUS composite grid to disk (compressed numpy + JSON metadata)."""
-    stem = _ts_to_stem(timestamp)
-    COMPOSITES_DIR.mkdir(parents=True, exist_ok=True)
-
-    npz_path = COMPOSITES_DIR / f"{stem}.npz"
-    np.savez_compressed(npz_path, grid=grid.astype(np.float32))
-
-    json_path = COMPOSITES_DIR / f"{stem}.json"
-    serialisable: dict[str, Any] = {}
+def _serialise_meta(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Convert numpy scalars to Python primitives for JSON serialisation."""
+    out: dict[str, Any] = {}
     for k, v in metadata.items():
         if isinstance(v, (np.integer, np.floating)):
-            serialisable[k] = v.item()
+            out[k] = v.item()
         elif isinstance(v, np.bool_):
-            serialisable[k] = bool(v)
+            out[k] = bool(v)
         else:
-            serialisable[k] = v
-    serialisable["timestamp"] = timestamp
-    with open(json_path, "w") as f:
-        json.dump(serialisable, f)
+            out[k] = v
+    return out
 
 
-def get_composite(timestamp: str) -> tuple[np.ndarray, dict[str, Any]] | None:
-    """Load a CONUS composite grid from disk. Returns ``(grid, metadata)`` or None."""
+def put_tilt_grids(
+    timestamp: str,
+    sparse_grids: dict[str, sp.csr_matrix],
+    metadata: dict[str, Any],
+) -> None:
+    """Save all tilt grids for one timestamp as individual sparse .npz files."""
     stem = _ts_to_stem(timestamp)
-    npz_path = COMPOSITES_DIR / f"{stem}.npz"
-    json_path = COMPOSITES_DIR / f"{stem}.json"
+    ts_dir = TILT_GRIDS_DIR / stem
+    ts_dir.mkdir(parents=True, exist_ok=True)
 
-    if not npz_path.exists() or not json_path.exists():
+    for tilt, matrix in sparse_grids.items():
+        sp.save_npz(ts_dir / f"{tilt}.npz", matrix)
+
+    meta = _serialise_meta(metadata)
+    meta["timestamp"] = timestamp
+    with open(ts_dir / "meta.json", "w") as f:
+        json.dump(meta, f)
+
+
+def get_tilt_grids(timestamp: str) -> tuple[dict[str, sp.csr_matrix], dict[str, Any]] | None:
+    """Load all tilt grids for a timestamp. Returns (sparse_dict, metadata) or None."""
+    stem = _ts_to_stem(timestamp)
+    ts_dir = TILT_GRIDS_DIR / stem
+    meta_path = ts_dir / "meta.json"
+
+    if not meta_path.exists():
         return None
 
-    data = np.load(npz_path)
-    grid = data["grid"]
-    with open(json_path) as f:
+    with open(meta_path) as f:
         meta = json.load(f)
-    return grid, meta
+
+    grids: dict[str, sp.csr_matrix] = {}
+    for npz_path in sorted(ts_dir.glob("*.npz")):
+        tilt = npz_path.stem  # e.g. "00.50"
+        grids[tilt] = sp.load_npz(npz_path)
+
+    if not grids:
+        return None
+
+    return grids, meta
 
 
-def has_composite(timestamp: str) -> bool:
-    """Check whether a CONUS composite exists on disk for *timestamp*."""
+def has_tilt_grids(timestamp: str) -> bool:
+    """Check whether tilt grids exist on disk for *timestamp*."""
     stem = _ts_to_stem(timestamp)
-    return (COMPOSITES_DIR / f"{stem}.npz").exists()
+    return (TILT_GRIDS_DIR / stem / "meta.json").exists()
 
 
-def list_composites() -> list[dict[str, Any]]:
-    """Return metadata dicts for all composites on disk, oldest-first."""
-    if not COMPOSITES_DIR.exists():
+def list_tilt_grid_timestamps() -> list[dict[str, Any]]:
+    """Return metadata dicts for all tilt grid sets on disk, oldest-first."""
+    if not TILT_GRIDS_DIR.exists():
         return []
     entries: list[dict[str, Any]] = []
-    for json_path in sorted(COMPOSITES_DIR.glob("*.json")):
-        with open(json_path) as f:
+    for ts_dir in sorted(TILT_GRIDS_DIR.iterdir()):
+        meta_path = ts_dir / "meta.json"
+        if not meta_path.exists():
+            continue
+        with open(meta_path) as f:
             meta = json.load(f)
         entries.append({
             "timestamp": meta.get("timestamp"),
@@ -194,18 +167,30 @@ def list_composites() -> list[dict[str, Any]]:
 
 
 def evict_older_than(hours: float = 24.0) -> int:
-    """Remove cached files older than `hours`. Walks tilt subdirectories."""
+    """Remove cached files older than `hours`."""
     cutoff = time.time() - hours * 3600
     removed = 0
-    for top in (RAW_DIR, DECODED_DIR, COMPOSITES_DIR):
-        if not top.exists():
-            continue
-        for path in top.rglob("*"):
+
+    # Raw cache: walk tilt subdirectories
+    if RAW_DIR.exists():
+        for path in RAW_DIR.rglob("*"):
             if path.is_file() and path.stat().st_mtime < cutoff:
                 path.unlink()
                 removed += 1
+
+    # Tilt grid cache: remove entire timestamp directories
+    if TILT_GRIDS_DIR.exists():
+        for ts_dir in list(TILT_GRIDS_DIR.iterdir()):
+            if not ts_dir.is_dir():
+                continue
+            meta_path = ts_dir / "meta.json"
+            check_path = meta_path if meta_path.exists() else ts_dir
+            if check_path.stat().st_mtime < cutoff:
+                shutil.rmtree(ts_dir)
+                removed += 1
+
     if removed:
-        logger.info("Evicted %d stale cache files (>%.0fh old)", removed, hours)
+        logger.info("Evicted %d stale cache entries (>%.0fh old)", removed, hours)
     return removed
 
 
@@ -213,48 +198,29 @@ def evict_older_than(hours: float = 24.0) -> int:
 
 
 def migrate_legacy_cache() -> dict[str, int]:
-    """Move files from the old flat cache dirs into the new per-tilt layout.
+    """Move files from old flat cache dirs into the per-tilt raw layout.
 
-    Returns counts: {'moved': N, 'deleted': N, 'errors': N}
+    Also removes stale legacy directories (decoded, composites).
     """
     stats = {"moved": 0, "deleted": 0, "errors": 0}
 
-    for legacy_dir, new_base, suffix in [
-        (_LEGACY_RAW_DIR, RAW_DIR, ".grib2.gz"),
-        (_LEGACY_DECODED_DIR, DECODED_DIR, ""),
-    ]:
-        if not legacy_dir.exists():
-            continue
-
-        for path in list(legacy_dir.iterdir()):
+    # Migrate old flat raw cache
+    if _LEGACY_RAW_DIR.exists():
+        for path in list(_LEGACY_RAW_DIR.iterdir()):
             if not path.is_file():
                 continue
-
-            name = path.name
-            if "Composite" in name:
+            if "Composite" in path.name:
                 path.unlink()
                 stats["deleted"] += 1
                 continue
-
-            m = _TILT_RE.search(name)
+            m = _TILT_RE.search(path.name)
             if not m:
                 stats["errors"] += 1
-                logger.warning("Could not extract tilt from legacy file: %s", name)
                 continue
-
             tilt = m.group(1)
-
-            # The legacy flat name is s3_key.replace("/","_"), e.g.:
-            # CONUS_MergedReflectivityQC_00.50_20260405_MRMS_...grib2.gz
-            # We want just the MRMS_... portion (everything after the date segment).
-            # Pattern: ..._YYYYMMDD_MRMS_... → split on _MRMS_ and reconstruct
-            parts = name.split("_MRMS_", 1)
-            if len(parts) == 2:
-                short_name = "MRMS_" + parts[1]
-            else:
-                short_name = name
-
-            dest = new_base / tilt / short_name
+            parts = path.name.split("_MRMS_", 1)
+            short_name = "MRMS_" + parts[1] if len(parts) == 2 else path.name
+            dest = RAW_DIR / tilt / short_name
             dest.parent.mkdir(parents=True, exist_ok=True)
             try:
                 shutil.move(str(path), str(dest))
@@ -262,18 +228,22 @@ def migrate_legacy_cache() -> dict[str, int]:
             except OSError:
                 logger.exception("Failed to move %s → %s", path, dest)
                 stats["errors"] += 1
-
-        # Clean up empty legacy directory
         try:
-            if legacy_dir.exists() and not any(legacy_dir.iterdir()):
-                legacy_dir.rmdir()
-                logger.info("Removed empty legacy dir: %s", legacy_dir)
+            if _LEGACY_RAW_DIR.exists() and not any(_LEGACY_RAW_DIR.iterdir()):
+                _LEGACY_RAW_DIR.rmdir()
         except OSError:
             pass
 
+    # Remove legacy decoded and composites directories
+    for legacy in (_LEGACY_DECODED_DIR, _LEGACY_DECODED_DIR2, _LEGACY_COMPOSITES_DIR):
+        if legacy.exists():
+            shutil.rmtree(legacy, ignore_errors=True)
+            logger.info("Removed legacy dir: %s", legacy)
+            stats["deleted"] += 1
+
     if stats["moved"] or stats["deleted"]:
         logger.info(
-            "Legacy cache migration: %d moved, %d deleted (stale composite), %d errors",
+            "Legacy migration: %d moved, %d deleted, %d errors",
             stats["moved"], stats["deleted"], stats["errors"],
         )
     return stats

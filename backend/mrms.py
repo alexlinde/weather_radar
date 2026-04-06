@@ -1,5 +1,5 @@
 """
-MRMS data access: S3 client, file listing, download, decode, and clip.
+MRMS data access: S3 client, file listing, download.
 
 Low-level utilities used by pipeline.py (the primary data pipeline).
 Fetch path: disk cache → S3 bucket (noaa-mrms-pds).
@@ -8,9 +8,7 @@ Fetch path: disk cache → S3 bucket (noaa-mrms-pds).
 from __future__ import annotations
 
 import functools
-import gzip
 import logging
-from typing import Any
 
 import boto3
 import numpy as np
@@ -18,18 +16,10 @@ from botocore import UNSIGNED
 from botocore.config import Config
 
 from . import disk_cache
-from .grib2.decoder import decode_grib2
 
 logger = logging.getLogger(__name__)
 
 BUCKET = "noaa-mrms-pds"
-
-NYC_BBOX = {
-    "north": 42.0,
-    "south": 39.44,
-    "east": -72.67,
-    "west": -75.23,
-}
 
 
 @functools.lru_cache(maxsize=1)
@@ -99,75 +89,7 @@ def fetch_raw(s3_key: str) -> bytes:
     return compressed
 
 
-def decode_and_clip(
-    raw_gz: bytes, bbox: dict | None = None
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Decompress, decode GRIB2, mask sentinels, clip to bounding box."""
-    bbox = bbox or NYC_BBOX
-    raw = gzip.decompress(raw_gz)
-    metadata, grid = decode_grib2(raw)
-    grid = mask_sentinel_values(grid)
-    clipped, clipped_meta = clip_to_bbox(grid, metadata, bbox)
-    return clipped, clipped_meta
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def clip_to_bbox(
-    data: np.ndarray,
-    metadata: dict,
-    bbox: dict | None = None,
-) -> tuple[np.ndarray, dict]:
-    """
-    Clip a decoded GRIB2 grid to the given bounding box.
-
-    Assumes row 0 = northernmost latitude (scanning direction already corrected).
-    """
-    bbox = bbox or NYC_BBOX
-    north = metadata["north"]
-    south = metadata["south"]
-    west = metadata["west"]
-    east = metadata["east"]
-    Nj = metadata["Nj"]
-    Ni = metadata["Ni"]
-    Dj = metadata["Dj"]
-    Di = metadata["Di"]
-
-    row_start = max(0, int((north - bbox["north"]) / Dj))
-    row_end = min(Nj, int((north - bbox["south"]) / Dj) + 1)
-    col_start = max(0, int((bbox["west"] - west) / Di))
-    col_end = min(Ni, int((bbox["east"] - west) / Di) + 1)
-
-    clipped = data[row_start:row_end, col_start:col_end]
-
-    clipped_north = north - row_start * Dj + Dj / 2
-    clipped_south = north - (row_end - 1) * Dj - Dj / 2
-    clipped_west = west + col_start * Di - Di / 2
-    clipped_east = west + (col_end - 1) * Di + Di / 2
-
-    clipped_meta = {
-        **metadata,
-        "north": clipped_north,
-        "south": clipped_south,
-        "west": clipped_west,
-        "east": clipped_east,
-        "Nj": clipped.shape[0],
-        "Ni": clipped.shape[1],
-    }
-
-    logger.info(
-        "Clipped grid: %dx%d -> %dx%d  bounds: N%.3f S%.3f W%.3f E%.3f",
-        Nj,
-        Ni,
-        clipped.shape[0],
-        clipped.shape[1],
-        clipped_north,
-        clipped_south,
-        clipped_west,
-        clipped_east,
-    )
-    return clipped, clipped_meta
 
 
 def mask_sentinel_values(data: np.ndarray, threshold: float = -30.0) -> np.ndarray:

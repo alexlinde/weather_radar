@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NYC Weather Radar</title>
+  <title>Weather Radar</title>
 
   <!-- MapLibre GL JS -->
   <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
@@ -21,7 +21,7 @@
 
   <!-- Control panel -->
   <div id="controls">
-    <h2>NYC Radar</h2>
+    <h2>Weather Radar</h2>
 
     <!-- Opacity slider -->
     <div class="control-row">
@@ -41,7 +41,6 @@
     <div class="control-row">
       <div class="control-label">
         <span>View</span>
-        <span id="volume-status" class="volume-status-label"></span>
       </div>
       <div class="seg-control" id="view-mode-seg">
         <button class="seg-btn active" data-mode="composite">Composite</button>
@@ -66,7 +65,7 @@
     <!-- Action buttons -->
     <div class="control-row btn-row">
       <button id="btn-refresh" title="Re-fetch latest frames">Refresh</button>
-      <button id="btn-reset-view" title="Fly back to NYC">Reset view</button>
+      <button id="btn-reset-view" title="Reset to CONUS view">Reset view</button>
     </div>
 
     <!-- Status -->

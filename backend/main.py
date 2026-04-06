@@ -1,25 +1,27 @@
 """
-FastAPI backend for the NYC Weather Radar prototype.
+FastAPI backend for the Weather Radar viewer.
 
 Endpoints:
-    GET /api/radar/latest   — latest clipped radar data as JSON
-    GET /api/radar/image    — latest clipped radar rendered as PNG (NWS color scale)
-    GET /api/radar/frames   — batch of recent frames as base64 PNGs for animation
-    GET /api/radar/refresh  — force cache invalidation and immediate re-fetch
+    GET /api/radar/tiles/{ts}/{z}/{x}/{y}.png        — 2D composite tile
+    GET /api/radar/volume/tiles/{ts}/{z}/{x}/{y}.json — 3D voxel tile
+    GET /api/radar/timestamps                        — available timestamps
+    GET /api/radar/refresh                           — force re-seed
+    GET /api/config                                  — frontend map config
+    GET /health                                      — cache status
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
 
 logging.basicConfig(
@@ -42,7 +44,6 @@ except ImportError:
 async def lifespan(app: FastAPI):
     import threading
     from . import disk_cache, pipeline
-    from .cache import composite_cache, volume_cache
 
     disk_cache.migrate_legacy_cache()
     disk_cache.evict_older_than(hours=24)
@@ -50,8 +51,7 @@ async def lifespan(app: FastAPI):
     def _bg_seed():
         try:
             n = pipeline.seed_frames(60)
-            logger.info("Seeding complete: %d volume / %d composite",
-                        n, composite_cache.count())
+            logger.info("Seeding complete: %d timestamps cached", n)
         except Exception:
             logger.exception("Frame seeding failed")
 
@@ -61,161 +61,24 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="NYC Weather Radar API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Weather Radar API", version="5.0.0", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET"],
     allow_headers=["*"],
-    expose_headers=[
-        "X-Radar-Timestamp",
-        "X-Radar-North",
-        "X-Radar-South",
-        "X-Radar-West",
-        "X-Radar-East",
-    ],
 )
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
-
-@app.get("/api/radar/latest")
-def radar_latest():
-    """Return the latest clipped NYC radar frame as JSON."""
-    from .cache import composite_cache
-    from . import pipeline
-
-    entry = composite_cache.latest()
-    if entry is None:
-        try:
-            grid, metadata = pipeline.fetch_latest_composite()
-        except Exception:
-            logger.exception("Failed to fetch radar data")
-            raise HTTPException(status_code=502, detail="Failed to fetch radar data")
-    else:
-        _, frame = entry
-        grid, metadata = frame.grid, frame.metadata
-
-    rounded = np.round(grid, 2)
-    data_serialisable = np.where(np.isnan(rounded), None, rounded).tolist()
-
-    return {
-        "timestamp": metadata["timestamp"],
-        "bounds": {
-            "north": metadata["north"],
-            "south": metadata["south"],
-            "east": metadata["east"],
-            "west": metadata["west"],
-        },
-        "grid": {
-            "rows": int(metadata["Nj"]),
-            "cols": int(metadata["Ni"]),
-        },
-        "data": data_serialisable,
-    }
-
-
-@app.get("/api/radar/image")
-def radar_image():
-    """Return the latest NYC radar frame as a PNG with NWS colour scale."""
-    from .cache import composite_cache
-    from . import pipeline
-    from .render import grid_to_png
-
-    entry = composite_cache.latest()
-    if entry is None:
-        try:
-            grid, metadata = pipeline.fetch_latest_composite()
-        except Exception:
-            logger.exception("Failed to fetch radar data")
-            raise HTTPException(status_code=502, detail="Failed to fetch radar data")
-    else:
-        _, frame = entry
-        grid, metadata = frame.grid, frame.metadata
-
-    png_bytes = grid_to_png(grid)
-
-    headers = {
-        "X-Radar-Timestamp": metadata["timestamp"] or "",
-        "X-Radar-North": str(metadata["north"]),
-        "X-Radar-South": str(metadata["south"]),
-        "X-Radar-West": str(metadata["west"]),
-        "X-Radar-East": str(metadata["east"]),
-        "Cache-Control": "max-age=60",
-    }
-
-    return Response(content=png_bytes, media_type="image/png", headers=headers)
-
-
-@app.get("/api/radar/frames")
-def radar_frames(count: int = Query(default=60, ge=1, le=70)):
-    """Return recent radar frames as base64-encoded PNGs, oldest-first."""
-    from .cache import composite_cache
-    from .render import grid_to_png
-
-    frames_data = composite_cache.items(count)
-    if not frames_data:
-        raise HTTPException(status_code=503, detail="No frames cached yet")
-
-    result = []
-    for _key, entry in frames_data:
-        png_bytes = grid_to_png(entry.grid)
-        b64 = base64.b64encode(png_bytes).decode("ascii")
-        meta = entry.metadata
-        result.append(
-            {
-                "timestamp": meta["timestamp"],
-                "image": f"data:image/png;base64,{b64}",
-                "bounds": {
-                    "north": meta["north"],
-                    "south": meta["south"],
-                    "east": meta["east"],
-                    "west": meta["west"],
-                },
-            }
-        )
-
-    return {"frames": result, "count": len(result)}
-
-
-@app.get("/api/radar/volume")
-async def radar_volume():
-    """Return the latest multi-level radar snapshot as voxel data."""
-    try:
-        from . import pipeline
-
-        volume = await asyncio.to_thread(pipeline.fetch_volume_snapshot)
-    except Exception:
-        logger.exception("Failed to fetch volume data")
-        raise HTTPException(status_code=502, detail="Failed to fetch volume data")
-
-    return {
-        "timestamp": volume["timestamp"],
-        "bounds": volume["bounds"],
-        "voxels": volume["voxels"],
-    }
-
-
-@app.get("/api/radar/volume/frames")
-async def radar_volume_frames(count: int = Query(default=60, ge=1, le=70)):
-    """Return recent volume frames as pre-computed voxel data, oldest-first."""
-    from . import pipeline
-
-    frames = pipeline.get_volume_frames(count)
-    if not frames:
-        raise HTTPException(
-            status_code=503,
-            detail="Volume frames not yet cached — server is still seeding",
-        )
-    return {"frames": frames, "count": len(frames)}
+# ── 2D composite tiles ──────────────────────────────────────────────────────
 
 
 @app.get("/api/radar/tiles/{timestamp}/{z}/{x}/{y}.png")
 def radar_tile(timestamp: str, z: int, x: int, y: int):
-    """Serve a single 256x256 radar tile for the given timestamp and tile coordinates."""
-    from .cache import conus_cache
+    """Serve a single 256x256 radar composite tile."""
+    from .cache import tilt_cache
     from .tiles import MAX_ZOOM, MIN_ZOOM, render_tile, tile_cache
 
     if z < MIN_ZOOM or z > MAX_ZOOM:
@@ -230,7 +93,7 @@ def radar_tile(timestamp: str, z: int, x: int, y: int):
             headers={"Cache-Control": "public, max-age=3600, immutable"},
         )
 
-    result = conus_cache.get(timestamp)
+    result = tilt_cache.get_composite(timestamp)
     if result is None:
         raise HTTPException(status_code=404, detail="Timestamp not available")
     grid, meta = result
@@ -245,23 +108,66 @@ def radar_tile(timestamp: str, z: int, x: int, y: int):
     )
 
 
+# ── 3D voxel tiles ──────────────────────────────────────────────────────────
+
+
+@app.get("/api/radar/volume/tiles/{timestamp}/{z}/{x}/{y}.json")
+def radar_voxel_tile(timestamp: str, z: int, x: int, y: int):
+    """Serve voxel data for a tile region across all tilt levels."""
+    from .cache import tilt_cache
+    from .tiles import MAX_ZOOM, MIN_ZOOM, render_voxel_tile, voxel_tile_cache
+
+    if z < MIN_ZOOM or z > MAX_ZOOM:
+        raise HTTPException(status_code=400, detail=f"Zoom must be {MIN_ZOOM}–{MAX_ZOOM}")
+
+    cache_key = (timestamp, z, x, y)
+    cached = voxel_tile_cache.get(cache_key)
+    if cached is not None:
+        return Response(
+            content=cached,
+            media_type="application/json",
+            headers={"Cache-Control": "public, max-age=3600, immutable"},
+        )
+
+    entry = tilt_cache.get(timestamp)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Timestamp not available")
+
+    voxels = render_voxel_tile(entry["grids"], entry["meta"], z, x, y)
+    payload = json.dumps({"voxels": voxels, "count": len(voxels)})
+    payload_bytes = payload.encode()
+    voxel_tile_cache.put(cache_key, payload_bytes)
+
+    return Response(
+        content=payload_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=3600, immutable"},
+    )
+
+
+# ── Timestamps ───────────────────────────────────────────────────────────────
+
+
 @app.get("/api/radar/timestamps")
 def radar_timestamps():
-    """Return the list of available radar timestamps (for tile URL construction)."""
+    """Return the list of available radar timestamps."""
     from . import disk_cache
 
-    composites = disk_cache.list_composites()
-    if not composites:
+    entries = disk_cache.list_tilt_grid_timestamps()
+    if not entries:
         raise HTTPException(
             status_code=503,
-            detail="No composites cached yet — server is still seeding",
+            detail="No frames cached yet — server is still seeding",
         )
-    return {"timestamps": composites, "count": len(composites)}
+    return {"timestamps": entries, "count": len(entries)}
+
+
+# ── Admin / config ───────────────────────────────────────────────────────────
 
 
 @app.get("/api/radar/refresh")
 async def radar_refresh():
-    """Force cache invalidation and re-seed both caches."""
+    """Force cache invalidation and re-seed."""
     from . import pipeline
 
     pipeline.invalidate_all()
@@ -280,10 +186,11 @@ async def api_config():
 
 @app.get("/health")
 async def health():
-    from .cache import composite_cache, volume_cache
+    from .cache import tilt_cache
+    from . import disk_cache
 
     return {
         "status": "ok",
-        "cached_frames": composite_cache.count(),
-        "volume_frames": volume_cache.count(),
+        "cached_in_memory": tilt_cache.count(),
+        "cached_on_disk": len(disk_cache.list_tilt_grid_timestamps()),
     }

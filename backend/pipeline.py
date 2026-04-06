@@ -1,12 +1,11 @@
 """
-Unified MRMS data pipeline: fetch tilt-level reflectivity, produce both
-CONUS-wide 2D composites (for tile serving) and NYC-region 3D voxel volumes.
+MRMS data pipeline: fetch tilt-level reflectivity, store as sparse grids.
 
 Single fetch path: tilt-level MergedReflectivityQC files from S3.
-Three output stores per frame:
-  - CONUS composite grids → disk (data/composites/) + in-memory LRU
-  - NYC composite grids   → cache.composite_cache (legacy endpoints)
-  - NYC 3D voxels         → cache.volume_cache
+Output: sparse CSR tilt grids on disk + in-memory LRU cache.
+
+Both 2D composite tiles and 3D voxel tiles are derived on-demand at
+tile-serve time — no pre-computation of composites or voxels.
 """
 
 from __future__ import annotations
@@ -14,29 +13,18 @@ from __future__ import annotations
 import gzip
 import logging
 import re
-from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
 
 from . import disk_cache
-from .cache import FrameEntry, composite_cache, volume_cache
+from .cache import tilt_cache
 from .grib2.decoder import decode_grib2
-from .mrms import NYC_BBOX, S3KeyNotFound, clip_to_bbox, fetch_raw, list_latest_files, mask_sentinel_values
+from .mrms import S3KeyNotFound, fetch_raw, list_latest_files, mask_sentinel_values
 
 logger = logging.getLogger(__name__)
 
 TILT_LEVELS = ["00.50", "01.50", "02.50", "03.50", "05.00", "07.00", "10.00", "14.00"]
-
-TILT_TO_HEIGHT_KM: dict[str, float] = {
-    "00.50": 1.0,
-    "01.50": 2.0,
-    "02.50": 3.5,
-    "03.50": 5.0,
-    "05.00": 7.0,
-    "07.00": 9.0,
-    "10.00": 12.0,
-    "14.00": 15.0,
-}
 
 VOLUME_PRODUCT_TEMPLATE = "CONUS/MergedReflectivityQC_{tilt}"
 
@@ -59,10 +47,7 @@ def derive_tilt_key(ref_key: str, tilt: str) -> str:
 
 
 def _timestamp_from_key(s3_key: str) -> str | None:
-    """Parse an ISO timestamp from an MRMS S3 key filename.
-
-    ``MRMS_..._20260405-120000.grib2.gz`` → ``2026-04-05T12:00:00Z``
-    """
+    """Parse an ISO timestamp from an MRMS S3 key filename."""
     m = _TS_RE.search(s3_key)
     if not m:
         return None
@@ -73,31 +58,8 @@ def _timestamp_from_key(s3_key: str) -> str | None:
 # ── Per-tilt fetch + decode ───────────────────────────────────────────────────
 
 
-def _fetch_and_decode_tilt(s3_key: str, bbox: dict | None = None) -> tuple[np.ndarray, dict] | None:
-    """Fetch + decode one tilt file (NYC-clipped). Returns (clipped_grid, metadata) or None."""
-    bbox = bbox or NYC_BBOX
-    try:
-        decoded = disk_cache.get_decoded(s3_key)
-        if decoded is not None:
-            return decoded
-
-        raw_gz = fetch_raw(s3_key)
-        raw = gzip.decompress(raw_gz)
-        metadata, grid = decode_grib2(raw)
-        grid = mask_sentinel_values(grid)
-        clipped, clipped_meta = clip_to_bbox(grid, metadata, bbox)
-        disk_cache.put_decoded(s3_key, clipped, clipped_meta)
-        return clipped, clipped_meta
-    except S3KeyNotFound:
-        logger.warning("Not yet available in S3: %s", s3_key)
-        return None
-    except Exception:
-        logger.exception("Failed to decode %s", s3_key)
-        return None
-
-
 def _decode_tilt_full(s3_key: str) -> tuple[np.ndarray, dict] | None:
-    """Fetch + decode one tilt to the full CONUS grid (no clip). Returns (grid, metadata) or None."""
+    """Fetch + decode one tilt to the full CONUS grid. Returns (grid, metadata) or None."""
     try:
         raw_gz = fetch_raw(s3_key)
         raw = gzip.decompress(raw_gz)
@@ -112,157 +74,70 @@ def _decode_tilt_full(s3_key: str) -> tuple[np.ndarray, dict] | None:
         return None
 
 
-# ── Composite + voxel derivation ──────────────────────────────────────────────
+# ── Per-timestep frame builder ────────────────────────────────────────────────
 
 
-def composite_from_grids(grids: list[tuple[str, np.ndarray]]) -> np.ndarray:
-    """Max reflectivity across all tilt levels at each grid point."""
-    if not grids:
-        return np.array([])
-    ref_shape = grids[0][1].shape
-    same_shape = [g for _, g in grids if g.shape == ref_shape]
-    return np.nanmax(np.stack(same_shape), axis=0)
+def _build_frame(ref_key: str, pool=None) -> tuple[str, dict[str, sp.csr_matrix], dict] | None:
+    """Fetch all tilts, convert to sparse, return (timestamp, sparse_grids, metadata).
 
-
-def _compute_volume_voxels(
-    grids: list[tuple[str, np.ndarray]],
-    meta: dict,
-    min_dbz: float = 10.0,
-) -> list[list[float]]:
-    """Emit one voxel per active (cell, level) for deck.gl PointCloudLayer.
-
-    Returns list of [lon, lat, altitude_m, dbz].
-    """
-    if not grids:
-        return []
-
-    north = meta["north"]
-    west = meta["west"]
-    Dj = meta["Dj"]
-    Di = meta["Di"]
-
-    all_lons: list[np.ndarray] = []
-    all_lats: list[np.ndarray] = []
-    all_alts: list[np.ndarray] = []
-    all_dbz: list[np.ndarray] = []
-
-    for tilt_str, grid in grids:
-        height_m = TILT_TO_HEIGHT_KM[tilt_str] * 1000.0
-        mask = (~np.isnan(grid)) & (grid >= min_dbz)
-        rows, cols = np.where(mask)
-        if len(rows) == 0:
-            continue
-
-        all_lons.append(west + Di / 2 + cols * Di)
-        all_lats.append(north - Dj / 2 - rows * Dj)
-        all_alts.append(np.full(len(rows), height_m))
-        all_dbz.append(grid[rows, cols])
-
-    if not all_lons:
-        return []
-
-    lons = np.round(np.concatenate(all_lons), 5)
-    lats = np.round(np.concatenate(all_lats), 5)
-    alts = np.concatenate(all_alts)
-    dbz = np.round(np.concatenate(all_dbz), 1)
-
-    return np.column_stack([lons, lats, alts, dbz]).tolist()
-
-
-# ── Per-timestep frame builders ───────────────────────────────────────────────
-
-
-def _build_volume_frame(
-    ref_key: str, bbox: dict, pool=None
-) -> tuple[str, list, np.ndarray, dict] | None:
-    """Fetch all tilts, produce CONUS composite + NYC voxels in one decode pass.
-
-    Full CONUS grids are decoded for the composite (saved to disk).
-    NYC-clipped grids are derived for voxels + legacy composite cache.
-
-    Returns (timestamp, voxels, nyc_composite_grid, nyc_metadata) or None.
+    If tilt grids already exist on disk for this timestamp, skips entirely.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    timestamp = _timestamp_from_key(ref_key)
+    if timestamp is None:
+        return None
+
+    if disk_cache.has_tilt_grids(timestamp):
+        result = disk_cache.get_tilt_grids(timestamp)
+        if result is not None:
+            grids, meta = result
+            return timestamp, grids, meta
+
     tilt_keys = [(tilt, derive_tilt_key(ref_key, tilt)) for tilt in TILT_LEVELS]
-
-    ts_hint = _timestamp_from_key(ref_key)
-    have_conus = ts_hint is not None and disk_cache.has_composite(ts_hint)
-
-    conus_grids: list[tuple[str, np.ndarray]] = []
-    nyc_grids: list[tuple[str, np.ndarray]] = []
-    conus_meta: dict | None = None
-    nyc_meta: dict | None = None
-    timestamp: str | None = None
+    decoded: dict[str, tuple[np.ndarray, dict]] = {}
 
     def _do_tilt(tilt_key_pair):
         tilt, key = tilt_key_pair
-
-        if have_conus:
-            nyc_result = _fetch_and_decode_tilt(key, bbox)
-            return tilt, nyc_result, None
-
-        full_result = _decode_tilt_full(key)
-        if full_result is None:
-            return tilt, None, None
-
-        full_grid, full_meta = full_result
-        clipped, clipped_meta = clip_to_bbox(full_grid, full_meta, bbox)
-        disk_cache.put_decoded(key, clipped, clipped_meta)
-        return tilt, (clipped, clipped_meta), (full_grid, full_meta)
+        return tilt, _decode_tilt_full(key)
 
     executor = pool or ThreadPoolExecutor(max_workers=8)
     own_pool = pool is None
     try:
         futures = {executor.submit(_do_tilt, tk): tk for tk in tilt_keys}
         for f in as_completed(futures):
-            tilt, nyc_result, conus_result = f.result()
-
-            if nyc_result is not None:
-                clipped, clipped_meta = nyc_result
-                nyc_grids.append((tilt, clipped))
-                if nyc_meta is None:
-                    nyc_meta = clipped_meta
-                    timestamp = clipped_meta.get("timestamp")
-
-            if conus_result is not None:
-                full_grid, full_meta = conus_result
-                conus_grids.append((tilt, full_grid))
-                if conus_meta is None:
-                    conus_meta = full_meta
+            tilt, result = f.result()
+            if result is not None:
+                decoded[tilt] = result
     finally:
         if own_pool:
             executor.shutdown(wait=False)
 
-    if not nyc_grids or nyc_meta is None:
+    if not decoded:
         return None
 
-    if conus_grids and conus_meta is not None and timestamp:
-        conus_composite = composite_from_grids(conus_grids)
-        disk_cache.put_composite(timestamp, conus_composite, conus_meta)
-    del conus_grids
+    meta = next(iter(decoded.values()))[1]
 
-    nyc_composite = composite_from_grids(nyc_grids)
-    voxels = _compute_volume_voxels(nyc_grids, nyc_meta)
-    return timestamp, voxels, nyc_composite, nyc_meta
+    sparse_grids: dict[str, sp.csr_matrix] = {}
+    for tilt, (grid, _) in decoded.items():
+        g = grid.copy()
+        g[np.isnan(g)] = 0
+        sparse_grids[tilt] = sp.csr_matrix(g)
+
+    disk_cache.put_tilt_grids(timestamp, sparse_grids, meta)
+    return timestamp, sparse_grids, meta
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def seed_frames(count: int = 60, bbox: dict | None = None) -> int:
-    """Pre-fetch and cache data for the most recent volume snapshots.
+def seed_frames(count: int = 60) -> int:
+    """Pre-fetch and cache tilt grids for the most recent timestamps.
 
-    Produces:
-      - CONUS composites saved to disk (for tile serving)
-      - NYC composites in composite_cache (legacy endpoints)
-      - NYC voxels in volume_cache (3D mode)
-
-    Returns number of volume frames now cached.
+    Returns number of timestamps now cached.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    bbox = bbox or NYC_BBOX
     logger.info("Seeding frame cache (%d frames across %d tilts)…", count, len(TILT_LEVELS))
     ref_keys = list_tilt_files("00.50", count=count)
 
@@ -274,82 +149,25 @@ def seed_frames(count: int = 60, bbox: dict | None = None) -> int:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         for i, ref_key in enumerate(ordered):
-            result = _build_volume_frame(ref_key, bbox, pool=pool)
+            result = _build_frame(ref_key, pool=pool)
             if result is None:
-                logger.warning("Could not build volume frame for %s", ref_key)
+                logger.warning("Could not build frame for %s", ref_key)
                 continue
-            timestamp, voxels, comp_grid, meta = result
-            volume_cache.put(timestamp, voxels)
-            composite_cache.put(ref_key, FrameEntry(metadata=meta, grid=comp_grid))
-            logger.info("  [%d/%d] %s: %d voxels, composite %s",
-                        i + 1, len(ordered), timestamp, len(voxels),
-                        comp_grid.shape)
+            timestamp, sparse_grids, meta = result
+            tilt_cache.put(timestamp, sparse_grids, meta)
+            n_nnz = sum(s.nnz for s in sparse_grids.values())
+            logger.info("  [%d/%d] %s: %d tilts, %d active cells",
+                        i + 1, len(ordered), timestamp, len(sparse_grids), n_nnz)
 
-    total = volume_cache.count()
-    logger.info("Frame cache seeded: %d volume / %d composite / %d CONUS on disk",
-                total, composite_cache.count(), len(disk_cache.list_composites()))
+    total = tilt_cache.count()
+    logger.info("Frame cache seeded: %d timestamps in memory, %d on disk",
+                total, len(disk_cache.list_tilt_grid_timestamps()))
     return total
-
-
-def fetch_latest_composite(bbox: dict | None = None) -> tuple[np.ndarray, dict]:
-    """Fetch one volume snapshot and return the derived 2D composite.
-
-    Cold-start fallback when composite_cache is empty.
-    """
-    bbox = bbox or NYC_BBOX
-    ref_keys = list_tilt_files("00.50", count=1)
-    if not ref_keys:
-        raise RuntimeError("No tilt files found in S3")
-
-    result = _build_volume_frame(ref_keys[0], bbox)
-    if result is None:
-        raise RuntimeError("All tilt levels failed")
-
-    timestamp, voxels, comp_grid, meta = result
-    volume_cache.put(timestamp, voxels)
-    composite_cache.put(ref_keys[0], FrameEntry(metadata=meta, grid=comp_grid))
-    return comp_grid, meta
-
-
-def fetch_volume_snapshot(bbox: dict | None = None) -> dict[str, Any]:
-    """Return the latest volume frame as a full snapshot dict."""
-    bbox = bbox or NYC_BBOX
-
-    entry = volume_cache.latest()
-    if entry is not None:
-        ts, voxels = entry
-        return {
-            "timestamp": ts,
-            "bounds": dict(bbox),
-            "voxels": voxels,
-        }
-
-    ref_keys = list_tilt_files("00.50", count=1)
-    if not ref_keys:
-        raise RuntimeError("No tilt files found in S3")
-
-    result = _build_volume_frame(ref_keys[0], bbox)
-    if result is None:
-        raise RuntimeError("All tilt levels failed")
-
-    timestamp, voxels, comp_grid, meta = result
-    volume_cache.put(timestamp, voxels)
-    composite_cache.put(ref_keys[0], FrameEntry(metadata=meta, grid=comp_grid))
-    return {
-        "timestamp": timestamp,
-        "bounds": dict(bbox),
-        "voxels": voxels,
-    }
-
-
-def get_volume_frames(count: int = 60) -> list[dict]:
-    """Return up to `count` cached volume frames, oldest-first."""
-    return [{"timestamp": ts, "voxels": v} for ts, v in volume_cache.items(count)]
 
 
 def invalidate_all() -> None:
     """Clear all in-memory caches."""
-    composite_cache.clear()
-    volume_cache.clear()
-    from .tiles import tile_cache
+    tilt_cache.clear()
+    from .tiles import tile_cache, voxel_tile_cache
     tile_cache.clear()
+    voxel_tile_cache.clear()
