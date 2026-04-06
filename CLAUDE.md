@@ -584,3 +584,16 @@ data/tilt_grids/20260405-120000/
 This makes eviction simple (delete entire directory), atomic checks easy (test for `meta.json` or `motion.png`), and keeps the raw S3 cache (`data/raw/{tilt}/`) separate.
 
 Legacy caches (`data/decoded/`, `data/composites/`, `data/grib2_cache/`) are automatically removed on startup by the migration logic in `disk_cache.py`.
+
+### Deferred tile rebuild to prevent zoom flicker
+
+When the user zooms, the tile set changes (e.g., z=4 → z=5). Rebuilding tile meshes immediately causes flicker: new meshes start invisible (no textures yet) and old "stale" meshes get purged as soon as the first new tile loads, leaving gaps where the rest haven't arrived. The base map doesn't have this problem because MapLibre manages its own tile transitions internally.
+
+The fix uses **deferred mesh rebuild with atomic swap**:
+1. `updateVisibleTiles()` stores the new tile set as `_pendingTiles` instead of rebuilding immediately
+2. Old meshes keep rendering (they use world-space Mercator coordinates, so they stretch/shrink correctly during zoom)
+3. Textures for the pending tile set are prefetched in the background
+4. Once ALL pending tile textures are cached, `_applyPendingTiles()` swaps atomically — old meshes out, new fully-textured meshes in, single frame
+5. A 3-second safety timeout force-applies if some tiles fail to load
+
+As a belt-and-suspenders measure, `_updateMaterials` only purges stale fallback meshes when **all** new meshes have textures (`allTextured`), not when the first one arrives (`anyTextured`). Never use `anyTextured` for the stale purge condition — it causes partial tile visibility.

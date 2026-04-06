@@ -448,6 +448,7 @@ class RadarLayer {
     this._tileLoadGen = 0;
     this._tileCache = new TileTextureCache(() => {
       this._tileLoadGen++;
+      this._checkPendingReady();
       this._requestRepaint();
     });
     this._motionCache = new MotionTextureCache(() => this._requestRepaint());
@@ -455,6 +456,8 @@ class RadarLayer {
     this._maxDispDeg = 0.5;
     this._map = null;
     this._visibleTiles = [];
+    this._pendingTiles = null;
+    this._pendingTilesTimer = null;
 
     this._renderer = null;
     this._scene = null;
@@ -541,7 +544,31 @@ class RadarLayer {
   }
 
   updateVisibleTiles() {
-    if (!this._map) return;
+    const tiles = this._computeVisibleTiles();
+    if (tiles.length === 0) return;
+
+    clearTimeout(this._pendingTilesTimer);
+
+    if (this._tileMeshes.size === 0) {
+      this._pendingTiles = null;
+      this._visibleTiles = tiles;
+      this._rebuildMeshes();
+      return;
+    }
+
+    if (this._tilesKey(tiles) === this._tilesKey(this._visibleTiles)) {
+      this._pendingTiles = null;
+      return;
+    }
+
+    this._pendingTiles = tiles;
+    this._pendingTilesTimer = setTimeout(() => this._applyPendingTiles(), 3000);
+    this._startPrefetchPending();
+    this._checkPendingReady();
+  }
+
+  _computeVisibleTiles() {
+    if (!this._map) return [];
     const bounds = this._map.getBounds();
     const zoom = Math.round(this._map.getZoom());
     const z = Math.max(RADAR_TILE_MIN_ZOOM, Math.min(RADAR_TILE_MAX_ZOOM, zoom));
@@ -560,7 +587,42 @@ class RadarLayer {
         tiles.push({ z, x, y });
       }
     }
-    this._visibleTiles = tiles;
+    return tiles;
+  }
+
+  _tilesKey(tiles) {
+    return tiles.map(t => `${t.z}/${t.x}/${t.y}`).join(',');
+  }
+
+  _startPrefetchPending() {
+    if (!this._pendingTiles || !this._timestamps.length) return;
+    const tsA = this._timestamps[this._frameA]?.timestamp;
+    const tsB = this._timestamps[this._frameB]?.timestamp;
+    if (!tsA) return;
+    for (const { z, x, y } of this._pendingTiles) {
+      this._tileCache.load(tsA, z, x, y);
+      if (tsB && tsB !== tsA) this._tileCache.load(tsB, z, x, y);
+    }
+  }
+
+  _checkPendingReady() {
+    if (!this._pendingTiles || !this._timestamps.length) return;
+    const tsA = this._timestamps[this._frameA]?.timestamp;
+    if (!tsA) return;
+    for (const { z, x, y } of this._pendingTiles) {
+      if (!this._tileCache.has(tsA, z, x, y)) {
+        this._tileCache.load(tsA, z, x, y);
+        return;
+      }
+    }
+    this._applyPendingTiles();
+  }
+
+  _applyPendingTiles() {
+    if (!this._pendingTiles) return;
+    clearTimeout(this._pendingTilesTimer);
+    this._visibleTiles = this._pendingTiles;
+    this._pendingTiles = null;
     this._rebuildMeshes();
   }
 
@@ -570,9 +632,14 @@ class RadarLayer {
     const tsB = this._timestamps[frameB]?.timestamp;
     if (!tsA) return;
     const promises = [];
-    for (const { z, x, y } of this._visibleTiles) {
-      promises.push(this._tileCache.load(tsA, z, x, y));
-      if (tsB && tsB !== tsA) promises.push(this._tileCache.load(tsB, z, x, y));
+    const tileSets = this._pendingTiles
+      ? [this._visibleTiles, this._pendingTiles]
+      : [this._visibleTiles];
+    for (const tiles of tileSets) {
+      for (const { z, x, y } of tiles) {
+        promises.push(this._tileCache.load(tsA, z, x, y));
+        if (tsB && tsB !== tsA) promises.push(this._tileCache.load(tsB, z, x, y));
+      }
     }
     await Promise.all(promises);
   }
@@ -580,11 +647,16 @@ class RadarLayer {
   prefetchFrames(startIdx, count) {
     const len = this._timestamps.length;
     if (len === 0) return;
+    const tileSets = this._pendingTiles
+      ? [this._visibleTiles, this._pendingTiles]
+      : [this._visibleTiles];
     for (let i = 0; i < count; i++) {
       const idx = (startIdx + i) % len;
       const ts = this._timestamps[idx]?.timestamp;
       if (!ts) continue;
-      for (const { z, x, y } of this._visibleTiles) this._tileCache.load(ts, z, x, y);
+      for (const tiles of tileSets) {
+        for (const { z, x, y } of tiles) this._tileCache.load(ts, z, x, y);
+      }
     }
   }
 
@@ -858,21 +930,23 @@ class RadarLayer {
     const motionTex = (entryA?.has_motion) ? this._motionCache.get(tsA) : null;
     const hasMotion = motionTex ? 1.0 : 0.0;
 
-    let anyTextured = false;
+    let allTextured = true;
     for (const [, mesh] of this._tileMeshes) {
       const { z, x, y } = mesh.userData;
       const texA = this._tileCache.get(tsA, z, x, y);
       const u = mesh.material.uniforms;
 
       if (texA) {
-        anyTextured = true;
         const texB = (tsB && tsB !== tsA) ? this._tileCache.get(tsB, z, x, y) : null;
         u.u_tex0.value = texA;
         u.u_tex1.value = texB || texA;
         u.u_timeMix.value = texB ? this._timeMix : 0;
         mesh.visible = true;
-      } else if (u.u_tex0.value === this._dummyTex) {
-        mesh.visible = false;
+      } else {
+        allTextured = false;
+        if (u.u_tex0.value === this._dummyTex) {
+          mesh.visible = false;
+        }
       }
 
       u.u_opacity.value = this._opacity;
@@ -883,7 +957,7 @@ class RadarLayer {
       u.u_maxDispDeg.value = this._maxDispDeg;
     }
 
-    if (anyTextured && this._staleMeshes.length > 0) {
+    if (allTextured && this._staleMeshes.length > 0) {
       this._purgeStale();
     }
   }
