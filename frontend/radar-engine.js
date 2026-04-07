@@ -24,7 +24,6 @@ const PREFETCH_BURST = 10;
 export function formatTimestamp(iso) {
   if (!iso) return '--:--';
   return new Date(iso).toLocaleTimeString('en-US', {
-    timeZone: 'America/New_York',
     hour12: false,
     hour: '2-digit',
     minute: '2-digit',
@@ -34,7 +33,6 @@ export function formatTimestamp(iso) {
 export function formatTimestampFull(iso) {
   if (!iso) return '--';
   return new Date(iso).toLocaleString('en-US', {
-    timeZone: 'America/New_York',
     hour12: false,
   });
 }
