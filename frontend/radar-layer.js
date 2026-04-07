@@ -46,8 +46,11 @@ const COLORIZE_GLSL = `
     if (dbz < u_dbzMin || dbz > u_dbzMax) return vec4(0.0);
     vec3 color = texture2D(u_colorRamp, vec2(encoded, 0.5)).rgb;
     if (dot(color, color) < 0.001) return vec4(0.0);
-    float t = clamp((dbz - u_dbzMin) / (u_dbzMax - u_dbzMin), 0.0, 1.0);
-    float alpha = pow(t, mix(2.0, 0.5, u_opacity));
+    float dLo = max(u_dbzMin, 5.0);
+    float dHi = min(u_dbzMax, 70.0);
+    float t = clamp((dbz - dLo) / (dHi - dLo), 0.0, 1.0);
+    float alpha = pow(t, mix(1.5, 0.4, u_opacity));
+    alpha *= smoothstep(dLo, dLo + 10.0, dbz);
     return vec4(color, alpha);
   }
 `;
@@ -149,9 +152,9 @@ const RADAR_FRAG = `
     vec4 col = colorize(encoded);
     if (col.a < 0.01) discard;
     if (u_tiltIndex < 0) {
-      col.a = 1.0 - pow(1.0 - col.a, 6.0);
+      col.a = min(1.0, col.a * (1.0 + col.a));
     } else {
-      col.a = min(1.0, col.a + col.a * col.a * col.a);
+      col.a = min(1.0, col.a * 1.3);
     }
     col.a *= u_opacity;
     gl_FragColor = vec4(col.rgb * col.a, col.a);
@@ -251,7 +254,7 @@ const VOLUME_FRAG = `
       float val = sampleVolume(pos);
       vec4 col = colorize(val);
       if (col.a > 0.0) {
-        col.a = min(1.0, col.a + col.a * col.a * col.a);
+        col.a = min(1.0, col.a * 1.3);
         col.a = min(1.0, col.a * 12.0 / u_steps);
         float f = col.a * (1.0 - acc.a);
         acc.rgb = (acc.a * acc.rgb + f * col.rgb) / max(acc.a + f, 0.001);
