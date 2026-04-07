@@ -8,18 +8,20 @@ This is a working prototype, not a production app. Prioritise getting real data 
 
 ## Current status
 
-All planned phases are complete.
+All planned phases are complete. The frontend has been refactored into ES modules with an embeddable mode for React Native integration.
 
 The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a three.js overlay renderer synced to MapLibre's projection matrix, with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Three view modes use the same atlas tile data: Composite (fmax across bands on one ground plane), 3D (8 stacked planes at tilt altitudes), and Volume (ray-marched volumetric rendering). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS starting at a CONUS-wide view. 3D terrain is currently disabled pending a tile seam fix.
+
+The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). It supports two display modes — full (all controls) and embed (minimal bar for WebView embedding) — controlled by the `?mode=embed` URL parameter. A postMessage bridge (`radar-bridge.js`) enables bidirectional communication with React Native WebViews. An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
 
 ## Architecture
 
 ```
-┌─────────────────┐      ┌──────────────────────┐      ┌────────────────────┐
-│  NOAA S3 Bucket  │─────▶│  Python Backend       │─────▶│  Browser Frontend   │
-│  noaa-mrms-pds   │      │  (FastAPI)             │      │  (MapLibre + WebGL) │
-│  Public, no auth │      │  Fetch, decode, atlas  │      │  Map + radar overlay │
-└─────────────────┘      └──────────────────────┘      └────────────────────┘
+┌──────────────────┐      ┌───────────────────────┐      ┌──────────────────────┐
+│  NOAA S3 Bucket  │─────▶│  Python Backend       │─────▶│  Browser Frontend    │
+│  noaa-mrms-pds   │      │  (FastAPI)            │      │  (MapLibre + WebGL)  │
+│  Public, no auth │      │  Fetch, decode, atlas │      │  Map + radar overlay │
+└──────────────────┘      └───────────────────────┘      └──────────────────────┘
 ```
 
 ### Backend (Python / FastAPI)
@@ -34,12 +36,25 @@ Responsibilities:
 - GZip middleware for API responses
 - Background seeding on startup (60 frames across all tilts) + atlas tile pre-rendering + motion field computation for all consecutive pairs
 
-### Frontend (HTML + JS)
+### Frontend (ES modules, esbuild)
 
-Responsibilities:
+The frontend is vanilla JS structured as ES modules, bundled for production by esbuild. MapLibre and three.js are loaded from CDN (not bundled). No framework, no JSX.
+
+**Module structure:**
+- `radar-layer.js` — three.js overlay renderer (`RadarLayer` as MapLibre `CustomLayerInterface`), all GLSL shaders, tile/motion texture caches, mesh management. Imports only `createColorRampData` from `colors.js`. This is the heaviest module (~1060 lines) and has zero DOM dependencies.
+- `radar-engine.js` — `RadarEngine` class (extends `EventTarget`): animation state machine, timestamp fetching with 503 retry, frame interpolation, preset logic, auto-refresh timer. Zero DOM dependencies — communicates via CustomEvent dispatch.
+- `radar-bridge.js` — `RadarBridge` class: postMessage bridge for React Native WebView communication. Translates inbound commands to engine calls, forwards engine events outbound.
+- `colors.js` — NWS color scale data, GPU ramp texture builder, DOM legend builder.
+- `app.js` — entry point. Initializes the map, creates RadarEngine + RadarBridge, wires the appropriate UI based on `?mode=embed` or `?mode=full` (default).
+
+**Display modes (controlled by `?mode=` URL parameter):**
+- `full` (default) — all controls: control panel (top-right), animation bar (bottom-center), legend, presets, dBZ range sliders, URL hash persistence
+- `embed` — minimal floating bar (bottom-center) with view mode selector, intensity slider, and expand button. No animation bar, no control panel, no map nav controls. Designed for WebView embedding. The expand button sends a `requestFullScreen` postMessage to the RN host.
+
+**Rendering responsibilities:**
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
 - 3D terrain via AWS elevation tiles (currently disabled — tile seam issue)
-- three.js overlay renderer (`RadarLayer` as MapLibre `CustomLayerInterface`) with camera projection synced from MapLibre's render callback matrix
+- three.js overlay renderer with camera projection synced from MapLibre's render callback matrix
 - GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection, spatial smoothing, tile edge blending
 - Motion texture cache loads per-frame-pair CONUS-wide motion vectors; shader converts tile UV → geographic coordinates → motion texture UV, traces pixels backward/forward along displacement field, blends with crossfade weighted by confidence
 - Composite mode: single ground-level quad per tile, shader takes fmax across 8 tilt bands
@@ -47,11 +62,13 @@ Responsibilities:
 - Volume mode: single box mesh per viewport, ray-marched through a stitched tile atlas texture with trilinear interpolation between tilt levels
 - Continuous float animation time with motion-compensated interpolation between keyframes
 - Viewport-based tile loading with browser HTTP cache (`force-cache` + `immutable`)
-- Default CONUS view at z=4, user zooms in to area of interest
-- Time animation with play/pause, scrubber, speed control
-- Opacity slider, vertical exaggeration slider (3D mode), dBZ min/max cutoff sliders
-- NWS reflectivity color scale legend
-- Auto-refresh every 2 minutes
+
+**Build pipeline:**
+- `frontend/package.json` — esbuild as sole dev dependency
+- `npm run build` — bundles `app.js` (+ all imports) into `frontend/dist/radar.min.js` (~37 KB), minifies CSS into `style.min.css`, copies `index.html` with rewritten script/link tags
+- `npm run watch` — rebuild on save during development
+- In dev without a build step, browsers load the ES modules directly via `<script type="module">`
+- FastAPI serves from `frontend/dist/` if it exists, otherwise falls back to `frontend/` source
 
 ## Data Source: MRMS on AWS
 
@@ -155,13 +172,19 @@ No eccodes, no cfgrib, no system-level C dependencies.
 - **MapLibre GL JS** (~v4) — base map (3D terrain disabled pending seam fix)
 - **three.js** (~v0.160) — overlay WebGL renderer, synced to MapLibre's projection matrix
 - **GLSL shaders** via `THREE.ShaderMaterial` — dBZ decoding, color ramp, motion advection, volume ray marching
-- **Vanilla JS** — no framework, no build step
+- **Vanilla JS** — ES modules, no framework
+- **esbuild** — bundler + minifier (dev dependency only)
 
-Loaded from CDN:
+MapLibre and three.js loaded from CDN (not bundled):
 ```html
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+```
+
+Application JS loaded as ES module:
+```html
+<script type="module" src="app.js"></script>
 ```
 
 ## API Endpoints
@@ -411,6 +434,7 @@ The -30 dBZ threshold preserves legitimate weak reflectivity values while catchi
 ```
 weather_radar/
 ├── CLAUDE.md              ← this file
+├── INTEGRATION.md         ← React Native integration spec (WebView + postMessage API)
 ├── .env                   ← API keys (not committed)
 ├── .env.example           ← template for .env
 ├── .gitignore
@@ -432,11 +456,21 @@ weather_radar/
 │       ├── packing.py     ← simple, J2K, PNG unpackers
 │       └── bitstream.py   ← N-bit integer reader utility
 ├── frontend/
-│   ├── index.html         ← single-page app
-│   ├── style.css          ← dark theme, glassmorphism panels
-│   ├── radar-layer.js     ← three.js overlay renderer, GLSL shaders, tile/motion texture caches
-│   ├── app.js             ← map init, continuous animation, motion prefetch, UI wiring
-│   └── colors.js          ← NWS color scale, legend builder, GPU color ramp data
+│   ├── package.json       ← esbuild dev dependency, build/watch scripts
+│   ├── package-lock.json  ← locked dependency versions (committed)
+│   ├── build.js           ← esbuild config: bundle, minify, copy HTML
+│   ├── index.html         ← single-page app (full + embed mode markup)
+│   ├── style.css          ← dark theme, glassmorphism panels, embed bar styles
+│   ├── app.js             ← entry point: map init, mode detection, UI wiring
+│   ├── radar-engine.js    ← RadarEngine class: animation, timestamps, presets (no DOM)
+│   ├── radar-layer.js     ← RadarLayer: three.js overlay, GLSL shaders, tile/motion caches
+│   ├── radar-bridge.js    ← RadarBridge: postMessage API for RN WebView communication
+│   ├── colors.js          ← NWS color scale, legend builder, GPU color ramp data
+│   └── dist/              ← production build output (gitignored)
+│       ├── index.html
+│       ├── radar.min.js   ← bundled + minified (~37 KB)
+│       ├── radar.min.js.map
+│       └── style.min.css
 ├── tests/
 │   ├── __init__.py
 │   ├── fixtures/          ← real MRMS .grib2.gz file (gitignored)
@@ -458,8 +492,11 @@ weather_radar/
 ## Running
 
 ```bash
-# Install dependencies
+# Install backend dependencies
 pip install -r backend/requirements.txt
+
+# (Optional) Build minified frontend for production
+cd frontend && npm install && npm run build && cd ..
 
 # Set up API keys (optional — app works without them)
 cp .env.example .env
@@ -473,7 +510,12 @@ DEV_MODE=1 uvicorn backend.main:app
 
 # Open in browser
 open http://localhost:8000
+
+# Embed mode (minimal controls, for WebView testing):
+open http://localhost:8000/?mode=embed
 ```
+
+The frontend build step is optional for development — browsers load the ES modules directly via `<script type="module">`. If `frontend/dist/` exists (from `npm run build`), FastAPI serves the minified bundle; otherwise it serves the raw source files.
 
 The server seeds 60 frames on startup in a background thread, then pre-renders atlas tiles for the default CONUS viewport and computes motion fields for all consecutive pairs. After seeding, a background task polls S3 every 60 seconds to pick up new frames and purge data older than 3 hours. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second; motion fields are computed for any new pairs.
 

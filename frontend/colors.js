@@ -5,7 +5,7 @@
  * Values below 5 dBZ (or NaN/null) are fully transparent.
  */
 
-const NWS_DBZ_COLORS = [
+export const NWS_DBZ_COLORS = [
   { min:  5, max: 10, r:  64, g: 192, b:  64 }, // light green
   { min: 10, max: 15, r:  48, g: 160, b:  48 },
   { min: 15, max: 20, r:   0, g: 144, b:   0 }, // green
@@ -28,7 +28,7 @@ const NWS_DBZ_COLORS = [
  * Encoding: pixel = round((dBZ + 30) * 2), so dBZ = pixel / 2 - 30.
  * Index 0 is always transparent (no echo).
  */
-function createColorRampData() {
+export function createColorRampData() {
   const data = new Uint8Array(256 * 4);
 
   for (let i = 1; i < 256; i++) {
@@ -79,7 +79,7 @@ function createColorRampData() {
  * Build the legend DOM entries — call once on page load.
  * @param {HTMLElement} container
  */
-function buildLegend(container) {
+export function buildLegend(container) {
   const bands = [
     ...NWS_DBZ_COLORS,
     { min: 75, max: Infinity, r: 200, g: 200, b: 255 },

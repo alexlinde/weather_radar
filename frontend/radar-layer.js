@@ -14,6 +14,8 @@
  *   - 'volume': ray-marched volumetric rendering through the atlas cube
  */
 
+import { createColorRampData } from './colors.js';
+
 const RADAR_TILE_MIN_ZOOM = 3;
 const RADAR_TILE_MAX_ZOOM = 8;
 const RADAR_NUM_BANDS = 8;
@@ -1059,3 +1061,5 @@ class RadarLayer {
     if (this._map) this._map.triggerRepaint();
   }
 }
+
+export { RadarLayer };

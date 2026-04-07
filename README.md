@@ -7,7 +7,7 @@ A web-based weather radar viewer that renders live MRMS (Multi-Radar Multi-Senso
 
 ## Quickstart
 
-**Prerequisites:** Python 3.11+ and pip.
+**Prerequisites:** Python 3.11+ and pip. Node.js 18+ optional (for production build only).
 
 ```bash
 # Clone and enter the repo
@@ -18,14 +18,19 @@ cd weather_radar
 python -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
+# Install backend dependencies
 pip install -r backend/requirements.txt
+
+# (Optional) Build minified frontend
+cd frontend && npm install && npm run build && cd ..
 
 # Start the server
 uvicorn backend.main:app
 ```
 
 Open **http://localhost:8000** in your browser.
+
+The frontend build step is optional — without it, the server serves the ES module source files directly (all modern browsers support `<script type="module">`). If you run `npm run build`, it bundles and minifies the JS/CSS (~37 KB) into `frontend/dist/` for production.
 
 On first launch the server seeds ~60 radar frames from NOAA's public S3 bucket in the background (no AWS credentials needed). The page will show a loading state for 1–2 minutes while data arrives, then the radar overlay appears automatically.
 
@@ -56,33 +61,15 @@ cp .env.example .env
 
 Use the playback controls to animate through time. Storms slide smoothly between keyframes via motion-compensated interpolation.
 
-## Project structure
+## Embedding in React Native
+
+The radar supports an embed mode for use inside a React Native WebView:
 
 ```
-backend/          Python/FastAPI server — fetches, decodes, and serves radar data
-  grib2/          Custom minimal GRIB2 decoder (no eccodes dependency)
-  main.py         API endpoints
-  pipeline.py     Data pipeline: S3 → sparse grids → atlas tiles → motion fields
-  motion.py       FFT block matching for inter-frame displacement
-  tiles.py        TMS atlas tile rendering
-frontend/         Browser app — vanilla JS, MapLibre GL + three.js
-  index.html      Single-page app entry point
-  app.js          Map init, animation loop, UI wiring
-  radar-layer.js  three.js overlay with GLSL shaders
-  colors.js       NWS reflectivity color scale
-tests/            Decoder tests
+http://localhost:8000/?mode=embed
 ```
 
-## Running tests
-
-```bash
-# Download a test fixture (one-time)
-python scripts/test_fetch.py
-
-# Run tests
-pip install -r backend/requirements-dev.txt
-python -m pytest tests/ -v
-```
+This shows a minimal control bar (view mode, intensity, expand button) with no animation controls or panels — designed for landscape embedding. A postMessage bridge enables the host app to control the radar programmatically and receive state events. See [INTEGRATION.md](INTEGRATION.md) for the full spec and reference implementation.
 
 ## Data source
 

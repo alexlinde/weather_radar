@@ -1,16 +1,22 @@
 /**
- * Weather Radar — Atlas tile architecture with custom WebGL radar layer.
+ * Weather Radar — application entry point.
  *
- * Uses RadarLayer (CustomLayerInterface) for GPU-rendered radar overlays.
- * Atlas tiles (256×2048 grayscale PNG, 8 tilt bands) are loaded per-tile
- * and rendered with GLSL shaders for dBZ colorisation, temporal interpolation,
- * and spatial smoothing.
+ * Initializes the map, creates a RadarEngine, and wires up the UI.
+ * Supports two modes controlled by ?mode= URL parameter:
+ *   - 'full' (default): all controls — control panel, animation bar, legend
+ *   - 'embed': minimal bar with view mode, intensity, and expand button
  */
 
+import { buildLegend } from './colors.js';
+import { RadarEngine, formatTimestampFull } from './radar-engine.js';
+import { RadarBridge } from './radar-bridge.js';
+
 const API_BASE = '';
-const REFRESH_INTERVAL_MS = 120_000;
-const MAX_503_RETRIES = 24;
-const VIEWPORT_DEBOUNCE_MS = 300;
+
+function getMode() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('mode') === 'embed' ? 'embed' : 'full';
+}
 
 // ── Map style selection ───────────────────────────────────────────────────────
 
@@ -28,277 +34,6 @@ async function resolveMapStyle() {
     }
   } catch (err) { console.warn('Could not load map config, using fallback:', err.message); }
   return 'https://tiles.openfreemap.org/styles/liberty';
-}
-
-// ── Animation state ───────────────────────────────────────────────────────────
-
-let timestamps = [];
-let currentAnimationTime = 0; // float index — e.g. 3.7 = 70% between frame 3 and 4
-let playing = false;
-let frameInterval = 500;      // ms per frame
-let animationId = null;
-let mapRef = null;
-let userOpacity = 0.8;
-let fetchAbort = null;
-let timestampFetchRetries = 0;
-let refreshIntervalId = null;
-
-// ── Radar layer ──────────────────────────────────────────────────────────────
-
-let radarLayer = null;
-let viewMode = 'composite';
-let verticalExaggeration = 1.0;
-let activePreset = 'all';
-
-const RADAR_PRESETS = {
-  all:    { dbzMin: 5,  dbzMax: 75, intensity: 0.8 },
-  precip: { dbzMin: 15, dbzMax: 75, intensity: 0.85 },
-  severe: { dbzMin: 40, dbzMax: 75, intensity: 0.95 },
-  custom: null,
-};
-
-// ── Status helpers ────────────────────────────────────────────────────────────
-
-function setStatus(state, message) {
-  const dot = document.getElementById('status-dot');
-  const ts  = document.getElementById('timestamp');
-  dot.className = state;
-  ts.textContent = message || '';
-}
-
-function formatTimestamp(iso) {
-  if (!iso) return '--:--';
-  return new Date(iso).toLocaleTimeString('en-US', {
-    timeZone: 'America/New_York',
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
-function formatTimestampFull(iso) {
-  if (!iso) return '--';
-  return new Date(iso).toLocaleString('en-US', {
-    timeZone: 'America/New_York',
-    hour12: false,
-  });
-}
-
-// ── Timestamp loading ─────────────────────────────────────────────────────────
-
-async function fetchTimestamps() {
-  if (fetchAbort) fetchAbort.abort();
-  fetchAbort = new AbortController();
-
-  setStatus('loading', 'Loading timestamps…');
-  try {
-    const resp = await fetch(
-      `${API_BASE}/api/radar/timestamps`,
-      { cache: 'no-store', signal: fetchAbort.signal },
-    );
-    if (resp.status === 503) {
-      timestampFetchRetries++;
-      if (timestampFetchRetries < MAX_503_RETRIES) {
-        setStatus('loading', 'Server seeding cache…');
-        setTimeout(fetchTimestamps, 5_000);
-      } else {
-        setStatus('error', 'Server unavailable — try refreshing');
-      }
-      return false;
-    }
-    timestampFetchRetries = 0;
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-
-    timestamps = data.timestamps;
-    currentAnimationTime = timestamps.length - 1;
-
-    if (radarLayer) {
-      radarLayer.setTimestamps(timestamps);
-      if (data.motion && timestamps.length > 0) {
-        const b = timestamps[0].bounds;
-        radarLayer.setMotionConfig(b, data.motion.max_disp_deg);
-      }
-    }
-
-    updateScrubber();
-    updateFrameDisplay();
-
-    const newest = timestamps[timestamps.length - 1];
-    setStatus('', `Latest: ${formatTimestampFull(newest?.timestamp)} ET`);
-
-    return true;
-  } catch (err) {
-    if (err.name === 'AbortError') return false;
-    console.error('Timestamp fetch error:', err);
-    setStatus('error', `Error: ${err.message}`);
-    return false;
-  }
-}
-
-// ── Frame display ─────────────────────────────────────────────────────────────
-
-function getCurrentFrameIndex() {
-  return Math.floor(currentAnimationTime) % Math.max(1, timestamps.length);
-}
-
-const PREFETCH_AHEAD = 5;
-
-function showFrame() {
-  if (!radarLayer || timestamps.length === 0) return;
-
-  const len = timestamps.length;
-  const t = ((currentAnimationTime % len) + len) % len;
-  const frameA = Math.floor(t);
-  const frameB = (frameA + 1) % len;
-  const mix = t - frameA;
-
-  radarLayer.setAnimation(frameA, frameB, mix);
-
-  radarLayer.prefetchFrames((frameB + 1) % len, PREFETCH_AHEAD);
-  radarLayer.prefetchMotion(frameA, PREFETCH_AHEAD);
-}
-
-async function loadAndShowFrame() {
-  if (!radarLayer || timestamps.length === 0) return;
-
-  const len = timestamps.length;
-  const t = ((currentAnimationTime % len) + len) % len;
-  const frameA = Math.floor(t);
-  const frameB = (frameA + 1) % len;
-
-  await Promise.all([
-    radarLayer.ensureTextures(frameA, frameB),
-    radarLayer.ensureMotion(frameA),
-  ]);
-  showFrame();
-}
-
-// ── Animation loop ────────────────────────────────────────────────────────────
-
-let lastAnimTime = 0;
-
-function animationTick(now) {
-  if (!playing) return;
-
-  if (lastAnimTime > 0 && radarLayer) {
-    const dt = now - lastAnimTime;
-    const step = dt / frameInterval;
-    const len = timestamps.length;
-
-    let nextTime = currentAnimationTime + step;
-    if (nextTime >= len) nextTime -= len;
-
-    const nextFrameA = Math.floor(nextTime) % len;
-    const nextFrameB = (nextFrameA + 1) % len;
-
-    if (radarLayer.hasTexturesForFrame(nextFrameA) &&
-        radarLayer.hasTexturesForFrame(nextFrameB)) {
-      currentAnimationTime = nextTime;
-      showFrame();
-      updateFrameDisplay();
-    } else {
-      radarLayer.prefetchFrames(nextFrameA, PREFETCH_AHEAD);
-    }
-  }
-  lastAnimTime = now;
-
-  animationId = requestAnimationFrame(animationTick);
-}
-
-const PREFETCH_BURST = 10;
-
-async function play() {
-  if (timestamps.length < 2) return;
-  playing = true;
-  lastAnimTime = 0;
-  document.getElementById('icon-play').style.display = 'none';
-  document.getElementById('icon-pause').style.display = '';
-
-  if (radarLayer) {
-    const len = timestamps.length;
-    const startFrame = Math.floor(((currentAnimationTime % len) + len) % len);
-    radarLayer.prefetchFrames(startFrame, PREFETCH_BURST);
-  }
-
-  animationId = requestAnimationFrame(animationTick);
-}
-
-function pause() {
-  playing = false;
-  lastAnimTime = 0;
-  document.getElementById('icon-play').style.display = '';
-  document.getElementById('icon-pause').style.display = 'none';
-  if (animationId) {
-    cancelAnimationFrame(animationId);
-    animationId = null;
-  }
-  showFrame();
-}
-
-function togglePlay() {
-  playing ? pause() : play();
-}
-
-// ── UI sync ───────────────────────────────────────────────────────────────────
-
-function updateScrubber() {
-  const scrubber = document.getElementById('frame-scrubber');
-  scrubber.max = Math.max(0, timestamps.length - 1);
-  scrubber.value = getCurrentFrameIndex();
-}
-
-function updateFrameDisplay() {
-  const idx = getCurrentFrameIndex();
-  const scrubber = document.getElementById('frame-scrubber');
-  scrubber.value = idx;
-
-  const timeEl = document.getElementById('frame-time');
-  const counterEl = document.getElementById('frame-counter');
-  const ts = timestamps[idx];
-
-  timeEl.textContent = ts ? formatTimestamp(ts.timestamp) : '--:--';
-  counterEl.textContent = timestamps.length > 0 ? `${idx + 1}/${timestamps.length}` : '0/0';
-}
-
-// ── View mode toggle ──────────────────────────────────────────────────────────
-
-function setViewMode(mode, { animateCamera = true } = {}) {
-  if (mode === viewMode) return;
-  viewMode = mode;
-
-  const map = mapRef;
-  if (!map) return;
-
-  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.mode === mode);
-  });
-
-  const rowExag = document.getElementById('row-exaggeration');
-
-  if (mode === 'composite') {
-    if (animateCamera) map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
-    rowExag.style.display = 'none';
-  } else {
-    if (animateCamera) map.easeTo({ pitch: 50, duration: 600 });
-    rowExag.style.display = '';
-  }
-
-  if (radarLayer) radarLayer.setMode(mode);
-  showFrame();
-}
-
-// ── Viewport change handler ───────────────────────────────────────────────────
-
-let viewportDebounceTimer = null;
-
-function onViewportChange() {
-  if (viewportDebounceTimer) clearTimeout(viewportDebounceTimer);
-  viewportDebounceTimer = setTimeout(async () => {
-    if (!radarLayer || !mapRef) return;
-    radarLayer.updateVisibleTiles();
-    await loadAndShowFrame();
-  }, VIEWPORT_DEBOUNCE_MS);
 }
 
 // ── URL hash ↔ map view sync ─────────────────────────────────────────────────
@@ -324,13 +59,224 @@ function updateHash(map) {
   history.replaceState(null, '', `#${z}/${lat}/${lng}/${b}/${p}`);
 }
 
+// ── Full-mode UI wiring ──────────────────────────────────────────────────────
+
+function wireFullUI(engine, map) {
+  // Status
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('timestamp');
+  engine.addEventListener('status', e => {
+    statusDot.className = e.detail.state;
+    statusText.textContent = e.detail.message || '';
+  });
+
+  // Frame display
+  const scrubber = document.getElementById('frame-scrubber');
+  const frameTime = document.getElementById('frame-time');
+  const frameCounter = document.getElementById('frame-counter');
+
+  engine.addEventListener('frame', e => {
+    scrubber.value = e.detail.index;
+    frameTime.textContent = e.detail.formattedTime;
+    frameCounter.textContent = e.detail.total > 0
+      ? `${e.detail.index + 1}/${e.detail.total}`
+      : '0/0';
+  });
+
+  engine.addEventListener('timestamps', () => {
+    scrubber.max = Math.max(0, engine.timestamps.length - 1);
+    scrubber.value = engine.getCurrentFrameIndex();
+  });
+
+  // Play/Pause
+  const iconPlay = document.getElementById('icon-play');
+  const iconPause = document.getElementById('icon-pause');
+  document.getElementById('btn-play').addEventListener('click', () => engine.togglePlay());
+  engine.addEventListener('playstate', e => {
+    iconPlay.style.display = e.detail.playing ? 'none' : '';
+    iconPause.style.display = e.detail.playing ? '' : 'none';
+  });
+
+  // Frame scrubber
+  scrubber.addEventListener('input', () => {
+    engine.setFrameIndex(parseInt(scrubber.value, 10));
+  });
+
+  // Speed
+  document.getElementById('speed-select').addEventListener('change', e => {
+    engine.setSpeed(parseInt(e.target.value, 10));
+  });
+
+  // Intensity
+  const opacitySlider = document.getElementById('opacity-slider');
+  const opacityValue = document.getElementById('opacity-value');
+  opacitySlider.addEventListener('input', () => {
+    const val = parseFloat(opacitySlider.value);
+    engine.setOpacity(val);
+    opacityValue.textContent = Math.round(val * 100) + '%';
+    if (engine.activePreset !== 'custom') engine.switchPreset('custom');
+  });
+
+  // View mode
+  const viewModeBtns = document.querySelectorAll('#view-mode-seg .seg-btn');
+  viewModeBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      engine.setViewMode(btn.dataset.mode);
+    });
+  });
+
+  const rowExag = document.getElementById('row-exaggeration');
+  engine.addEventListener('viewmode', e => {
+    viewModeBtns.forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === e.detail.mode);
+    });
+    if (e.detail.mode === 'composite') {
+      map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+      rowExag.style.display = 'none';
+    } else {
+      map.easeTo({ pitch: 50, duration: 600 });
+      rowExag.style.display = '';
+    }
+  });
+
+  // Vertical exaggeration
+  const exagSlider = document.getElementById('exag-slider');
+  const exagValue = document.getElementById('exag-value');
+  exagSlider.addEventListener('input', () => {
+    const val = parseFloat(exagSlider.value);
+    engine.setVerticalExaggeration(val);
+    exagValue.textContent = `${val}x`;
+  });
+
+  // dBZ range
+  const dbzMinSlider = document.getElementById('dbz-min-slider');
+  const dbzMaxSlider = document.getElementById('dbz-max-slider');
+  const dbzRangeValue = document.getElementById('dbz-range-value');
+
+  function updateDbzRange() {
+    let lo = parseInt(dbzMinSlider.value, 10);
+    let hi = parseInt(dbzMaxSlider.value, 10);
+    if (lo > hi) [lo, hi] = [hi, lo];
+    dbzRangeValue.textContent = `${lo} – ${hi}`;
+    engine.setDbzRange(lo, hi);
+  }
+  dbzMinSlider.addEventListener('input', updateDbzRange);
+  dbzMaxSlider.addEventListener('input', updateDbzRange);
+
+  // Presets
+  const presetSeg = document.getElementById('preset-seg');
+  const dbzCutoffRow = document.getElementById('row-dbz-cutoff');
+
+  presetSeg.querySelectorAll('.seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => engine.switchPreset(btn.dataset.preset));
+  });
+
+  engine.addEventListener('preset', e => {
+    presetSeg.querySelectorAll('.seg-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.preset === e.detail.preset);
+    });
+    dbzCutoffRow.style.display = e.detail.preset === 'custom' ? '' : 'none';
+
+    const vals = e.detail.values;
+    if (vals) {
+      dbzMinSlider.value = vals.dbzMin;
+      dbzMaxSlider.value = vals.dbzMax;
+      dbzRangeValue.textContent = `${vals.dbzMin} – ${vals.dbzMax}`;
+      opacitySlider.value = vals.intensity;
+      opacityValue.textContent = Math.round(vals.intensity * 100) + '%';
+    }
+  });
+
+  // Refresh
+  document.getElementById('btn-refresh').addEventListener('click', () => engine.refresh());
+
+  // Reset view
+  document.getElementById('btn-reset-view').addEventListener('click', () => {
+    const pitch = (engine.viewMode === '3d' || engine.viewMode === 'volume') ? 50 : 0;
+    map.flyTo({ center: [-98.5, 39.8], zoom: 4, pitch, bearing: 0, duration: 800 });
+  });
+
+  // Legend
+  const legendEl = document.getElementById('legend');
+  const legendToggle = document.getElementById('btn-legend');
+  buildLegend(legendEl);
+  legendToggle.addEventListener('click', () => {
+    legendEl.classList.toggle('visible');
+    legendToggle.textContent = legendEl.classList.contains('visible') ? 'Hide legend' : 'Show legend';
+  });
+
+  // Hash sync
+  map.on('moveend', () => updateHash(map));
+  map.on('zoomend', () => updateHash(map));
+  map.on('pitchend', () => {
+    updateHash(map);
+    if (map.getPitch() > 0 && engine.viewMode === 'composite') {
+      engine.setViewMode('3d');
+    }
+  });
+  map.on('rotateend', () => updateHash(map));
+  updateHash(map);
+}
+
+// ── Embed-mode UI wiring ─────────────────────────────────────────────────────
+
+function wireEmbedUI(engine, map, bridge) {
+  const embedBar = document.getElementById('embed-bar');
+  embedBar.style.display = '';
+
+  // Hide full-mode UI elements
+  document.getElementById('controls').style.display = 'none';
+  document.getElementById('animation-bar').style.display = 'none';
+  document.getElementById('legend-toggle').style.display = 'none';
+  document.getElementById('legend').style.display = 'none';
+
+  // Hide MapLibre nav controls
+  const navControls = document.querySelectorAll('.maplibregl-ctrl-top-left');
+  navControls.forEach(el => { el.style.display = 'none'; });
+
+  // View mode buttons
+  const modeBtns = document.querySelectorAll('#embed-mode-seg .seg-btn');
+  modeBtns.forEach(btn => {
+    btn.addEventListener('click', () => engine.setViewMode(btn.dataset.mode));
+  });
+  engine.addEventListener('viewmode', e => {
+    modeBtns.forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === e.detail.mode);
+    });
+    if (e.detail.mode === 'composite') {
+      map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+    } else {
+      map.easeTo({ pitch: 50, duration: 600 });
+    }
+  });
+
+  // Intensity slider
+  const slider = document.getElementById('embed-opacity');
+  slider.addEventListener('input', () => {
+    engine.setOpacity(parseFloat(slider.value));
+  });
+
+  // Expand button
+  document.getElementById('embed-expand').addEventListener('click', () => {
+    bridge.requestFullScreen();
+  });
+
+  // Status — use a simple attribute on the bar
+  engine.addEventListener('status', e => {
+    embedBar.dataset.status = e.detail.state || 'ok';
+  });
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
+  const mode = getMode();
+  const engine = new RadarEngine({ apiBase: API_BASE });
+
   const styleUrl = await resolveMapStyle();
 
-  const saved = parseHash();
-  if (saved && saved.pitch > 0) viewMode = '3d';
+  const saved = mode === 'full' ? parseHash() : null;
+  if (saved && saved.pitch > 0) engine.viewMode = '3d';
 
   const map = new maplibregl.Map({
     container: 'map',
@@ -339,196 +285,36 @@ async function init() {
     zoom: saved?.zoom ?? 4,
     pitch: saved?.pitch ?? 0,
     bearing: saved?.bearing ?? 0,
-    attributionControl: true,
+    attributionControl: mode === 'full',
   });
-  mapRef = map;
 
-  // Sync button active states with restored view mode
-  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.mode === viewMode);
-  });
-  if (viewMode === '3d') {
-    document.getElementById('row-exaggeration').style.display = '';
+  if (mode === 'full') {
+    // Sync view mode buttons with restored state
+    document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === engine.viewMode);
+    });
+    if (engine.viewMode === '3d') {
+      document.getElementById('row-exaggeration').style.display = '';
+    }
+
+    map.addControl(new maplibregl.NavigationControl(), 'top-left');
+    map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+    wireFullUI(engine, map);
   }
 
-  map.on('moveend', () => updateHash(map));
-  map.on('zoomend', () => updateHash(map));
-  map.on('pitchend', () => {
-    updateHash(map);
-    if (map.getPitch() > 0 && viewMode === 'composite') {
-      setViewMode('3d', { animateCamera: false });
-    }
-  });
-  map.on('rotateend', () => updateHash(map));
-  updateHash(map);
-
-  map.addControl(new maplibregl.NavigationControl(), 'top-left');
-  map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+  const bridge = new RadarBridge(engine, map);
+  if (mode === 'embed') {
+    wireEmbedUI(engine, map, bridge);
+    bridge.start();
+  }
 
   map.on('load', async () => {
-    // TODO: re-enable terrain once tile seam issue is resolved
-    // map.addSource('terrain', {
-    //   type: 'raster-dem',
-    //   tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
-    //   encoding: 'terrarium',
-    //   tileSize: 256,
-    //   maxzoom: 15,
-    // });
-    // map.setTerrain({ source: 'terrain', exaggeration: 1.5 });
-
-    radarLayer = new RadarLayer();
-    map.addLayer(radarLayer);
-    if (viewMode !== 'composite') radarLayer.setMode(viewMode);
-
-    const ok = await fetchTimestamps();
-    if (ok && timestamps.length > 0) {
-      radarLayer.updateVisibleTiles();
-      await loadAndShowFrame();
-      if (timestamps.length >= 2) {
-        play();
-      }
-    }
-
-    refreshIntervalId = setInterval(async () => {
-      const wasPlaying = playing;
-      if (wasPlaying) pause();
-      await fetchTimestamps();
-      if (timestamps.length > 0) {
-        radarLayer.updateVisibleTiles();
-        await loadAndShowFrame();
-      }
-      if (wasPlaying && timestamps.length >= 2) play();
-    }, REFRESH_INTERVAL_MS);
+    engine.initLayer(map);
+    await engine.start();
   });
 
-  map.on('moveend', onViewportChange);
-
-  // ── Intensity slider ─────────────────────────────────────────────────────
-
-  const opacitySlider = document.getElementById('opacity-slider');
-  const opacityValue  = document.getElementById('opacity-value');
-
-  opacitySlider.addEventListener('input', () => {
-    userOpacity = parseFloat(opacitySlider.value);
-    opacityValue.textContent = Math.round(userOpacity * 100) + '%';
-    if (radarLayer) radarLayer.setOpacity(userOpacity);
-    if (activePreset !== 'custom') switchPreset('custom');
-  });
-
-  // ── Play / Pause ────────────────────────────────────────────────────────
-
-  document.getElementById('btn-play').addEventListener('click', togglePlay);
-
-  // ── Frame scrubber ──────────────────────────────────────────────────────
-
-  const scrubber = document.getElementById('frame-scrubber');
-  scrubber.addEventListener('input', () => {
-    if (playing) pause();
-    currentAnimationTime = parseInt(scrubber.value, 10);
-    updateFrameDisplay();
-    showFrame();
-    loadAndShowFrame();
-  });
-
-  // ── Speed select ────────────────────────────────────────────────────────
-
-  document.getElementById('speed-select').addEventListener('change', (e) => {
-    frameInterval = parseInt(e.target.value, 10);
-  });
-
-  // ── View mode segmented control ──────────────────────────────────────────
-
-  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
-    btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
-  });
-
-  // ── Vertical exaggeration ───────────────────────────────────────────────
-
-  document.getElementById('exag-slider').addEventListener('input', (e) => {
-    verticalExaggeration = parseFloat(e.target.value);
-    document.getElementById('exag-value').textContent = `${verticalExaggeration}x`;
-    if (radarLayer) radarLayer.setVerticalExaggeration(verticalExaggeration);
-  });
-
-  // ── dBZ cutoff sliders ──────────────────────────────────────────────────
-
-  const dbzMinSlider = document.getElementById('dbz-min-slider');
-  const dbzMaxSlider = document.getElementById('dbz-max-slider');
-  const dbzRangeValue = document.getElementById('dbz-range-value');
-
-  function updateDbzRange() {
-    let lo = parseInt(dbzMinSlider.value, 10);
-    let hi = parseInt(dbzMaxSlider.value, 10);
-    if (lo > hi) { [lo, hi] = [hi, lo]; }
-    dbzRangeValue.textContent = `${lo} – ${hi}`;
-    if (radarLayer) radarLayer.setDbzRange(lo, hi);
-  }
-
-  dbzMinSlider.addEventListener('input', updateDbzRange);
-  dbzMaxSlider.addEventListener('input', updateDbzRange);
-
-  // ── Radar presets ──────────────────────────────────────────────────────
-
-  const presetSeg = document.getElementById('preset-seg');
-  const dbzCutoffRow = document.getElementById('row-dbz-cutoff');
-
-  function switchPreset(key) {
-    activePreset = key;
-    presetSeg.querySelectorAll('.seg-btn').forEach(b => {
-      b.classList.toggle('active', b.dataset.preset === key);
-    });
-
-    dbzCutoffRow.style.display = key === 'custom' ? '' : 'none';
-
-    const preset = RADAR_PRESETS[key];
-    if (!preset) return;
-
-    dbzMinSlider.value = preset.dbzMin;
-    dbzMaxSlider.value = preset.dbzMax;
-    dbzRangeValue.textContent = `${preset.dbzMin} – ${preset.dbzMax}`;
-    if (radarLayer) radarLayer.setDbzRange(preset.dbzMin, preset.dbzMax);
-
-    userOpacity = preset.intensity;
-    opacitySlider.value = preset.intensity;
-    opacityValue.textContent = Math.round(preset.intensity * 100) + '%';
-    if (radarLayer) radarLayer.setOpacity(preset.intensity);
-  }
-
-  presetSeg.querySelectorAll('.seg-btn').forEach(btn => {
-    btn.addEventListener('click', () => switchPreset(btn.dataset.preset));
-  });
-
-  // ── Refresh button ──────────────────────────────────────────────────────
-
-  document.getElementById('btn-refresh').addEventListener('click', async () => {
-    const wasPlaying = playing;
-    if (wasPlaying) pause();
-    await fetchTimestamps();
-    if (timestamps.length > 0 && radarLayer) {
-      radarLayer.updateVisibleTiles();
-      await loadAndShowFrame();
-    }
-    if (wasPlaying && timestamps.length >= 2) play();
-  });
-
-  // ── Reset view ──────────────────────────────────────────────────────────
-
-  document.getElementById('btn-reset-view').addEventListener('click', () => {
-    const pitch = (viewMode === '3d' || viewMode === 'volume') ? 50 : 0;
-    map.flyTo({ center: [-98.5, 39.8], zoom: 4, pitch, bearing: 0, duration: 800 });
-  });
-
-  // ── Legend ──────────────────────────────────────────────────────────────
-
-  const legendEl     = document.getElementById('legend');
-  const legendToggle = document.getElementById('btn-legend');
-
-  buildLegend(legendEl);
-
-  legendToggle.addEventListener('click', () => {
-    legendEl.classList.toggle('visible');
-    legendToggle.textContent = legendEl.classList.contains('visible') ? 'Hide legend' : 'Show legend';
-  });
+  map.on('moveend', () => engine.onViewportChange());
 }
 
 init();

@@ -245,5 +245,7 @@ async def ready():
 
 # ── Serve frontend static files ──────────────────────────────────────────────
 
-_FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_SRC_DIR = Path(__file__).resolve().parent.parent / "frontend"
+_FRONTEND_DIR = _DIST_DIR if _DIST_DIR.is_dir() else _SRC_DIR
 app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")
