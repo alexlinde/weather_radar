@@ -25,14 +25,13 @@ npm install react-native-webview
 │  │ RadarMap component                      │ │
 │  │                                         │ │
 │  │  ┌───────────────────────────────────┐  │ │
-│  │  │ WebView (embed mode)              │  │ │
-│  │  │ src={BASE_URL}/?mode=embed        │  │ │
+│  │  │ WebView (auto-detected)           │  │ │
+│  │  │ src={BASE_URL}/                   │  │ │
 │  │  │                                   │  │ │
 │  │  │  MapLibre + three.js + GLSL       │  │ │
-│  │  │  Minimal controls bar             │  │ │
+│  │  │  Responsive controls + expand btn │  │ │
 │  │  └───────────────────────────────────┘  │ │
 │  │                                         │ │
-│  │  [Native expand button overlay]         │ │
 │  └─────────────────────────────────────────┘ │
 │                                              │
 │  (on expand → modal)                         │
@@ -40,8 +39,8 @@ npm install react-native-webview
 │  ┌─────────────────────────────────────────┐ │
 │  │ RadarFullScreen (modal)                 │ │
 │  │                                         │ │
-│  │  WebView (full mode)                    │ │
-│  │  src={BASE_URL}/?mode=full              │ │
+│  │  WebView (same URL, responsive)         │ │
+│  │  src={BASE_URL}/#7/{lat}/{lon}/0/0      │ │
 │  │                                         │ │
 │  │  All controls: view mode, presets,      │ │
 │  │  animation bar, intensity, legend, etc. │ │
@@ -49,16 +48,28 @@ npm install react-native-webview
 └──────────────────────────────────────────────┘
 ```
 
-## URL Modes
+## Responsive Layout & Auto-Detection
 
-The radar frontend supports two display modes via query parameter:
+The radar frontend uses a single responsive layout that works on all screen sizes. No `?mode=` parameter is needed.
 
-| URL | Mode | Controls shown |
-|-----|------|----------------|
-| `{BASE_URL}/?mode=embed` | Embed | Minimal bottom bar: view mode segmented control, intensity slider, expand button |
-| `{BASE_URL}/` or `{BASE_URL}/?mode=full` | Full | Everything: control panel, animation bar, presets, dBZ range, legend, navigation |
+**Responsive behavior:**
+- Desktop (>600px): control panel top-right, animation bar bottom-center, legend, MapLibre nav controls.
+- Mobile (≤600px): control panel becomes a bottom sheet toggled by a hamburger button, animation bar stretches full-width.
 
-Both modes render the same radar data with the same GPU pipeline. The embed mode auto-plays animation and hides map navigation controls for a clean embedded appearance.
+**Embedded context auto-detection:**
+The frontend automatically detects when it's running inside a React Native WebView (`window.ReactNativeWebView`) or an iframe (`window.parent !== window`). When embedded:
+- The postMessage bridge activates (see API below)
+- An expand button appears in the top-right corner (sends `requestFullScreen` to the host)
+- URL hash sync is disabled (the host controls navigation)
+
+**Minimal mode (optional):**
+
+| URL | Controls shown |
+|-----|----------------|
+| `{BASE_URL}/` | Full responsive UI — adapts to screen size |
+| `{BASE_URL}/?controls=minimal` | Animation bar only — no control panel, nav, or legend |
+
+Use `?controls=minimal` when the host app provides its own controls and you want just the map + radar + animation. Both render the same radar data with the same GPU pipeline.
 
 ## postMessage API
 
@@ -105,11 +116,11 @@ interface RadarMapProps {
 
 ### Behavior
 
-1. **Inline mode (default):** Render a fixed-height WebView (240px, matching the current RadarMap height) loading `{radarBaseUrl}/?mode=embed`. The WebView is non-scrollable and transparent-background.
+1. **Inline mode (default):** Render a fixed-height WebView (240px, matching the current RadarMap height) loading `{radarBaseUrl}/`. The frontend auto-detects the WebView context and adapts. The WebView is non-scrollable and transparent-background.
 
 2. **Initial viewport:** On `ready` message, send a `setViewport` message to center the map on the station's `lat`/`lon` at zoom 6–7 (regional view, vs the default CONUS zoom 4).
 
-3. **Full-screen mode:** When the WebView sends `requestFullScreen`, open a modal/overlay containing a second WebView loading `{radarBaseUrl}/?mode=full`. Pass the same viewport center. Provide a close/back button.
+3. **Full-screen mode:** When the WebView sends `requestFullScreen`, open a modal/overlay containing a second WebView loading `{radarBaseUrl}/`. Pass the same viewport center via hash fragment. Provide a close/back button.
 
 4. **Loading state:** Show a placeholder/spinner until the `ready` message arrives. The radar server may take 1–2 minutes to seed on first boot (the frontend handles retry internally, but the WebView will show a blank map during this time).
 
@@ -174,7 +185,7 @@ export function RadarMap({ lat, lon, testID, radarBaseUrl }: RadarMapProps) {
       <View style={styles.container}>
         <WebView
           ref={embed.ref}
-          source={{ uri: `${baseUrl}/?mode=embed` }}
+          source={{ uri: `${baseUrl}/` }}
           style={styles.webview}
           scrollEnabled={false}
           bounces={false}
@@ -202,7 +213,7 @@ export function RadarMap({ lat, lon, testID, radarBaseUrl }: RadarMapProps) {
       >
         <View style={styles.fullScreenContainer}>
           <WebView
-            source={{ uri: `${baseUrl}/?mode=full#7/${lat}/${lon}/0/0` }}
+            source={{ uri: `${baseUrl}/#7/${lat}/${lon}/0/0` }}
             style={styles.fullScreenWebview}
             javaScriptEnabled
             domStorageEnabled
@@ -274,7 +285,7 @@ const styles = StyleSheet.create({
 The full-screen WebView URL uses the hash fragment to pre-set the map position:
 
 ```
-{baseUrl}/?mode=full#7/{lat}/{lon}/0/0
+{baseUrl}/#7/{lat}/{lon}/0/0
 ```
 
 Format: `#{zoom}/{lat}/{lng}/{bearing}/{pitch}`. The radar frontend parses this on load and initializes the map at that location. This avoids needing a `ready` → `setViewport` round-trip for the full-screen view.
@@ -314,7 +325,7 @@ To replace:
      return (
        <View testID={testID} style={{ height: 240, borderRadius: 8, overflow: 'hidden' }}>
          <iframe
-           src={`${baseUrl}/?mode=embed#7/${lat}/${lon}/0/0`}
+           src={`${baseUrl}/#7/${lat}/${lon}/0/0`}
            style={{ width: '100%', height: '100%', border: 'none' }}
            allow="webgl"
          />
@@ -338,7 +349,7 @@ To replace:
 
 The `RadarMap` component should have a co-located test file. Key test cases:
 
-1. Renders WebView with correct embed URL
+1. Renders WebView with correct URL
 2. Shows loading overlay before `ready` message
 3. Hides loading overlay after `ready` message
 4. Opens full-screen modal on `requestFullScreen` message

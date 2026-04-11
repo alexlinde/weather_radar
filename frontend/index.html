@@ -19,7 +19,23 @@
   <!-- Map container -->
   <div id="map"></div>
 
-  <!-- Full-mode: Control panel (top-right) -->
+  <!-- Mobile: hamburger toggle for control panel (hidden on desktop via CSS) -->
+  <button id="btn-mobile-toggle" title="Toggle controls" aria-label="Toggle controls">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+      <rect x="3" y="5" width="18" height="2" rx="1"/>
+      <rect x="3" y="11" width="18" height="2" rx="1"/>
+      <rect x="3" y="17" width="18" height="2" rx="1"/>
+    </svg>
+  </button>
+
+  <!-- Expand button (visible only in embedded contexts — WebView / iframe) -->
+  <button id="btn-expand" title="Full screen" aria-label="Expand to full screen">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+      <path d="M3 3h6v2H5v4H3V3zm12 0h6v6h-2V5h-4V3zM3 15h2v4h4v2H3v-6zm16 4h-4v2h6v-6h-2v4z"/>
+    </svg>
+  </button>
+
+  <!-- Control panel (top-right on desktop, bottom sheet on mobile) -->
   <div id="controls">
     <h2>Weather Radar</h2>
 
@@ -107,7 +123,7 @@
     </div>
   </div>
 
-  <!-- Full-mode: Animation bar (bottom-center) -->
+  <!-- Animation bar (bottom-center) -->
   <div id="animation-bar">
     <button id="btn-play" title="Play / Pause" aria-label="Play or pause animation">
       <svg id="icon-play" viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
@@ -137,33 +153,13 @@
     </select>
   </div>
 
-  <!-- Full-mode: Legend toggle (bottom-right) -->
+  <!-- Legend toggle (bottom-right) -->
   <div id="legend-toggle">
     <button id="btn-legend">Show legend</button>
   </div>
 
-  <!-- Full-mode: Legend panel -->
+  <!-- Legend panel -->
   <div id="legend" role="complementary" aria-label="Reflectivity colour scale"></div>
-
-  <!-- Embed-mode: minimal floating bar (hidden by default) -->
-  <div id="embed-bar" style="display:none">
-    <div class="seg-control" id="embed-mode-seg">
-      <button class="seg-btn active" data-mode="composite">Composite</button>
-      <button class="seg-btn" data-mode="3d">3D</button>
-      <button class="seg-btn" data-mode="volume">Volume</button>
-    </div>
-    <input
-      type="range"
-      id="embed-opacity"
-      min="0" max="1" step="0.01" value="0.8"
-      aria-label="Radar intensity"
-    />
-    <button id="embed-expand" title="Full screen" aria-label="Expand to full screen">
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-        <path d="M3 3h6v2H5v4H3V3zm12 0h6v6h-2V5h-4V3zM3 15h2v4h4v2H3v-6zm16 4h-4v2h6v-6h-2v4z"/>
-      </svg>
-    </button>
-  </div>
 
   <!-- App entry point (ES module) -->
   <script type="module" src="app.js"></script>

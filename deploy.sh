@@ -5,7 +5,7 @@ set -euo pipefail
 PROJECT_ID="weather-radar-prod"
 ZONE="us-east4-c"
 VM_NAME="weather-radar"
-MACHINE_TYPE="e2-small"
+MACHINE_TYPE="e2-medium"
 DOMAIN="wx.somefamilies.com"
 REPO_URL="https://github.com/alexlinde/weather_radar.git"
 APP_DIR="/opt/weather-radar"

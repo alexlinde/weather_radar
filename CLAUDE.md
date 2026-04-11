@@ -8,11 +8,11 @@ This is a working prototype, not a production app. Prioritise getting real data 
 
 ## Current status
 
-All planned phases are complete. The frontend has been refactored into ES modules with an embeddable mode for React Native integration.
+All planned phases are complete. The frontend has been refactored into ES modules with a responsive layout (mobile + desktop) and automatic WebView/iframe detection for React Native integration.
 
 The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a three.js overlay renderer synced to MapLibre's projection matrix, with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Three view modes use the same atlas tile data: Composite (fmax across bands on one ground plane), 3D (8 stacked planes at tilt altitudes), and Volume (ray-marched volumetric rendering). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS starting at a CONUS-wide view. 3D terrain is currently disabled pending a tile seam fix.
 
-The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). It supports two display modes — full (all controls) and embed (minimal bar for WebView embedding) — controlled by the `?mode=embed` URL parameter. A postMessage bridge (`radar-bridge.js`) enables bidirectional communication with React Native WebViews. An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
+The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). The layout is fully responsive — on desktop the control panel sits top-right; on mobile (≤600px) it becomes a bottom sheet toggled by a hamburger button. WebView/iframe context is auto-detected (`window.ReactNativeWebView` or `window.parent !== window`), which activates the postMessage bridge (`radar-bridge.js`) and shows an expand button — no special URL parameter needed. A `?controls=minimal` flag hides all chrome except the animation bar for stripped-down embedding. An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
 
 ## Architecture
 
@@ -43,13 +43,18 @@ The frontend is vanilla JS structured as ES modules, bundled for production by e
 **Module structure:**
 - `radar-layer.js` — three.js overlay renderer (`RadarLayer` as MapLibre `CustomLayerInterface`), all GLSL shaders, tile/motion texture caches, mesh management. Imports only `createColorRampData` from `colors.js`. This is the heaviest module (~1060 lines) and has zero DOM dependencies.
 - `radar-engine.js` — `RadarEngine` class (extends `EventTarget`): animation state machine, timestamp fetching with 503 retry, frame interpolation, preset logic, auto-refresh timer. Zero DOM dependencies — communicates via CustomEvent dispatch.
-- `radar-bridge.js` — `RadarBridge` class: postMessage bridge for React Native WebView communication. Translates inbound commands to engine calls, forwards engine events outbound.
+- `radar-bridge.js` — `RadarBridge` class: postMessage bridge for React Native WebView / iframe communication. Translates inbound commands to engine calls, forwards engine events outbound. Auto-started when an embedded context is detected.
 - `colors.js` — NWS color scale data, GPU ramp texture builder, DOM legend builder.
-- `app.js` — entry point. Initializes the map, creates RadarEngine + RadarBridge, wires the appropriate UI based on `?mode=embed` or `?mode=full` (default).
+- `app.js` — entry point. Initializes the map, creates RadarEngine, wires the responsive UI. Auto-detects embedded context to start the bridge and show the expand button.
 
-**Display modes (controlled by `?mode=` URL parameter):**
-- `full` (default) — all controls: control panel (top-right), animation bar (bottom-center), legend, presets, dBZ range sliders, URL hash persistence
-- `embed` — minimal floating bar (bottom-center) with view mode selector, intensity slider, and expand button. No animation bar, no control panel, no map nav controls. Designed for WebView embedding. The expand button sends a `requestFullScreen` postMessage to the RN host.
+**Responsive layout:**
+- Desktop (>600px): control panel top-right, animation bar bottom-center, legend toggle bottom-right, MapLibre nav controls.
+- Mobile (≤600px): control panel becomes a bottom sheet toggled by a hamburger button (top-right), animation bar stretches full-width, frame time hidden to save space. Tapping the map closes the sheet.
+- `?controls=minimal`: hides all chrome except the animation bar. No nav controls, no attribution. Useful for iframe/WebView embedding when the host provides its own UI.
+
+**Embedded context detection:**
+- Auto-detected via `window.ReactNativeWebView` (RN WebView) or `window.parent !== window` (iframe).
+- When embedded: postMessage bridge starts, expand button appears (sends `requestFullScreen` to host), URL hash sync is disabled.
 
 **Rendering responsibilities:**
 - Render base map with MapLibre GL JS (Stadia/MapTiler/OpenFreeMap cascade)
@@ -461,7 +466,7 @@ weather_radar/
 │   ├── build.js           ← esbuild config: bundle, minify, copy HTML
 │   ├── index.html         ← single-page app (full + embed mode markup)
 │   ├── style.css          ← dark theme, glassmorphism panels, embed bar styles
-│   ├── app.js             ← entry point: map init, mode detection, UI wiring
+│   ├── app.js             ← entry point: map init, responsive UI, WebView auto-detect
 │   ├── radar-engine.js    ← RadarEngine class: animation, timestamps, presets (no DOM)
 │   ├── radar-layer.js     ← RadarLayer: three.js overlay, GLSL shaders, tile/motion caches
 │   ├── radar-bridge.js    ← RadarBridge: postMessage API for RN WebView communication
@@ -508,11 +513,11 @@ uvicorn backend.main:app
 # Dev mode (skip S3 fetching, load from disk cache):
 DEV_MODE=1 uvicorn backend.main:app
 
-# Open in browser
+# Open in browser (responsive — works on desktop and mobile)
 open http://localhost:8000
 
-# Embed mode (minimal controls, for WebView testing):
-open http://localhost:8000/?mode=embed
+# Minimal controls mode (hides all chrome except animation bar):
+open http://localhost:8000/?controls=minimal
 ```
 
 The frontend build step is optional for development — browsers load the ES modules directly via `<script type="module">`. If `frontend/dist/` exists (from `npm run build`), FastAPI serves the minified bundle; otherwise it serves the raw source files.

@@ -404,81 +404,58 @@ select:focus-visible {
   outline-offset: 2px;
 }
 
-/* ── Embed-mode bar ────────────────────────────────────────────────────── */
+/* ── Mobile controls toggle button ─────────────────────────────────────── */
 
-#embed-bar {
+#btn-mobile-toggle {
+  display: none;
   position: absolute;
-  bottom: 16px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: rgba(13, 17, 23, 0.88);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
-  padding: 8px 14px;
-  backdrop-filter: blur(8px);
-  color: #e6edf3;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
-}
-
-#embed-bar .seg-control {
-  display: flex;
-  gap: 0;
-  border-radius: 6px;
-  overflow: hidden;
-  border: 1px solid rgba(255,255,255,0.15);
-}
-
-#embed-bar .seg-btn {
-  padding: 5px 10px;
-  font-size: 11px;
-  font-weight: 500;
-  border: none;
-  background: rgba(255,255,255,0.04);
-  color: #8b949e;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-  border-radius: 0;
-}
-
-#embed-bar .seg-btn:not(:last-child) {
-  border-right: 1px solid rgba(255,255,255,0.1);
-}
-
-#embed-bar .seg-btn:hover:not(.active) {
-  background: rgba(255,255,255,0.08);
-  color: #c9d1d9;
-}
-
-#embed-bar .seg-btn.active {
-  background: rgba(88,166,255,0.2);
-  color: #58a6ff;
-}
-
-#embed-bar input[type="range"] {
-  width: 80px;
-}
-
-#embed-expand {
-  flex: none;
-  width: 32px;
-  height: 32px;
-  display: flex;
+  top: 12px;
+  right: 12px;
+  z-index: 11;
+  width: 36px;
+  height: 36px;
   align-items: center;
   justify-content: center;
   padding: 0;
   border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 6px;
-  background: rgba(255,255,255,0.06);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.88);
+  backdrop-filter: blur(8px);
   color: #e6edf3;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.4);
 }
 
-#embed-expand:hover {
+#btn-mobile-toggle:hover {
+  background: rgba(88,166,255,0.15);
+  border-color: #58a6ff;
+}
+
+/* ── Expand button (WebView / iframe contexts) ─────────────────────────── */
+
+#btn-expand {
+  display: none;
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 11;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.88);
+  backdrop-filter: blur(8px);
+  color: #e6edf3;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+}
+
+#btn-expand:hover {
   background: rgba(88,166,255,0.15);
   border-color: #58a6ff;
 }
@@ -487,4 +464,85 @@ select:focus-visible {
 
 .maplibregl-ctrl-attrib {
   font-size: 10px !important;
+}
+
+/* ── Responsive: small screens ─────────────────────────────────────────── */
+
+@media (max-width: 600px) {
+  #btn-mobile-toggle {
+    display: flex;
+  }
+
+  #controls {
+    position: absolute;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    border-radius: 16px 16px 0 0;
+    padding: 16px 16px 24px;
+    max-height: 60vh;
+    overflow-y: auto;
+    transform: translateY(100%);
+    transition: transform 0.3s ease;
+  }
+
+  #controls.mobile-open {
+    transform: translateY(0);
+  }
+
+  #controls h2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  #animation-bar {
+    bottom: 12px;
+    min-width: 0;
+    width: calc(100% - 24px);
+    left: 12px;
+    transform: none;
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  #animation-bar #frame-time {
+    display: none;
+  }
+
+  #legend-toggle {
+    bottom: 68px;
+    right: 8px;
+  }
+
+  #legend {
+    bottom: 100px;
+    right: 8px;
+    left: 8px;
+  }
+}
+
+/* ── Minimal mode ──────────────────────────────────────────────────────── */
+
+body.controls-minimal #controls,
+body.controls-minimal #legend-toggle,
+body.controls-minimal #legend,
+body.controls-minimal #btn-mobile-toggle {
+  display: none !important;
+}
+
+body.controls-minimal #animation-bar {
+  bottom: 12px;
+  min-width: 0;
+}
+
+body.controls-minimal .maplibregl-ctrl-top-left,
+body.controls-minimal .maplibregl-ctrl-bottom-left {
+  display: none;
+}
+
+body.controls-minimal .maplibregl-ctrl-attrib {
+  display: none;
 }

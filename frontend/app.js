@@ -1,10 +1,18 @@
 /**
  * Weather Radar — application entry point.
  *
- * Initializes the map, creates a RadarEngine, and wires up the UI.
- * Supports two modes controlled by ?mode= URL parameter:
- *   - 'full' (default): all controls — control panel, animation bar, legend
- *   - 'embed': minimal bar with view mode, intensity, and expand button
+ * Initializes the map, creates a RadarEngine, and wires the UI.
+ *
+ * Layout is fully responsive — adapts to mobile/desktop via CSS media queries.
+ * On small screens the control panel slides up as a bottom sheet toggled by a
+ * hamburger button; on desktop it's always visible in the top-right corner.
+ *
+ * Two special behaviors are detected automatically:
+ *   - WebView context (window.ReactNativeWebView or window !== parent):
+ *     Starts the postMessage bridge for RN / iframe communication.
+ *   - ?controls=minimal: hides all chrome except the animation bar.
+ *     Useful for embedding via iframe or WebView when the host app provides
+ *     its own controls.
  */
 
 import { buildLegend } from './colors.js';
@@ -13,9 +21,12 @@ import { RadarBridge } from './radar-bridge.js';
 
 const API_BASE = '';
 
-function getMode() {
-  const params = new URLSearchParams(window.location.search);
-  return params.get('mode') === 'embed' ? 'embed' : 'full';
+function isMinimalMode() {
+  return new URLSearchParams(window.location.search).get('controls') === 'minimal';
+}
+
+function isEmbeddedContext() {
+  return !!(window.ReactNativeWebView || window.parent !== window);
 }
 
 // ── Map style selection ───────────────────────────────────────────────────────
@@ -59,10 +70,10 @@ function updateHash(map) {
   history.replaceState(null, '', `#${z}/${lat}/${lng}/${b}/${p}`);
 }
 
-// ── Full-mode UI wiring ──────────────────────────────────────────────────────
+// ── UI wiring ─────────────────────────────────────────────────────────────────
 
-function wireFullUI(engine, map) {
-  // Status
+function wireUI(engine, map, { minimal, embedded }) {
+  // ── Status ──────────────────────────────────────────────────────────────
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('timestamp');
   engine.addEventListener('status', e => {
@@ -70,7 +81,7 @@ function wireFullUI(engine, map) {
     statusText.textContent = e.detail.message || '';
   });
 
-  // Frame display
+  // ── Frame display ───────────────────────────────────────────────────────
   const scrubber = document.getElementById('frame-scrubber');
   const frameTime = document.getElementById('frame-time');
   const frameCounter = document.getElementById('frame-counter');
@@ -88,7 +99,7 @@ function wireFullUI(engine, map) {
     scrubber.value = engine.getCurrentFrameIndex();
   });
 
-  // Play/Pause
+  // ── Play/Pause ──────────────────────────────────────────────────────────
   const iconPlay = document.getElementById('icon-play');
   const iconPause = document.getElementById('icon-pause');
   document.getElementById('btn-play').addEventListener('click', () => engine.togglePlay());
@@ -97,17 +108,17 @@ function wireFullUI(engine, map) {
     iconPause.style.display = e.detail.playing ? '' : 'none';
   });
 
-  // Frame scrubber
+  // ── Frame scrubber ──────────────────────────────────────────────────────
   scrubber.addEventListener('input', () => {
     engine.setFrameIndex(parseInt(scrubber.value, 10));
   });
 
-  // Speed
+  // ── Speed ───────────────────────────────────────────────────────────────
   document.getElementById('speed-select').addEventListener('change', e => {
     engine.setSpeed(parseInt(e.target.value, 10));
   });
 
-  // Intensity
+  // ── Intensity ───────────────────────────────────────────────────────────
   const opacitySlider = document.getElementById('opacity-slider');
   const opacityValue = document.getElementById('opacity-value');
   opacitySlider.addEventListener('input', () => {
@@ -117,7 +128,7 @@ function wireFullUI(engine, map) {
     if (engine.activePreset !== 'custom') engine.switchPreset('custom');
   });
 
-  // View mode
+  // ── View mode ───────────────────────────────────────────────────────────
   const viewModeBtns = document.querySelectorAll('#view-mode-seg .seg-btn');
   viewModeBtns.forEach(btn => {
     btn.addEventListener('click', () => {
@@ -139,7 +150,7 @@ function wireFullUI(engine, map) {
     }
   });
 
-  // Vertical exaggeration
+  // ── Vertical exaggeration ──────────────────────────────────────────────
   const exagSlider = document.getElementById('exag-slider');
   const exagValue = document.getElementById('exag-value');
   exagSlider.addEventListener('input', () => {
@@ -148,7 +159,7 @@ function wireFullUI(engine, map) {
     exagValue.textContent = `${val}x`;
   });
 
-  // dBZ range
+  // ── dBZ range ──────────────────────────────────────────────────────────
   const dbzMinSlider = document.getElementById('dbz-min-slider');
   const dbzMaxSlider = document.getElementById('dbz-max-slider');
   const dbzRangeValue = document.getElementById('dbz-range-value');
@@ -163,7 +174,7 @@ function wireFullUI(engine, map) {
   dbzMinSlider.addEventListener('input', updateDbzRange);
   dbzMaxSlider.addEventListener('input', updateDbzRange);
 
-  // Presets
+  // ── Presets ────────────────────────────────────────────────────────────
   const presetSeg = document.getElementById('preset-seg');
   const dbzCutoffRow = document.getElementById('row-dbz-cutoff');
 
@@ -187,16 +198,15 @@ function wireFullUI(engine, map) {
     }
   });
 
-  // Refresh
+  // ── Refresh / Reset ───────────────────────────────────────────────────
   document.getElementById('btn-refresh').addEventListener('click', () => engine.refresh());
 
-  // Reset view
   document.getElementById('btn-reset-view').addEventListener('click', () => {
     const pitch = (engine.viewMode === '3d' || engine.viewMode === 'volume') ? 50 : 0;
     map.flyTo({ center: [-98.5, 39.8], zoom: 4, pitch, bearing: 0, duration: 800 });
   });
 
-  // Legend
+  // ── Legend ─────────────────────────────────────────────────────────────
   const legendEl = document.getElementById('legend');
   const legendToggle = document.getElementById('btn-legend');
   buildLegend(legendEl);
@@ -205,77 +215,55 @@ function wireFullUI(engine, map) {
     legendToggle.textContent = legendEl.classList.contains('visible') ? 'Hide legend' : 'Show legend';
   });
 
-  // Hash sync
-  map.on('moveend', () => updateHash(map));
-  map.on('zoomend', () => updateHash(map));
-  map.on('pitchend', () => {
-    updateHash(map);
-    if (map.getPitch() > 0 && engine.viewMode === 'composite') {
-      engine.setViewMode('3d');
-    }
+  // ── Mobile controls toggle ────────────────────────────────────────────
+  const mobileToggle = document.getElementById('btn-mobile-toggle');
+  const controlsPanel = document.getElementById('controls');
+  mobileToggle.addEventListener('click', () => {
+    controlsPanel.classList.toggle('mobile-open');
   });
-  map.on('rotateend', () => updateHash(map));
-  updateHash(map);
-}
 
-// ── Embed-mode UI wiring ─────────────────────────────────────────────────────
-
-function wireEmbedUI(engine, map, bridge) {
-  const embedBar = document.getElementById('embed-bar');
-  embedBar.style.display = '';
-
-  // Hide full-mode UI elements
-  document.getElementById('controls').style.display = 'none';
-  document.getElementById('animation-bar').style.display = 'none';
-  document.getElementById('legend-toggle').style.display = 'none';
-  document.getElementById('legend').style.display = 'none';
-
-  // Hide MapLibre nav controls
-  const navControls = document.querySelectorAll('.maplibregl-ctrl-top-left');
-  navControls.forEach(el => { el.style.display = 'none'; });
-
-  // View mode buttons
-  const modeBtns = document.querySelectorAll('#embed-mode-seg .seg-btn');
-  modeBtns.forEach(btn => {
-    btn.addEventListener('click', () => engine.setViewMode(btn.dataset.mode));
+  // Close the bottom sheet when tapping the map on mobile
+  map.on('click', () => {
+    controlsPanel.classList.remove('mobile-open');
   });
-  engine.addEventListener('viewmode', e => {
-    modeBtns.forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.mode === e.detail.mode);
+
+  // ── Hash sync (skip in embedded contexts — host controls position) ────
+  if (!embedded) {
+    map.on('moveend', () => updateHash(map));
+    map.on('zoomend', () => updateHash(map));
+    map.on('pitchend', () => {
+      updateHash(map);
+      if (map.getPitch() > 0 && engine.viewMode === 'composite') {
+        engine.setViewMode('3d');
+      }
     });
-    if (e.detail.mode === 'composite') {
-      map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
-    } else {
-      map.easeTo({ pitch: 50, duration: 600 });
-    }
-  });
+    map.on('rotateend', () => updateHash(map));
+    updateHash(map);
+  }
 
-  // Intensity slider
-  const slider = document.getElementById('embed-opacity');
-  slider.addEventListener('input', () => {
-    engine.setOpacity(parseFloat(slider.value));
-  });
+  // ── Expand button (visible only in embedded contexts) ─────────────────
+  const expandBtn = document.getElementById('btn-expand');
+  if (embedded && !minimal) {
+    expandBtn.style.display = 'flex';
+  }
 
-  // Expand button
-  document.getElementById('embed-expand').addEventListener('click', () => {
-    bridge.requestFullScreen();
-  });
-
-  // Status — use a simple attribute on the bar
-  engine.addEventListener('status', e => {
-    embedBar.dataset.status = e.detail.state || 'ok';
-  });
+  return { expandBtn };
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
-  const mode = getMode();
+  const minimal = isMinimalMode();
+  const embedded = isEmbeddedContext();
   const engine = new RadarEngine({ apiBase: API_BASE });
+
+  if (minimal) {
+    document.body.classList.add('controls-minimal');
+  }
 
   const styleUrl = await resolveMapStyle();
 
-  const saved = mode === 'full' ? parseHash() : null;
+  const saved = !embedded ? parseHash() : null;
   if (saved && saved.pitch > 0) engine.viewMode = '3d';
 
   const map = new maplibregl.Map({
@@ -285,28 +273,29 @@ async function init() {
     zoom: saved?.zoom ?? 4,
     pitch: saved?.pitch ?? 0,
     bearing: saved?.bearing ?? 0,
-    attributionControl: mode === 'full',
+    attributionControl: !minimal,
   });
 
-  if (mode === 'full') {
-    // Sync view mode buttons with restored state
-    document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.mode === engine.viewMode);
-    });
-    if (engine.viewMode === '3d') {
-      document.getElementById('row-exaggeration').style.display = '';
-    }
-
+  if (!minimal) {
     map.addControl(new maplibregl.NavigationControl(), 'top-left');
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
-
-    wireFullUI(engine, map);
   }
 
+  // Sync view mode buttons with restored state
+  document.querySelectorAll('#view-mode-seg .seg-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === engine.viewMode);
+  });
+  if (engine.viewMode === '3d') {
+    document.getElementById('row-exaggeration').style.display = '';
+  }
+
+  const { expandBtn } = wireUI(engine, map, { minimal, embedded });
+
+  // Start the postMessage bridge when inside a WebView or iframe
   const bridge = new RadarBridge(engine, map);
-  if (mode === 'embed') {
-    wireEmbedUI(engine, map, bridge);
+  if (embedded) {
     bridge.start();
+    expandBtn.addEventListener('click', () => bridge.requestFullScreen());
   }
 
   map.on('load', async () => {
