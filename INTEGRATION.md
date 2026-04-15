@@ -86,6 +86,7 @@ Send JSON strings via `webViewRef.current.postMessage(JSON.stringify(msg))`.
 | `setPreset` | `{ type: 'setPreset', preset: 'all'\|'precip'\|'severe' }` | Apply filter preset |
 | `setIntensity` | `{ type: 'setIntensity', value: 0.0–1.0 }` | Set radar opacity |
 | `setViewport` | `{ type: 'setViewport', center: [lng, lat], zoom: number }` | Fly map to location |
+| `seekFrame` | `{ type: 'seekFrame', index: number }` | Seek to frame by index (0-based). Pauses playback. Use with `total` from `frameChanged` events. |
 | `play` | `{ type: 'play' }` | Start animation |
 | `pause` | `{ type: 'pause' }` | Pause animation |
 

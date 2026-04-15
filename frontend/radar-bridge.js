@@ -6,6 +6,7 @@
  *   { type: 'setPreset', preset: 'all'|'precip'|'severe' }
  *   { type: 'setIntensity', value: 0.0–1.0 }
  *   { type: 'setViewport', center: [lng, lat], zoom: number }
+ *   { type: 'seekFrame', index: 0–N }
  *   { type: 'play' }
  *   { type: 'pause' }
  *
@@ -75,6 +76,9 @@ export class RadarBridge {
             duration: 600,
           });
         }
+        break;
+      case 'seekFrame':
+        if (msg.index != null) this._engine.setFrameIndex(parseInt(msg.index, 10));
         break;
       case 'play':
         this._engine.play();
