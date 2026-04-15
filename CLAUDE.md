@@ -49,7 +49,7 @@ The frontend is vanilla JS structured as ES modules, bundled for production by e
 
 **Responsive layout:**
 - Desktop (>600px): control panel top-right, animation bar bottom-center, legend toggle bottom-right, MapLibre nav controls.
-- Mobile (≤600px): control panel becomes a bottom sheet toggled by a hamburger button (top-right), animation bar stretches full-width, frame time hidden to save space. Tapping the map closes the sheet.
+- Mobile (≤600px): animation bar stretches full-width with a square play/pause button and a hamburger button on the right end. The hamburger opens the control panel as a popup floating above the toolbar. Frame time hidden to save space. Tapping the map dismisses the popup.
 - `?controls=minimal`: hides all chrome except the animation bar. No nav controls, no attribution. Useful for iframe/WebView embedding when the host provides its own UI.
 
 **Embedded context detection:**

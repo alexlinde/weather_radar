@@ -19,15 +19,6 @@
   <!-- Map container -->
   <div id="map"></div>
 
-  <!-- Mobile: hamburger toggle for control panel (hidden on desktop via CSS) -->
-  <button id="btn-mobile-toggle" title="Toggle controls" aria-label="Toggle controls">
-    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
-      <rect x="3" y="5" width="18" height="2" rx="1"/>
-      <rect x="3" y="11" width="18" height="2" rx="1"/>
-      <rect x="3" y="17" width="18" height="2" rx="1"/>
-    </svg>
-  </button>
-
   <!-- Expand button (visible only in embedded contexts — WebView / iframe) -->
   <button id="btn-expand" title="Full screen" aria-label="Expand to full screen">
     <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
@@ -151,6 +142,15 @@
       <option value="250">2x</option>
       <option value="150">3x</option>
     </select>
+
+    <!-- Mobile: hamburger toggle for options (hidden on desktop via CSS) -->
+    <button id="btn-mobile-toggle" title="Toggle controls" aria-label="Toggle controls">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+        <rect x="3" y="5" width="18" height="2" rx="1"/>
+        <rect x="3" y="11" width="18" height="2" rx="1"/>
+        <rect x="3" y="17" width="18" height="2" rx="1"/>
+      </svg>
+    </button>
   </div>
 
   <!-- Legend toggle (bottom-right) -->

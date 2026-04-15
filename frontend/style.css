@@ -231,6 +231,14 @@ input[type="range"]::-moz-range-track {
   z-index: 10;
 }
 
+#legend-toggle button {
+  background: rgba(13, 17, 23, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+  padding: 6px 12px;
+}
+
 #legend {
   position: absolute;
   bottom: 60px;
@@ -338,7 +346,7 @@ input[type="range"]::-moz-range-track {
   min-width: 340px;
 }
 
-#btn-play {
+#animation-bar #btn-play {
   flex: none;
   width: 32px;
   height: 32px;
@@ -346,7 +354,7 @@ input[type="range"]::-moz-range-track {
   align-items: center;
   justify-content: center;
   padding: 0;
-  border-radius: 50%;
+  border-radius: 6px;
 }
 
 #frame-scrubber {
@@ -404,32 +412,17 @@ select:focus-visible {
   outline-offset: 2px;
 }
 
-/* ── Mobile controls toggle button ─────────────────────────────────────── */
+/* ── Mobile controls toggle button (lives inside #animation-bar) ──────── */
 
-#btn-mobile-toggle {
+#animation-bar #btn-mobile-toggle {
   display: none;
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 11;
-  width: 36px;
-  height: 36px;
+  flex: none;
+  width: 32px;
+  height: 32px;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 8px;
-  background: rgba(13, 17, 23, 0.88);
-  backdrop-filter: blur(8px);
-  color: #e6edf3;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.4);
-}
-
-#btn-mobile-toggle:hover {
-  background: rgba(88,166,255,0.15);
-  border-color: #58a6ff;
+  border-radius: 6px;
 }
 
 /* ── Expand button (WebView / iframe contexts) ─────────────────────────── */
@@ -469,33 +462,8 @@ select:focus-visible {
 /* ── Responsive: small screens ─────────────────────────────────────────── */
 
 @media (max-width: 600px) {
-  #btn-mobile-toggle {
+  #animation-bar #btn-mobile-toggle {
     display: flex;
-  }
-
-  #controls {
-    position: absolute;
-    top: auto;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    width: 100%;
-    border-radius: 16px 16px 0 0;
-    padding: 16px 16px 24px;
-    max-height: 60vh;
-    overflow-y: auto;
-    transform: translateY(100%);
-    transition: transform 0.3s ease;
-  }
-
-  #controls.mobile-open {
-    transform: translateY(0);
-  }
-
-  #controls h2 {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
   }
 
   #animation-bar {
@@ -512,15 +480,41 @@ select:focus-visible {
     display: none;
   }
 
+  /* Controls panel pops up from the toolbar */
+  #controls {
+    position: absolute;
+    top: auto;
+    right: 12px;
+    left: 12px;
+    bottom: 64px;
+    width: auto;
+    border-radius: 10px;
+    padding: 14px 16px;
+    max-height: 55vh;
+    overflow-y: auto;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(8px);
+    transition: opacity 0.2s ease, transform 0.2s ease, visibility 0.2s;
+  }
+
+  #controls.mobile-open {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+  }
+
   #legend-toggle {
-    bottom: 68px;
-    right: 8px;
+    bottom: auto;
+    top: 12px;
+    right: 12px;
   }
 
   #legend {
-    bottom: 100px;
-    right: 8px;
-    left: 8px;
+    bottom: auto;
+    top: 48px;
+    right: 12px;
+    left: auto;
   }
 }
 
@@ -528,8 +522,11 @@ select:focus-visible {
 
 body.controls-minimal #controls,
 body.controls-minimal #legend-toggle,
-body.controls-minimal #legend,
-body.controls-minimal #btn-mobile-toggle {
+body.controls-minimal #legend {
+  display: none !important;
+}
+
+body.controls-minimal #animation-bar #btn-mobile-toggle {
   display: none !important;
 }
 

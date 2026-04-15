@@ -4,8 +4,8 @@
  * Initializes the map, creates a RadarEngine, and wires the UI.
  *
  * Layout is fully responsive — adapts to mobile/desktop via CSS media queries.
- * On small screens the control panel slides up as a bottom sheet toggled by a
- * hamburger button; on desktop it's always visible in the top-right corner.
+ * On small screens the control panel pops up from the bottom animation toolbar
+ * via a hamburger button; on desktop it's always visible in the top-right corner.
  *
  * Two special behaviors are detected automatically:
  *   - WebView context (window.ReactNativeWebView or window !== parent):
@@ -215,14 +215,15 @@ function wireUI(engine, map, { minimal, embedded }) {
     legendToggle.textContent = legendEl.classList.contains('visible') ? 'Hide legend' : 'Show legend';
   });
 
-  // ── Mobile controls toggle ────────────────────────────────────────────
+  // ── Mobile controls toggle (hamburger inside animation bar) ────────────
   const mobileToggle = document.getElementById('btn-mobile-toggle');
   const controlsPanel = document.getElementById('controls');
-  mobileToggle.addEventListener('click', () => {
+  mobileToggle.addEventListener('click', (e) => {
+    e.stopPropagation();
     controlsPanel.classList.toggle('mobile-open');
   });
 
-  // Close the bottom sheet when tapping the map on mobile
+  // Close the popup when tapping the map
   map.on('click', () => {
     controlsPanel.classList.remove('mobile-open');
   });

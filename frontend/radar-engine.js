@@ -80,7 +80,6 @@ export class RadarEngine extends EventTarget {
     if (ok && this.timestamps.length > 0) {
       this._radarLayer.updateVisibleTiles();
       await this.loadAndShowFrame();
-      if (this.timestamps.length >= 2) this.play();
     }
     this.startAutoRefresh();
   }
