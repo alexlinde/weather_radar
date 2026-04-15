@@ -12,7 +12,7 @@ All planned phases are complete. The frontend has been refactored into ES module
 
 The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a three.js overlay renderer synced to MapLibre's projection matrix, with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Three view modes use the same atlas tile data: Composite (fmax across bands on one ground plane), 3D (8 stacked planes at tilt altitudes), and Volume (ray-marched volumetric rendering). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS starting at a CONUS-wide view. 3D terrain is currently disabled pending a tile seam fix.
 
-The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). The layout is fully responsive — on desktop the control panel sits top-right; on mobile (≤600px) it becomes a bottom sheet toggled by a hamburger button. WebView/iframe context is auto-detected (`window.ReactNativeWebView` or `window.parent !== window`), which activates the postMessage bridge (`radar-bridge.js`) and shows an expand button — no special URL parameter needed. A `?controls=minimal` flag hides all chrome except the animation bar for stripped-down embedding. An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
+The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). The layout is fully responsive — on desktop the control panel sits top-right; on mobile (≤600px) a hamburger button in the animation bar opens the control panel as a popup above the toolbar. WebView/iframe context is auto-detected (`window.ReactNativeWebView` or `window.parent !== window`), which activates the postMessage bridge (`radar-bridge.js`) and shows an expand button — no special URL parameter needed. A `?controls=minimal` flag hides all chrome except the animation bar for stripped-down embedding. An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
 
 ## Architecture
 
@@ -464,8 +464,8 @@ weather_radar/
 │   ├── package.json       ← esbuild dev dependency, build/watch scripts
 │   ├── package-lock.json  ← locked dependency versions (committed)
 │   ├── build.js           ← esbuild config: bundle, minify, copy HTML
-│   ├── index.html         ← single-page app (full + embed mode markup)
-│   ├── style.css          ← dark theme, glassmorphism panels, embed bar styles
+│   ├── index.html         ← single-page app (responsive layout)
+│   ├── style.css          ← dark theme, glassmorphism panels, responsive mobile styles
 │   ├── app.js             ← entry point: map init, responsive UI, WebView auto-detect
 │   ├── radar-engine.js    ← RadarEngine class: animation, timestamps, presets (no DOM)
 │   ├── radar-layer.js     ← RadarLayer: three.js overlay, GLSL shaders, tile/motion caches
@@ -522,7 +522,7 @@ open http://localhost:8000/?controls=minimal
 
 The frontend build step is optional for development — browsers load the ES modules directly via `<script type="module">`. If `frontend/dist/` exists (from `npm run build`), FastAPI serves the minified bundle; otherwise it serves the raw source files.
 
-The server seeds 60 frames on startup in a background thread, then pre-renders atlas tiles for the default CONUS viewport and computes motion fields for all consecutive pairs. After seeding, a background task polls S3 every 60 seconds to pick up new frames and purge data older than 3 hours. The frontend auto-retries until frames are available (~1-2 minutes). In `DEV_MODE`, frames load from disk cache in ~1 second; motion fields are computed for any new pairs.
+The server seeds 60 frames on startup in a background thread, then pre-renders atlas tiles for the default CONUS viewport and computes motion fields for all consecutive pairs. After seeding, a background task polls S3 every 60 seconds to pick up new frames and purge data older than 3 hours. The frontend auto-retries until frames are available (~1-2 minutes). Once loaded, the radar starts paused on the latest (newest) frame — the user taps play to animate. In `DEV_MODE`, frames load from disk cache in ~1 second; motion fields are computed for any new pairs.
 
 ## Running Tests
 

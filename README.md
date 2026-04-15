@@ -59,17 +59,26 @@ cp .env.example .env
 - **3D** — eight tilt levels rendered as stacked translucent planes at their physical altitudes.
 - **Volume** — GPU ray-marched volumetric rendering through all tilt levels.
 
-Use the playback controls to animate through time. Storms slide smoothly between keyframes via motion-compensated interpolation.
+The radar starts paused on the latest frame. Use the playback controls to animate through time — storms slide smoothly between keyframes via motion-compensated interpolation.
 
-## Embedding in React Native
+## Responsive layout
 
-The radar supports an embed mode for use inside a React Native WebView:
+The UI adapts to screen size:
+
+- **Desktop** — control panel (top-right), animation bar (bottom-center), legend toggle (bottom-right).
+- **Mobile** — animation bar stretches full-width with a hamburger button that opens controls as a popup. Legend toggle moves to top-right.
+
+## Embedding
+
+The radar auto-detects when it's running inside a React Native WebView or iframe and activates a postMessage bridge for programmatic control. No special URL parameter is needed — just load the base URL.
+
+For a stripped-down view where the host provides its own controls:
 
 ```
-http://localhost:8000/?mode=embed
+http://localhost:8000/?controls=minimal
 ```
 
-This shows a minimal control bar (view mode, intensity, expand button) with no animation controls or panels — designed for landscape embedding. A postMessage bridge enables the host app to control the radar programmatically and receive state events. See [INTEGRATION.md](INTEGRATION.md) for the full spec and reference implementation.
+See [INTEGRATION.md](INTEGRATION.md) for the full React Native spec, postMessage API, and reference implementation.
 
 ## Data source
 

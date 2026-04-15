@@ -54,12 +54,12 @@ The radar frontend uses a single responsive layout that works on all screen size
 
 **Responsive behavior:**
 - Desktop (>600px): control panel top-right, animation bar bottom-center, legend, MapLibre nav controls.
-- Mobile (≤600px): control panel becomes a bottom sheet toggled by a hamburger button, animation bar stretches full-width.
+- Mobile (≤600px): animation bar stretches full-width with a square play/pause button and a hamburger on the right end. Hamburger opens the control panel as a popup above the toolbar. Legend toggle moves to top-right.
 
 **Embedded context auto-detection:**
 The frontend automatically detects when it's running inside a React Native WebView (`window.ReactNativeWebView`) or an iframe (`window.parent !== window`). When embedded:
 - The postMessage bridge activates (see API below)
-- An expand button appears in the top-right corner (sends `requestFullScreen` to the host)
+- An expand button appears top-left (sends `requestFullScreen` to the host)
 - URL hash sync is disabled (the host controls navigation)
 
 **Minimal mode (optional):**
@@ -96,7 +96,7 @@ Received via the WebView's `onMessage` prop. Parse with `JSON.parse(event.native
 |---------|--------|------|
 | `ready` | `{ type: 'ready', timestamps: number }` | Radar loaded and frames available |
 | `frameChanged` | `{ type: 'frameChanged', timestamp: string, index: number, total: number }` | Current animation frame changed |
-| `requestFullScreen` | `{ type: 'requestFullScreen' }` | User tapped expand button in embed mode |
+| `requestFullScreen` | `{ type: 'requestFullScreen' }` | User tapped expand button (embedded context) |
 | `error` | `{ type: 'error', message: string }` | Fetch or rendering error |
 
 ## Component Spec: RadarMap
@@ -118,7 +118,7 @@ interface RadarMapProps {
 
 1. **Inline mode (default):** Render a fixed-height WebView (240px, matching the current RadarMap height) loading `{radarBaseUrl}/`. The frontend auto-detects the WebView context and adapts. The WebView is non-scrollable and transparent-background.
 
-2. **Initial viewport:** On `ready` message, send a `setViewport` message to center the map on the station's `lat`/`lon` at zoom 6–7 (regional view, vs the default CONUS zoom 4).
+2. **Initial viewport:** On `ready` message, send a `setViewport` message to center the map on the station's `lat`/`lon` at zoom 6–7 (regional view, vs the default CONUS zoom 4). The radar starts paused on the latest frame — send a `play` message to start animation if desired.
 
 3. **Full-screen mode:** When the WebView sends `requestFullScreen`, open a modal/overlay containing a second WebView loading `{radarBaseUrl}/`. Pass the same viewport center via hash fragment. Provide a close/back button.
 
@@ -342,7 +342,7 @@ To replace:
 - **CORS:** Not an issue — the WebView loads from the radar server origin, and all API calls are same-origin.
 - **Cache:** Atlas tiles use `Cache-Control: immutable`. The WebView's HTTP cache makes revisited animation frames instant.
 - **Memory:** The radar uses ~50–100 MB of WebView memory for textures. On low-memory devices, the WebView may reclaim textures (they reload automatically on next access).
-- **Touch events:** The embed mode WebView handles pan/zoom gestures internally (MapLibre). Set `scrollEnabled={false}` and `bounces={false}` to prevent RN scroll view interference.
+- **Touch events:** The WebView handles pan/zoom gestures internally (MapLibre). Set `scrollEnabled={false}` and `bounces={false}` to prevent RN scroll view interference.
 - **Orientation:** The embed is designed for landscape but works in portrait. The full-screen modal should allow both orientations via `supportedOrientations`.
 
 ## Testing
