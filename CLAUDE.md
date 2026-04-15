@@ -12,7 +12,7 @@ All planned phases are complete. The frontend has been refactored into ES module
 
 The app fetches tilt-level reflectivity data across 8 vertical levels, stores them as sparse matrices (scipy.sparse CSR). The backend serves 256×2048 grayscale PNG atlas tiles — 8 tilt levels stacked vertically — via a standard TMS endpoint, plus per-frame-pair motion vector PNGs computed via FFT block matching. The frontend uses a three.js overlay renderer synced to MapLibre's projection matrix, with GLSL shaders for GPU-side dBZ decoding, NWS color ramp lookup, motion-compensated semi-Lagrangian advection between frames, and spatial smoothing. Three view modes use the same atlas tile data: Composite (fmax across bands on one ground plane), 3D (8 stacked planes at tilt altitudes), and Volume (ray-marched volumetric rendering). Animation uses continuous float time with motion-compensated interpolation so storms slide smoothly between 2-minute keyframes. The map uses MapLibre GL JS starting at a CONUS-wide view. 3D terrain is currently disabled pending a tile seam fix.
 
-The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). The layout is fully responsive — on desktop the control panel sits top-right; on mobile (≤600px) a hamburger button in the animation bar opens the control panel as a popup above the toolbar. WebView/iframe context is auto-detected (`window.ReactNativeWebView` or `window.parent !== window`), which activates the postMessage bridge (`radar-bridge.js`) and shows an expand button — no special URL parameter needed. A `?controls=minimal` flag hides all chrome except the animation bar for stripped-down embedding. An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
+The frontend is structured as ES modules with a clean separation between rendering (`radar-layer.js`), engine logic (`radar-engine.js`), and UI wiring (`app.js`). The layout is fully responsive — on desktop the control panel sits top-right; on mobile (≤600px) a hamburger button in the animation bar opens the control panel as a popup above the toolbar. WebView/iframe context is auto-detected (`window.ReactNativeWebView` or `window.parent !== window`), which activates the postMessage bridge (`radar-bridge.js`) and shows an expand button — no special URL parameter needed. A `?controls=` parameter selects the UI chrome level: `full` (default, all controls), `minimal` (animation bar only), or `none` (no UI chrome — host app controls everything via postMessage). An esbuild pipeline bundles and minifies the JS/CSS for production deployment. See `INTEGRATION.md` for the React Native integration spec.
 
 ## Architecture
 
@@ -50,7 +50,8 @@ The frontend is vanilla JS structured as ES modules, bundled for production by e
 **Responsive layout:**
 - Desktop (>600px): control panel top-right, animation bar bottom-center, legend toggle bottom-right, MapLibre nav controls.
 - Mobile (≤600px): animation bar stretches full-width with a square play/pause button and a hamburger button on the right end. The hamburger opens the control panel as a popup floating above the toolbar. Frame time hidden to save space. Tapping the map dismisses the popup.
-- `?controls=minimal`: hides all chrome except the animation bar. No nav controls, no attribution. Useful for iframe/WebView embedding when the host provides its own UI.
+- `?controls=minimal`: hides all chrome except the animation bar. No nav controls, no attribution.
+- `?controls=none`: hides all UI chrome including the animation bar. The host app controls everything via postMessage. Expand button is also hidden.
 
 **Embedded context detection:**
 - Auto-detected via `window.ReactNativeWebView` (RN WebView) or `window.parent !== window` (iframe).
@@ -516,8 +517,11 @@ DEV_MODE=1 uvicorn backend.main:app
 # Open in browser (responsive — works on desktop and mobile)
 open http://localhost:8000
 
-# Minimal controls mode (hides all chrome except animation bar):
+# Minimal controls mode (animation bar only):
 open http://localhost:8000/?controls=minimal
+
+# No controls mode (bare map + radar, for embedded use with postMessage):
+open http://localhost:8000/?controls=none
 ```
 
 The frontend build step is optional for development — browsers load the ES modules directly via `<script type="module">`. If `frontend/dist/` exists (from `npm run build`), FastAPI serves the minified bundle; otherwise it serves the raw source files.

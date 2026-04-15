@@ -543,3 +543,19 @@ body.controls-minimal .maplibregl-ctrl-bottom-left {
 body.controls-minimal .maplibregl-ctrl-attrib {
   display: none;
 }
+
+/* ── No-controls mode (bare map + radar, host drives via postMessage) ── */
+
+body.controls-none #controls,
+body.controls-none #legend-toggle,
+body.controls-none #legend,
+body.controls-none #animation-bar,
+body.controls-none #btn-expand {
+  display: none !important;
+}
+
+body.controls-none .maplibregl-ctrl-top-left,
+body.controls-none .maplibregl-ctrl-bottom-left,
+body.controls-none .maplibregl-ctrl-attrib {
+  display: none;
+}

@@ -26,10 +26,10 @@ npm install react-native-webview
 │  │                                         │ │
 │  │  ┌───────────────────────────────────┐  │ │
 │  │  │ WebView (auto-detected)           │  │ │
-│  │  │ src={BASE_URL}/                   │  │ │
+│  │  │ src={BASE_URL}/?controls=none     │  │ │
 │  │  │                                   │  │ │
 │  │  │  MapLibre + three.js + GLSL       │  │ │
-│  │  │  Responsive controls + expand btn │  │ │
+│  │  │  No UI chrome — host controls     │  │ │
 │  │  └───────────────────────────────────┘  │ │
 │  │                                         │ │
 │  └─────────────────────────────────────────┘ │
@@ -62,14 +62,15 @@ The frontend automatically detects when it's running inside a React Native WebVi
 - An expand button appears top-left (sends `requestFullScreen` to the host)
 - URL hash sync is disabled (the host controls navigation)
 
-**Minimal mode (optional):**
+**Controls mode (`?controls=` parameter):**
 
-| URL | Controls shown |
-|-----|----------------|
-| `{BASE_URL}/` | Full responsive UI — adapts to screen size |
-| `{BASE_URL}/?controls=minimal` | Animation bar only — no control panel, nav, or legend |
+| URL | Controls shown | Typical use |
+|-----|----------------|-------------|
+| `{BASE_URL}/` | Full responsive UI — adapts to screen size | Full-screen modal |
+| `{BASE_URL}/?controls=minimal` | Animation bar only — no control panel, nav, or legend | Compact embed with basic playback |
+| `{BASE_URL}/?controls=none` | No UI chrome at all — bare map + radar rendering | Inline embed where the host app provides all controls via postMessage |
 
-Use `?controls=minimal` when the host app provides its own controls and you want just the map + radar + animation. Both render the same radar data with the same GPU pipeline.
+All three modes render the same radar data with the same GPU pipeline. The `none` mode is designed for inline embedding where the native app drives playback, view mode, and settings entirely through the postMessage bridge.
 
 ## postMessage API
 
@@ -116,7 +117,7 @@ interface RadarMapProps {
 
 ### Behavior
 
-1. **Inline mode (default):** Render a fixed-height WebView (240px, matching the current RadarMap height) loading `{radarBaseUrl}/`. The frontend auto-detects the WebView context and adapts. The WebView is non-scrollable and transparent-background.
+1. **Inline mode (default):** Render a fixed-height WebView (240px, matching the current RadarMap height) loading `{radarBaseUrl}/?controls=none`. The frontend auto-detects the WebView context and activates the postMessage bridge. No UI chrome is rendered — the host app provides its own controls. The WebView is non-scrollable and transparent-background.
 
 2. **Initial viewport:** On `ready` message, send a `setViewport` message to center the map on the station's `lat`/`lon` at zoom 6–7 (regional view, vs the default CONUS zoom 4). The radar starts paused on the latest frame — send a `play` message to start animation if desired.
 
@@ -185,7 +186,7 @@ export function RadarMap({ lat, lon, testID, radarBaseUrl }: RadarMapProps) {
       <View style={styles.container}>
         <WebView
           ref={embed.ref}
-          source={{ uri: `${baseUrl}/` }}
+          source={{ uri: `${baseUrl}/?controls=none` }}
           style={styles.webview}
           scrollEnabled={false}
           bounces={false}
@@ -325,7 +326,7 @@ To replace:
      return (
        <View testID={testID} style={{ height: 240, borderRadius: 8, overflow: 'hidden' }}>
          <iframe
-           src={`${baseUrl}/#7/${lat}/${lon}/0/0`}
+           src={`${baseUrl}/?controls=none#7/${lat}/${lon}/0/0`}
            style={{ width: '100%', height: '100%', border: 'none' }}
            allow="webgl"
          />

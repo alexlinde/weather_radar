@@ -10,9 +10,10 @@
  * Two special behaviors are detected automatically:
  *   - WebView context (window.ReactNativeWebView or window !== parent):
  *     Starts the postMessage bridge for RN / iframe communication.
- *   - ?controls=minimal: hides all chrome except the animation bar.
- *     Useful for embedding via iframe or WebView when the host app provides
- *     its own controls.
+ *   - ?controls= parameter selects UI chrome level:
+ *       full (default) — all controls visible
+ *       minimal — animation bar only
+ *       none — no UI chrome; host app controls via postMessage
  */
 
 import { buildLegend } from './colors.js';
@@ -21,8 +22,11 @@ import { RadarBridge } from './radar-bridge.js';
 
 const API_BASE = '';
 
-function isMinimalMode() {
-  return new URLSearchParams(window.location.search).get('controls') === 'minimal';
+function getControlsMode() {
+  const val = new URLSearchParams(window.location.search).get('controls');
+  if (val === 'none') return 'none';
+  if (val === 'minimal') return 'minimal';
+  return 'full';
 }
 
 function isEmbeddedContext() {
@@ -72,7 +76,7 @@ function updateHash(map) {
 
 // ── UI wiring ─────────────────────────────────────────────────────────────────
 
-function wireUI(engine, map, { minimal, embedded }) {
+function wireUI(engine, map, { minimal, embedded, controlsMode }) {
   // ── Status ──────────────────────────────────────────────────────────────
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('timestamp');
@@ -242,9 +246,9 @@ function wireUI(engine, map, { minimal, embedded }) {
     updateHash(map);
   }
 
-  // ── Expand button (visible only in embedded contexts) ─────────────────
+  // ── Expand button (visible only in embedded contexts with some UI) ───
   const expandBtn = document.getElementById('btn-expand');
-  if (embedded && !minimal) {
+  if (embedded && controlsMode !== 'none') {
     expandBtn.style.display = 'flex';
   }
 
@@ -254,12 +258,15 @@ function wireUI(engine, map, { minimal, embedded }) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
-  const minimal = isMinimalMode();
+  const controlsMode = getControlsMode();
+  const minimal = controlsMode !== 'full';
   const embedded = isEmbeddedContext();
   const engine = new RadarEngine({ apiBase: API_BASE });
 
-  if (minimal) {
+  if (controlsMode === 'minimal') {
     document.body.classList.add('controls-minimal');
+  } else if (controlsMode === 'none') {
+    document.body.classList.add('controls-none');
   }
 
   const styleUrl = await resolveMapStyle();
@@ -290,7 +297,7 @@ async function init() {
     document.getElementById('row-exaggeration').style.display = '';
   }
 
-  const { expandBtn } = wireUI(engine, map, { minimal, embedded });
+  const { expandBtn } = wireUI(engine, map, { minimal, embedded, controlsMode });
 
   // Start the postMessage bridge when inside a WebView or iframe
   const bridge = new RadarBridge(engine, map);
