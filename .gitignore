@@ -1,5 +1,6 @@
-# Environment
+# Environment & credentials
 .env
+.gcp-key.json
 
 # Python
 __pycache__/

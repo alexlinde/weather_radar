@@ -10,6 +10,43 @@ DOMAIN="wx.somefamilies.com"
 REPO_URL="https://github.com/alexlinde/weather_radar.git"
 APP_DIR="/opt/weather-radar"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Service account auth ─────────────────────────────────────────────────────
+
+_SA_AUTH=false
+
+_ensure_auth() {
+  # Load GCP_SA_KEY from .env if present
+  if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    local key_path
+    key_path=$(grep -E '^GCP_SA_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | xargs)
+    if [[ -n "$key_path" ]]; then
+      [[ "$key_path" != /* ]] && key_path="$SCRIPT_DIR/$key_path"
+      if [[ -f "$key_path" ]]; then
+        gcloud auth activate-service-account --key-file="$key_path" --quiet 2>/dev/null
+        gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+        _SA_AUTH=true
+        return 0
+      fi
+    fi
+  fi
+  # Fall back to default .gcp-key.json in the project directory
+  if [[ -f "$SCRIPT_DIR/.gcp-key.json" ]]; then
+    gcloud auth activate-service-account --key-file="$SCRIPT_DIR/.gcp-key.json" --quiet 2>/dev/null
+    gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+    _SA_AUTH=true
+    return 0
+  fi
+  # No service account key — rely on existing gcloud auth
+  return 0
+}
+
+_sudo_prefix() {
+  # SA OS Login users need sudo for docker/git; personal users don't
+  if [[ "$_SA_AUTH" == "true" ]]; then echo "sudo"; else echo ""; fi
+}
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 gce_ssh() {
@@ -38,8 +75,7 @@ cmd_setup() {
   echo "==> Setting up GCE project and VM"
   echo ""
 
-  # Ensure project is selected
-  gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+  _ensure_auth
 
   # Enable Compute Engine API
   echo "==> Enabling Compute Engine API..."
@@ -103,21 +139,23 @@ cmd_setup() {
 
   wait_for_ssh
 
+  local S; S=$(_sudo_prefix)
+
   # Clone repo and set up the app directory
   echo "==> Setting up application on VM..."
   gce_ssh "sudo mkdir -p $APP_DIR && sudo chown \$(whoami):\$(whoami) $APP_DIR"
   gce_ssh "
     if [ -d $APP_DIR/.git ]; then
-      cd $APP_DIR && git pull
+      $S git -C $APP_DIR pull
     else
-      git clone $REPO_URL $APP_DIR
+      $S git clone $REPO_URL $APP_DIR
     fi
   "
 
   # Create a minimal .env on the VM if it doesn't exist
   gce_ssh "
     if [ ! -f $APP_DIR/.env ]; then
-      cat > $APP_DIR/.env << 'ENVEOF'
+      $S tee $APP_DIR/.env > /dev/null << 'ENVEOF'
 STADIA_API_KEY=
 MAPTILER_API_KEY=
 ENVEOF
@@ -126,11 +164,11 @@ ENVEOF
   "
 
   # Ensure the persistent data directory exists
-  gce_ssh "mkdir -p $APP_DIR/data"
+  gce_ssh "$S mkdir -p $APP_DIR/data"
 
   # Build and start
   echo "==> Building and starting containers..."
-  gce_ssh "cd $APP_DIR && docker compose -f docker-compose.prod.yml up -d --build"
+  gce_ssh "cd $APP_DIR && $S docker compose -f docker-compose.prod.yml up -d --build"
 
   echo ""
   echo "========================================"
@@ -164,17 +202,19 @@ ENVEOF
 cmd_deploy() {
   echo "==> Deploying to $VM_NAME..."
 
-  gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+  _ensure_auth
+
+  local S; S=$(_sudo_prefix)
 
   echo "==> Pulling latest code..."
-  gce_ssh "cd $APP_DIR && git pull"
+  gce_ssh "$S git -C $APP_DIR pull"
 
   echo "==> Rebuilding and restarting containers..."
-  gce_ssh "cd $APP_DIR && docker compose -f docker-compose.prod.yml up -d --build"
+  gce_ssh "cd $APP_DIR && $S docker compose -f docker-compose.prod.yml up -d --build"
 
   echo "==> Waiting for health check..."
   sleep 5
-  if gce_ssh "curl -sf http://localhost:8080/health" >/dev/null 2>&1; then
+  if gce_ssh "curl -sf http://localhost/health" >/dev/null 2>&1; then
     echo "    Health check passed."
   else
     echo "    Health check pending (app may still be seeding — this is normal)."
@@ -189,45 +229,50 @@ cmd_deploy() {
 # ── logs: tail production logs ───────────────────────────────────────────────
 
 cmd_logs() {
-  gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
-  gce_ssh "cd $APP_DIR && docker compose -f docker-compose.prod.yml logs -f --tail=100"
+  _ensure_auth
+  local S; S=$(_sudo_prefix)
+  gce_ssh "cd $APP_DIR && $S docker compose -f docker-compose.prod.yml logs -f --tail=100"
 }
 
 # ── ssh: open a shell on the VM ──────────────────────────────────────────────
 
 cmd_ssh() {
+  _ensure_auth
   gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID"
 }
 
 # ── status: check service health ─────────────────────────────────────────────
 
 cmd_status() {
-  gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+  _ensure_auth
+  local S; S=$(_sudo_prefix)
   echo "==> Container status:"
-  gce_ssh "cd $APP_DIR && docker compose -f docker-compose.prod.yml ps"
+  gce_ssh "cd $APP_DIR && $S docker compose -f docker-compose.prod.yml ps"
   echo ""
   echo "==> Health check:"
-  gce_ssh "curl -s http://localhost:8080/health" | python3 -m json.tool 2>/dev/null || echo "(no response)"
+  gce_ssh "curl -s http://localhost/health" | python3 -m json.tool 2>/dev/null || echo "(no response)"
 }
 
 # ── stop / start ─────────────────────────────────────────────────────────────
 
 cmd_stop() {
-  gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+  _ensure_auth
+  local S; S=$(_sudo_prefix)
   echo "==> Stopping containers..."
-  gce_ssh "cd $APP_DIR && docker compose -f docker-compose.prod.yml down"
+  gce_ssh "cd $APP_DIR && $S docker compose -f docker-compose.prod.yml down"
   echo "==> Stopping VM..."
   gcloud compute instances stop "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --quiet
   echo "    VM stopped. No compute charges while stopped."
 }
 
 cmd_start() {
-  gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+  _ensure_auth
+  local S; S=$(_sudo_prefix)
   echo "==> Starting VM..."
   gcloud compute instances start "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID" --quiet
   wait_for_ssh
   echo "==> Starting containers..."
-  gce_ssh "cd $APP_DIR && docker compose -f docker-compose.prod.yml up -d"
+  gce_ssh "cd $APP_DIR && $S docker compose -f docker-compose.prod.yml up -d"
   echo "    VM and containers running."
 }
 
