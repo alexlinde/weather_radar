@@ -204,6 +204,18 @@ def get_motion_png(timestamp: str) -> bytes | None:
     return None
 
 
+def get_motion_arrays(
+    timestamp: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Load raw motion field arrays (U, V, confidence) for *timestamp*."""
+    stem = _ts_to_stem(timestamp)
+    path = TILT_GRIDS_DIR / stem / "motion.npz"
+    if not path.exists():
+        return None
+    data = np.load(path)
+    return data["u"], data["v"], data["confidence"]
+
+
 def has_motion(timestamp: str) -> bool:
     """Check whether a motion field exists on disk for *timestamp*."""
     stem = _ts_to_stem(timestamp)

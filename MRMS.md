@@ -238,10 +238,23 @@ Following the approach used by NOAA's WDSS-II system (Lakshmanan et al. 2002), w
 
 Implementation in `pipeline.py`:
 
-1. **`_fill_from_recent()`** — after decoding a frame's native tilts, walks backward through the disk cache to find prior frames that have the missing tilts. Copies the sparse CSR grids forward.
-2. **Chain-aware staleness tracking** — if a prior frame's tilt was itself carried forward, the true origin timestamp is used for the age check, preventing stale data from propagating through long chains.
-3. **10-minute staleness cap** (`MAX_CARRY_FORWARD_S = 600`) — tilts older than 10 minutes (5x the nominal cadence) are left empty rather than showing badly stale data. Handles radar maintenance outages.
-4. **Backfill pass** — `backfill_virtual_volumes()` runs after seeding/warming to fill missing tilts in existing cached data, then updates both disk and in-memory caches.
+1. **`_fill_from_recent()`** — after decoding a frame's native tilts, walks backward through the disk cache to find prior frames that have the missing tilts. Copies the sparse CSR grids forward, applying advection correction when motion data is available.
+2. **Advection correction** — when a carried-forward tilt has an associated motion field, `advect_tilt()` in `motion.py` warps the grid using semi-Lagrangian backward advection so storm features slide to their estimated position at the current timestamp. The motion displacement is scaled linearly by `age_s / frame_interval` (Lagrangian persistence). See details below.
+3. **Chain-aware staleness tracking** — if a prior frame's tilt was itself carried forward or advected, the true origin timestamp is used for the age check, preventing stale data from propagating through long chains.
+4. **10-minute staleness cap** (`MAX_CARRY_FORWARD_S = 600`) — tilts older than 10 minutes (5x the nominal cadence) are left empty rather than showing badly stale data. Handles radar maintenance outages.
+5. **Backfill pass** — `backfill_virtual_volumes()` runs after seeding/warming to fill missing tilts in existing cached data, then updates both disk and in-memory caches.
+
+### Advection correction (`advect_tilt` in `motion.py`)
+
+When carrying a tilt forward from a prior frame, the raw grid has storm features at their old positions. `advect_tilt()` warps the grid using the existing motion field to slide features to their estimated current position:
+
+1. **Downsample 4x** — the full 3500x7000 grid is reduced to 875x1750 via block averaging to stay within memory on the 4 GB production VM (~6 MB per array vs ~98 MB at full res).
+2. **Upsample motion** — the coarse 26x53 motion field (U, V, confidence) is upsampled to 875x1750 via `scipy.ndimage.zoom`, then scaled by `time_scale = age_s / frame_interval`.
+3. **Semi-Lagrangian backward trace** — for each output pixel, trace backward along the scaled motion vector and sample the input via `scipy.ndimage.map_coordinates` (bilinear interpolation).
+4. **Confidence blend** — `warped * confidence + raw * (1 - confidence)`. Where motion estimation is unreliable (cell initiation, dissipation), the unwarped data is preserved.
+5. **Upsample back** — zoom to 3500x7000 and convert back to scipy.sparse CSR.
+
+Performance: ~500ms per tilt. Falls back to raw (unwarped) carry-forward if advection fails or no motion data exists.
 
 ### Provenance tracking
 
@@ -252,13 +265,16 @@ Each frame's `meta.json` includes a `tilt_sources` dict:
   "tilt_sources": {
     "00.50": {"origin": "native"},
     "01.00": {"origin": "native"},
-    "01.50": {"origin": "carried_forward", "from": "2026-04-15T16:08:41Z", "age_s": 120},
+    "01.50": {"origin": "advected", "from": "2026-04-15T16:08:41Z", "age_s": 120},
+    "02.50": {"origin": "carried_forward", "from": "2026-04-15T16:08:41Z", "age_s": 120},
     "19.00": {"origin": "missing"}
   }
 }
 ```
 
-The `/timestamps` API exposes `native_tilts` (count of natively fetched tilts) and `total_tilts` (native + carried forward, excluding missing) per frame.
+Provenance types: `native` (decoded from NOAA), `advected` (carried forward with motion correction), `carried_forward` (carried forward without motion data), `missing` (no data within staleness cap).
+
+The `/timestamps` API exposes `native_tilts` (count of natively fetched tilts) and `total_tilts` (native + advected + carried forward, excluding missing) per frame.
 
 ## Design Decisions
 

@@ -99,12 +99,18 @@ def _fill_from_recent(
     """Fill missing tilts from the most recent prior frame (virtual volume).
 
     Walks backward through the disk cache, copying sparse grids for any tilts
-    not present in *sparse_grids*.  Tracks the true origin through carry-forward
-    chains and enforces a staleness cap of MAX_CARRY_FORWARD_S.
+    not present in *sparse_grids*.  When motion data is available for the source
+    frame, the copied grid is advection-corrected (warped forward in time) so
+    storm features slide to their estimated current position.
+
+    Tracks the true origin through carry-forward chains and enforces a
+    staleness cap of MAX_CARRY_FORWARD_S.
 
     Modifies *sparse_grids* in-place.  Returns a ``tilt_sources`` dict mapping
-    each tilt to its provenance (native, carried_forward, or missing).
+    each tilt to its provenance (native, advected, carried_forward, or missing).
     """
+    from .motion import advect_tilt
+
     tilt_sources: dict[str, dict] = {
         t: {"origin": "native"} for t in sparse_grids
     }
@@ -119,6 +125,9 @@ def _fill_from_recent(
         e for e in entries
         if e.get("timestamp") and e["timestamp"] < timestamp
     ]
+
+    # Build a quick lookup for frame intervals (needed for motion time scaling)
+    all_ts = [e["timestamp"] for e in entries if e.get("timestamp")]
 
     for prior_entry in reversed(candidates):
         if not missing:
@@ -137,9 +146,25 @@ def _fill_from_recent(
         prior_meta = disk_cache.get_meta(prior_ts)
         prior_sources = (prior_meta or {}).get("tilt_sources", {})
 
+        # Try to load motion data once for this candidate frame
+        motion_data = None
+        frame_interval_s = None
+        if disk_cache.has_motion(prior_ts):
+            motion_data = disk_cache.get_motion_arrays(prior_ts)
+            if motion_data is not None:
+                try:
+                    idx = all_ts.index(prior_ts)
+                    if idx + 1 < len(all_ts):
+                        next_dt = _parse_iso(all_ts[idx + 1])
+                        frame_interval_s = (next_dt - prior_dt).total_seconds()
+                except ValueError:
+                    pass
+                if not frame_interval_s or frame_interval_s <= 0:
+                    frame_interval_s = 120.0
+
         for tilt in fills:
             tilt_info = prior_sources.get(tilt, {})
-            if tilt_info.get("origin") == "carried_forward":
+            if tilt_info.get("origin") in ("carried_forward", "advected"):
                 original_from = tilt_info.get("from", prior_ts)
                 true_age_s = (current_dt - _parse_iso(original_from)).total_seconds()
             else:
@@ -150,14 +175,28 @@ def _fill_from_recent(
                 continue
 
             grid = disk_cache.get_single_tilt(prior_ts, tilt)
-            if grid is not None:
-                sparse_grids[tilt] = grid
-                tilt_sources[tilt] = {
-                    "origin": "carried_forward",
-                    "from": original_from,
-                    "age_s": true_age_s,
-                }
-                missing.remove(tilt)
+            if grid is None:
+                continue
+
+            # Attempt advection correction
+            advected = False
+            if motion_data is not None and true_age_s > 0:
+                u, v, conf = motion_data
+                time_scale = true_age_s / frame_interval_s
+                try:
+                    grid = advect_tilt(grid, u, v, conf, time_scale)
+                    advected = True
+                except Exception:
+                    logger.warning("Advection failed for %s tilt %s, using raw carry-forward",
+                                   prior_ts, tilt, exc_info=True)
+
+            sparse_grids[tilt] = grid
+            tilt_sources[tilt] = {
+                "origin": "advected" if advected else "carried_forward",
+                "from": original_from,
+                "age_s": true_age_s,
+            }
+            missing.remove(tilt)
 
     for tilt in missing:
         tilt_sources[tilt] = {"origin": "missing"}
