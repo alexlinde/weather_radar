@@ -204,7 +204,7 @@ Application JS loaded as ES module:
 | `/api/config` | GET | Frontend configuration (map tile API keys). |
 | `/health` | GET | Cache status (in-memory + on-disk counts). |
 
-The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes). Each timestamp entry includes `has_motion: true/false` indicating whether a motion field to the next frame is available. The response also includes `motion.max_disp_deg` for the shader's displacement decoding.
+The `/timestamps` endpoint returns 503 while the server is still seeding. The frontend retries automatically (up to ~2 minutes). Each timestamp entry includes `has_motion: true/false` indicating whether a motion field to the next frame is available, plus `gap_before_s` (seconds since previous frame) and `is_gap` (true when the gap exceeds 1.5× the median cadence). The response also includes `motion.max_disp_deg` for the shader's displacement decoding and `gap_info` with `expected_cadence_s`, `gap_count`, and `max_gap_s`.
 
 Atlas tiles and motion PNGs use `Cache-Control: public, max-age=3600, immutable` — radar data for a given timestamp never changes, so the browser caches aggressively. Combined with `cache: 'force-cache'` on the frontend fetch, animation scrubbing through previously visited frames is nearly instant.
 
@@ -664,3 +664,14 @@ The fix uses **deferred mesh rebuild with atomic swap**:
 5. A 3-second safety timeout force-applies if some tiles fail to load
 
 As a belt-and-suspenders measure, `_updateMaterials` only purges stale fallback meshes when **all** new meshes have textures (`allTextured`), not when the first one arrives (`anyTextured`). Never use `anyTextured` for the stale purge condition — it causes partial tile visibility.
+
+### Gap-aware animation
+
+MRMS data has inherent gaps — the ~2-minute cadence is nominal, not guaranteed. Upstream causes include radar scan cycle timing, ingestion latency from the ~180 WSR-88D sites, product generation failures, and individual radar outages. The `/timestamps` endpoint computes the median inter-frame cadence and annotates each entry with `gap_before_s` and `is_gap` (flagged when the gap exceeds 1.5× the median cadence).
+
+The frontend uses this to:
+1. **Weight animation timing** — `_computeFrameWeights()` in `RadarEngine` builds a per-frame weight array proportional to the gap duration (capped at 3×). The animation tick divides the base frame interval by this weight, so transitions spanning larger real-time gaps play proportionally slower instead of producing a visual "jump."
+2. **Show gap markers on the scrubber** — amber tick marks appear at positions where `is_gap` is true, with a tooltip showing the gap duration.
+3. **Annotate the frame time display** — when scrubbing over a gap frame, the time readout shows e.g. "14:08 (+4m)" to indicate the gap.
+
+The pipeline also retries once (3s delay) on `S3KeyNotFound` during tilt fetching, catching files that are still propagating in S3. The periodic refresh checks the 20 most recent S3 keys (covering ~40 minutes) to reduce the chance of missing late-arriving frames.

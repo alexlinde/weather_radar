@@ -357,9 +357,31 @@ input[type="range"]::-moz-range-track {
   border-radius: 6px;
 }
 
+#scrubber-container {
+  position: relative;
+  flex: 1;
+  min-width: 80px;
+  display: flex;
+  align-items: center;
+}
+
 #frame-scrubber {
   flex: 1;
   min-width: 80px;
+  position: relative;
+  z-index: 2;
+}
+
+.gap-marker {
+  position: absolute;
+  top: 50%;
+  width: 2px;
+  height: 14px;
+  transform: translateY(-50%);
+  background: rgba(255, 180, 50, 0.7);
+  border-radius: 1px;
+  pointer-events: none;
+  z-index: 1;
 }
 
 #frame-time {

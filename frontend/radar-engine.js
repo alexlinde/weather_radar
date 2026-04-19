@@ -61,6 +61,8 @@ export class RadarEngine extends EventTarget {
     this._timestampFetchRetries = 0;
     this._refreshIntervalId = null;
     this._viewportDebounceTimer = null;
+    this._frameWeights = null;
+    this._expectedCadence = 120;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -124,6 +126,10 @@ export class RadarEngine extends EventTarget {
 
       this.timestamps = data.timestamps;
       this.currentAnimationTime = this.timestamps.length - 1;
+      if (data.gap_info) {
+        this._expectedCadence = data.gap_info.expected_cadence_s || 120;
+      }
+      this._computeFrameWeights();
 
       if (this._radarLayer) {
         this._radarLayer.setTimestamps(this.timestamps);
@@ -186,6 +192,23 @@ export class RadarEngine extends EventTarget {
     this.showFrame();
   }
 
+  // ── Gap-aware frame weights ────────────────────────────────────────────
+
+  _computeFrameWeights() {
+    const len = this.timestamps.length;
+    if (len < 2) {
+      this._frameWeights = new Float32Array([1]);
+      return;
+    }
+    const weights = new Float32Array(len);
+    const cadence = this._expectedCadence || 120;
+    for (let i = 0; i < len; i++) {
+      const gap = this.timestamps[i].gap_before_s;
+      weights[i] = gap != null ? Math.min(gap / cadence, 3.0) : 1.0;
+    }
+    this._frameWeights = weights;
+  }
+
   // ── Animation ──────────────────────────────────────────────────────────
 
   play() {
@@ -235,8 +258,11 @@ export class RadarEngine extends EventTarget {
 
     if (this._lastAnimTime > 0 && this._radarLayer) {
       const dt = now - this._lastAnimTime;
-      const step = dt / this.frameInterval;
       const len = this.timestamps.length;
+      const curFrame = Math.floor(this.currentAnimationTime) % len;
+      const targetFrame = (curFrame + 1) % len;
+      const weight = this._frameWeights?.[targetFrame] ?? 1.0;
+      const step = dt / (this.frameInterval * weight);
 
       let nextTime = this.currentAnimationTime + step;
       if (nextTime >= len) nextTime -= len;
@@ -333,6 +359,8 @@ export class RadarEngine extends EventTarget {
       total: this.timestamps.length,
       timestamp: ts?.timestamp || null,
       formattedTime: formatTimestamp(ts?.timestamp),
+      isGap: ts?.is_gap || false,
+      gapMinutes: ts?.gap_before_s ? Math.round(ts.gap_before_s / 60) : null,
     });
   }
 }

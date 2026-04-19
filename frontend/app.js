@@ -92,15 +92,36 @@ function wireUI(engine, map, { minimal, embedded, controlsMode }) {
 
   engine.addEventListener('frame', e => {
     scrubber.value = e.detail.index;
-    frameTime.textContent = e.detail.formattedTime;
+    if (e.detail.isGap && e.detail.gapMinutes) {
+      frameTime.textContent = `${e.detail.formattedTime} (+${e.detail.gapMinutes}m)`;
+    } else {
+      frameTime.textContent = e.detail.formattedTime;
+    }
     frameCounter.textContent = e.detail.total > 0
       ? `${e.detail.index + 1}/${e.detail.total}`
       : '0/0';
   });
 
+  const scrubberContainer = document.getElementById('scrubber-container');
+
+  function updateGapMarkers(timestamps) {
+    scrubberContainer.querySelectorAll('.gap-marker').forEach(m => m.remove());
+    const total = timestamps.length - 1;
+    if (total <= 0) return;
+    timestamps.forEach((ts, i) => {
+      if (!ts.is_gap) return;
+      const marker = document.createElement('div');
+      marker.className = 'gap-marker';
+      marker.style.left = `${(i / total) * 100}%`;
+      marker.title = `${Math.round(ts.gap_before_s / 60)}min gap`;
+      scrubberContainer.appendChild(marker);
+    });
+  }
+
   engine.addEventListener('timestamps', () => {
     scrubber.max = Math.max(0, engine.timestamps.length - 1);
     scrubber.value = engine.getCurrentFrameIndex();
+    updateGapMarkers(engine.timestamps);
   });
 
   // ── Play/Pause ──────────────────────────────────────────────────────────

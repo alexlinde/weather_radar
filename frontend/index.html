@@ -126,12 +126,14 @@
       </svg>
     </button>
 
-    <input
-      type="range"
-      id="frame-scrubber"
-      min="0" max="0" step="1" value="0"
-      aria-label="Frame scrubber"
-    />
+    <div id="scrubber-container">
+      <input
+        type="range"
+        id="frame-scrubber"
+        min="0" max="0" step="1" value="0"
+        aria-label="Frame scrubber"
+      />
+    </div>
 
     <span id="frame-time">--:--</span>
     <span id="frame-counter">0/0</span>

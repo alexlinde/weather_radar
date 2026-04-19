@@ -17,6 +17,7 @@ import logging
 import os
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -69,7 +70,7 @@ async def lifespan(app: FastAPI):
             if _refresh_stop.is_set():
                 break
             try:
-                fetched = await asyncio.to_thread(pipeline.refresh_new_frames, 10)
+                fetched = await asyncio.to_thread(pipeline.refresh_new_frames, 20)
                 purged = await asyncio.to_thread(
                     pipeline.purge_stale_data, PURGE_MAX_AGE_H, PURGE_MAX_FRAMES,
                 )
@@ -178,23 +179,67 @@ def radar_motion_tile(timestamp: str):
 # ── Timestamps ───────────────────────────────────────────────────────────────
 
 
+def _parse_ts(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def _annotate_gaps(entries: list[dict]) -> tuple[list[dict], dict]:
+    """Add per-entry gap_before_s / is_gap and return summary gap_info."""
+    if len(entries) < 2:
+        for e in entries:
+            e["gap_before_s"] = None
+            e["is_gap"] = False
+        return entries, {"expected_cadence_s": 120, "gap_count": 0, "max_gap_s": 0}
+
+    deltas: list[float] = []
+    for i in range(1, len(entries)):
+        t0 = _parse_ts(entries[i - 1]["timestamp"])
+        t1 = _parse_ts(entries[i]["timestamp"])
+        deltas.append((t1 - t0).total_seconds())
+
+    cadence = sorted(deltas)[len(deltas) // 2]
+    threshold = cadence * 1.5
+
+    entries[0]["gap_before_s"] = None
+    entries[0]["is_gap"] = False
+    gap_count = 0
+    max_gap = 0.0
+    for i, dt in enumerate(deltas):
+        is_gap = dt > threshold
+        entries[i + 1]["gap_before_s"] = dt
+        entries[i + 1]["is_gap"] = is_gap
+        if is_gap:
+            gap_count += 1
+        if dt > max_gap:
+            max_gap = dt
+
+    gap_info = {
+        "expected_cadence_s": cadence,
+        "gap_count": gap_count,
+        "max_gap_s": max_gap,
+    }
+    return entries, gap_info
+
+
 @app.get("/api/radar/timestamps")
 def radar_timestamps():
     """Return the list of available radar timestamps with motion availability."""
     from . import disk_cache
     from .motion import MAX_DISP_DEG
 
-    entries = disk_cache.list_tilt_grid_timestamps()
-    if not entries:
+    raw_entries = disk_cache.list_tilt_grid_timestamps()
+    if not raw_entries:
         raise HTTPException(
             status_code=503,
             detail="No frames cached yet — server is still seeding",
         )
-    entries = entries[-MAX_FRAMES:]
+    entries = [dict(e) for e in raw_entries[-MAX_FRAMES:]]
+    entries, gap_info = _annotate_gaps(entries)
     return {
         "timestamps": entries,
         "count": len(entries),
         "motion": {"max_disp_deg": MAX_DISP_DEG},
+        "gap_info": gap_info,
     }
 
 

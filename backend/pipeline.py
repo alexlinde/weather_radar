@@ -13,6 +13,7 @@ from __future__ import annotations
 import gzip
 import logging
 import re
+import time
 
 import numpy as np
 import scipy.sparse as sp
@@ -58,20 +59,28 @@ def _timestamp_from_key(s3_key: str) -> str | None:
 # ── Per-tilt fetch + decode ───────────────────────────────────────────────────
 
 
-def _decode_tilt_full(s3_key: str) -> tuple[np.ndarray, dict] | None:
-    """Fetch + decode one tilt to the full CONUS grid. Returns (grid, metadata) or None."""
-    try:
-        raw_gz = fetch_raw(s3_key)
-        raw = gzip.decompress(raw_gz)
-        metadata, grid = decode_grib2(raw)
-        grid = mask_sentinel_values(grid)
-        return grid, metadata
-    except S3KeyNotFound:
-        logger.warning("Not yet available in S3: %s", s3_key)
-        return None
-    except Exception:
-        logger.exception("Failed to decode %s", s3_key)
-        return None
+def _decode_tilt_full(s3_key: str, retries: int = 1) -> tuple[np.ndarray, dict] | None:
+    """Fetch + decode one tilt to the full CONUS grid. Returns (grid, metadata) or None.
+
+    Retries once on S3KeyNotFound to handle files still propagating in S3.
+    """
+    for attempt in range(1 + retries):
+        try:
+            raw_gz = fetch_raw(s3_key)
+            raw = gzip.decompress(raw_gz)
+            metadata, grid = decode_grib2(raw)
+            grid = mask_sentinel_values(grid)
+            return grid, metadata
+        except S3KeyNotFound:
+            if attempt < retries:
+                time.sleep(3)
+                continue
+            logger.warning("Not yet available in S3: %s", s3_key)
+            return None
+        except Exception:
+            logger.exception("Failed to decode %s", s3_key)
+            return None
+    return None
 
 
 # ── Per-timestep frame builder ────────────────────────────────────────────────
@@ -262,6 +271,27 @@ def warm_from_disk(limit: int = 30) -> int:
     return loaded
 
 
+def _log_gap_stats() -> None:
+    """Log frame gap statistics for diagnostics."""
+    from datetime import datetime
+
+    entries = disk_cache.list_tilt_grid_timestamps()
+    timestamps = [e["timestamp"] for e in entries if e.get("timestamp")]
+    if len(timestamps) < 2:
+        return
+    deltas = []
+    for i in range(len(timestamps) - 1):
+        t0 = datetime.fromisoformat(timestamps[i].replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(timestamps[i + 1].replace("Z", "+00:00"))
+        deltas.append((t1 - t0).total_seconds())
+    median = sorted(deltas)[len(deltas) // 2]
+    large_gaps = [d for d in deltas if d > median * 1.5]
+    logger.info(
+        "Frame gaps: %d/%d transitions >%.0fs (median=%.0fs, max=%.0fs)",
+        len(large_gaps), len(deltas), median * 1.5, median, max(deltas),
+    )
+
+
 def seed_frames(count: int = 60) -> int:
     """Pre-fetch and cache tilt grids for the most recent timestamps.
 
@@ -294,6 +324,8 @@ def seed_frames(count: int = 60) -> int:
     total = tilt_cache.count()
     logger.info("Frame cache seeded: %d timestamps in memory, %d on disk",
                 total, len(disk_cache.list_tilt_grid_timestamps()))
+
+    _log_gap_stats()
 
     tile_coords_z4 = _conus_tile_coords(z=4)
     entries = disk_cache.list_tilt_grid_timestamps()
