@@ -146,6 +146,34 @@ def has_tilt_grids(timestamp: str) -> bool:
     return (TILT_GRIDS_DIR / stem / "meta.json").exists()
 
 
+def get_meta(timestamp: str) -> dict[str, Any] | None:
+    """Load just the metadata (meta.json) for a timestamp, without grids."""
+    stem = _ts_to_stem(timestamp)
+    meta_path = TILT_GRIDS_DIR / stem / "meta.json"
+    if not meta_path.exists():
+        return None
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def list_available_tilts(timestamp: str) -> list[str]:
+    """Return the tilt level names that have .npz files on disk for *timestamp*."""
+    stem = _ts_to_stem(timestamp)
+    ts_dir = TILT_GRIDS_DIR / stem
+    if not ts_dir.exists():
+        return []
+    return [p.stem for p in ts_dir.glob("*.npz") if p.stem != "motion"]
+
+
+def get_single_tilt(timestamp: str, tilt: str) -> sp.csr_matrix | None:
+    """Load a single tilt's sparse grid from disk."""
+    stem = _ts_to_stem(timestamp)
+    path = TILT_GRIDS_DIR / stem / f"{tilt}.npz"
+    if not path.exists():
+        return None
+    return sp.load_npz(path)
+
+
 # ── Motion field cache ────────────────────────────────────────────────────────
 
 
@@ -200,6 +228,15 @@ def _meta_to_entry(meta: dict[str, Any]) -> dict[str, Any]:
     }
     if ts:
         entry["has_motion"] = has_motion(ts)
+
+    tilt_sources = meta.get("tilt_sources")
+    if tilt_sources:
+        entry["native_tilts"] = sum(
+            1 for v in tilt_sources.values() if v.get("origin") == "native"
+        )
+        entry["total_tilts"] = sum(
+            1 for v in tilt_sources.values() if v.get("origin") != "missing"
+        )
     return entry
 
 
@@ -232,7 +269,7 @@ def list_tilt_grid_timestamps() -> list[dict[str, Any]]:
 
 
 def _notify_ts_list(metadata: dict[str, Any]) -> None:
-    """Append a new entry to the cached timestamps list after a disk write.
+    """Insert or update an entry in the cached timestamps list after a disk write.
 
     Deduplicates by timestamp and maintains sorted order.
     """
@@ -243,8 +280,10 @@ def _notify_ts_list(metadata: dict[str, Any]) -> None:
         if _ts_list_cache is None:
             _ts_list_cache = _load_ts_list_from_disk()
             return
-        if any(e["timestamp"] == ts for e in _ts_list_cache):
-            return
+        for i, e in enumerate(_ts_list_cache):
+            if e["timestamp"] == ts:
+                _ts_list_cache[i] = entry
+                return
         _ts_list_cache.append(entry)
         _ts_list_cache.sort(key=lambda e: e["timestamp"] or "")
 

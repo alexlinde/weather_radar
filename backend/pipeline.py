@@ -14,6 +14,7 @@ import gzip
 import logging
 import re
 import time
+from datetime import datetime
 
 import numpy as np
 import scipy.sparse as sp
@@ -26,6 +27,7 @@ from .mrms import S3KeyNotFound, fetch_raw, list_latest_files, mask_sentinel_val
 logger = logging.getLogger(__name__)
 
 TILT_LEVELS = ["00.50", "01.00", "01.50", "02.50", "04.00", "07.00", "10.00", "19.00"]
+MAX_CARRY_FORWARD_S = 600  # 10 minutes — don't use tilt data older than this
 
 VOLUME_PRODUCT_TEMPLATE = "CONUS/MergedReflectivityQC_{tilt}"
 
@@ -83,6 +85,86 @@ def _decode_tilt_full(s3_key: str, retries: int = 1) -> tuple[np.ndarray, dict] 
     return None
 
 
+# ── Virtual volume: carry forward missing tilts ──────────────────────────────
+
+
+def _parse_iso(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def _fill_from_recent(
+    timestamp: str,
+    sparse_grids: dict[str, sp.csr_matrix],
+) -> dict[str, dict]:
+    """Fill missing tilts from the most recent prior frame (virtual volume).
+
+    Walks backward through the disk cache, copying sparse grids for any tilts
+    not present in *sparse_grids*.  Tracks the true origin through carry-forward
+    chains and enforces a staleness cap of MAX_CARRY_FORWARD_S.
+
+    Modifies *sparse_grids* in-place.  Returns a ``tilt_sources`` dict mapping
+    each tilt to its provenance (native, carried_forward, or missing).
+    """
+    tilt_sources: dict[str, dict] = {
+        t: {"origin": "native"} for t in sparse_grids
+    }
+
+    missing = [t for t in TILT_LEVELS if t not in sparse_grids]
+    if not missing:
+        return tilt_sources
+
+    current_dt = _parse_iso(timestamp)
+    entries = disk_cache.list_tilt_grid_timestamps()
+    candidates = [
+        e for e in entries
+        if e.get("timestamp") and e["timestamp"] < timestamp
+    ]
+
+    for prior_entry in reversed(candidates):
+        if not missing:
+            break
+        prior_ts = prior_entry["timestamp"]
+        prior_dt = _parse_iso(prior_ts)
+        age_s = (current_dt - prior_dt).total_seconds()
+        if age_s > MAX_CARRY_FORWARD_S:
+            break
+
+        available = set(disk_cache.list_available_tilts(prior_ts))
+        fills = [t for t in missing if t in available]
+        if not fills:
+            continue
+
+        prior_meta = disk_cache.get_meta(prior_ts)
+        prior_sources = (prior_meta or {}).get("tilt_sources", {})
+
+        for tilt in fills:
+            tilt_info = prior_sources.get(tilt, {})
+            if tilt_info.get("origin") == "carried_forward":
+                original_from = tilt_info.get("from", prior_ts)
+                true_age_s = (current_dt - _parse_iso(original_from)).total_seconds()
+            else:
+                original_from = prior_ts
+                true_age_s = age_s
+
+            if true_age_s > MAX_CARRY_FORWARD_S:
+                continue
+
+            grid = disk_cache.get_single_tilt(prior_ts, tilt)
+            if grid is not None:
+                sparse_grids[tilt] = grid
+                tilt_sources[tilt] = {
+                    "origin": "carried_forward",
+                    "from": original_from,
+                    "age_s": true_age_s,
+                }
+                missing.remove(tilt)
+
+    for tilt in missing:
+        tilt_sources[tilt] = {"origin": "missing"}
+
+    return tilt_sources
+
+
 # ── Per-timestep frame builder ────────────────────────────────────────────────
 
 
@@ -130,6 +212,9 @@ def _build_frame(ref_key: str, pool=None) -> tuple[str, dict[str, sp.csr_matrix]
     sparse_grids: dict[str, sp.csr_matrix] = {}
     for tilt, (grid, _) in decoded.items():
         sparse_grids[tilt] = sp.csr_matrix(np.nan_to_num(grid, nan=0.0))
+
+    tilt_sources = _fill_from_recent(timestamp, sparse_grids)
+    meta["tilt_sources"] = tilt_sources
 
     disk_cache.put_tilt_grids(timestamp, sparse_grids, meta)
     return timestamp, sparse_grids, meta
@@ -260,6 +345,8 @@ def warm_from_disk(limit: int = 30) -> int:
 
     logger.info("Warmed %d/%d frames from disk into memory", loaded, len(recent))
 
+    backfill_virtual_volumes()
+
     tile_coords_z4 = _conus_tile_coords(z=4)
     atlas_count = _prerender_atlas_tiles(recent, tile_coords_z4)
     tile_coords_z5 = _conus_tile_coords(z=5)
@@ -271,10 +358,51 @@ def warm_from_disk(limit: int = 30) -> int:
     return loaded
 
 
+def backfill_virtual_volumes() -> int:
+    """Walk the disk cache chronologically and fill missing tilts from prior frames.
+
+    For each timestamp with fewer than 8 tilts (or no ``tilt_sources`` metadata),
+    runs ``_fill_from_recent`` to carry forward data, then updates both the disk
+    and in-memory caches.  Returns the number of frames that gained new tilts.
+    """
+    entries = disk_cache.list_tilt_grid_timestamps()
+    if not entries:
+        return 0
+
+    backfilled = 0
+    for entry in entries:
+        ts = entry["timestamp"]
+        if not ts:
+            continue
+
+        result = disk_cache.get_tilt_grids(ts)
+        if result is None:
+            continue
+        grids, meta = result
+
+        if len(grids) >= len(TILT_LEVELS) and "tilt_sources" in meta:
+            continue
+
+        original_count = len(grids)
+        tilt_sources = _fill_from_recent(ts, grids)
+        meta["tilt_sources"] = tilt_sources
+
+        disk_cache.put_tilt_grids(ts, grids, meta)
+        tilt_cache.put(ts, grids, meta)
+
+        if len(grids) > original_count:
+            backfilled += 1
+            filled = [t for t, s in tilt_sources.items() if s.get("origin") == "carried_forward"]
+            logger.info("  Backfill %s: %d→%d tilts (+%s)",
+                        ts, original_count, len(grids), ", ".join(filled))
+
+    if backfilled:
+        logger.info("Backfilled %d frames with carried-forward tilts", backfilled)
+    return backfilled
+
+
 def _log_gap_stats() -> None:
     """Log frame gap statistics for diagnostics."""
-    from datetime import datetime
-
     entries = disk_cache.list_tilt_grid_timestamps()
     timestamps = [e["timestamp"] for e in entries if e.get("timestamp")]
     if len(timestamps) < 2:
@@ -325,6 +453,7 @@ def seed_frames(count: int = 60) -> int:
     logger.info("Frame cache seeded: %d timestamps in memory, %d on disk",
                 total, len(disk_cache.list_tilt_grid_timestamps()))
 
+    backfill_virtual_volumes()
     _log_gap_stats()
 
     tile_coords_z4 = _conus_tile_coords(z=4)

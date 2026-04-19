@@ -226,6 +226,40 @@ The frontend uses this to:
 2. **Show gap markers on the scrubber** — amber tick marks at gap positions with tooltip showing gap duration.
 3. **Annotate the frame time display** — shows e.g. "14:08 (+4m)" on gap frames.
 
+## Virtual Volumes (Tilt Carry-Forward)
+
+MRMS composites are generated every ~2 minutes, but the underlying WSR-88D radars take ~4-6 minutes for a full volume scan. The lower tilts (00.50, 01.00) are scanned first and published fastest; higher tilts (07.00, 10.00, 19.00) only appear when the volume scan has progressed far enough. This means most 2-minute frames only contain 2-4 of the 8 tilt levels natively.
+
+In composite mode this is invisible (fmax ignores empty bands), but in 3D mode each tilt is rendered on its own plane — missing tilts cause layers to blink in and out as you scrub through frames.
+
+### Approach: WDSS-II virtual volumes
+
+Following the approach used by NOAA's WDSS-II system (Lakshmanan et al. 2002), we build "virtual volumes" by carrying forward the most recent data for each tilt level. Rather than confining data to a single volume scan, each frame inherits the latest available data at every elevation angle.
+
+Implementation in `pipeline.py`:
+
+1. **`_fill_from_recent()`** — after decoding a frame's native tilts, walks backward through the disk cache to find prior frames that have the missing tilts. Copies the sparse CSR grids forward.
+2. **Chain-aware staleness tracking** — if a prior frame's tilt was itself carried forward, the true origin timestamp is used for the age check, preventing stale data from propagating through long chains.
+3. **10-minute staleness cap** (`MAX_CARRY_FORWARD_S = 600`) — tilts older than 10 minutes (5x the nominal cadence) are left empty rather than showing badly stale data. Handles radar maintenance outages.
+4. **Backfill pass** — `backfill_virtual_volumes()` runs after seeding/warming to fill missing tilts in existing cached data, then updates both disk and in-memory caches.
+
+### Provenance tracking
+
+Each frame's `meta.json` includes a `tilt_sources` dict:
+
+```json
+{
+  "tilt_sources": {
+    "00.50": {"origin": "native"},
+    "01.00": {"origin": "native"},
+    "01.50": {"origin": "carried_forward", "from": "2026-04-15T16:08:41Z", "age_s": 120},
+    "19.00": {"origin": "missing"}
+  }
+}
+```
+
+The `/timestamps` API exposes `native_tilts` (count of natively fetched tilts) and `total_tilts` (native + carried forward, excluding missing) per frame.
+
 ## Design Decisions
 
 ### Why tilt-level data instead of the pre-computed composite
