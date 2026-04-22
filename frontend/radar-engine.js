@@ -18,8 +18,16 @@ export const RADAR_PRESETS = {
 const MAX_503_RETRIES = 24;
 const REFRESH_INTERVAL_MS = 120_000;
 const VIEWPORT_DEBOUNCE_MS = 300;
-const PREFETCH_AHEAD = 5;
-const PREFETCH_BURST = 10;
+
+// Prefetch less aggressively on mobile — each frame-prefetch can trigger N
+// tile fetches × 2 (A+B), so halving these roughly halves peak GPU upload
+// pressure during play/animation transitions.
+const IS_MOBILE = typeof window !== 'undefined' && (
+  (window.matchMedia && window.matchMedia('(max-width: 600px)').matches)
+  || /Mobi|Android/i.test(window.navigator?.userAgent || '')
+);
+const PREFETCH_AHEAD = IS_MOBILE ? 3 : 5;
+const PREFETCH_BURST = IS_MOBILE ? 5 : 10;
 
 export function formatTimestamp(iso) {
   if (!iso) return '--:--';

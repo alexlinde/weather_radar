@@ -19,7 +19,20 @@ import { createColorRampData } from './colors.js';
 const RADAR_TILE_MIN_ZOOM = 3;
 const RADAR_TILE_MAX_ZOOM = 8;
 const RADAR_NUM_BANDS = 8;
-const MAX_TEXTURES = 300;
+
+// ── Device-class budgets ────────────────────────────────────────────────────
+// Mobile browsers (especially iOS Safari) kill WebGL contexts around 250-500 MB
+// of GPU memory. Tiles are uploaded as R8 (1 byte/pixel ≈ 512 KB each), so the
+// desktop cap ≈ 75 MB of tile VRAM and the mobile cap ≈ 40 MB.
+const IS_MOBILE = typeof window !== 'undefined' && (
+  (window.matchMedia && window.matchMedia('(max-width: 600px)').matches)
+  || /Mobi|Android/i.test(window.navigator?.userAgent || '')
+);
+
+const MAX_TILE_TEXTURES = IS_MOBILE ? 80 : 150;
+const MAX_MOTION_TEXTURES = IS_MOBILE ? 20 : 40;
+const VOLUME_ATLAS_HEIGHT = IS_MOBILE ? 1024 : 2048;
+const DPR_CAP = IS_MOBILE ? 1.5 : 2.0;
 
 const TILT_HEIGHTS_M = [1000, 1500, 2000, 3500, 5500, 9000, 12000, 19000];
 
@@ -270,16 +283,67 @@ const VOLUME_FRAG = `
   }
 `;
 
+// ── Single-channel PNG decode ───────────────────────────────────────────────
+// The server returns grayscale 256×2048 atlas PNGs, but `new THREE.Texture(bmp)`
+// uploads them as RGBA8 (~2 MB VRAM/tile). Decoding to an R8 DataTexture cuts
+// that to ~512 KB/tile, a 4× VRAM win. A single shared 2D canvas is reused for
+// all decodes so we don't thrash the browser's 2D-canvas allocator.
+
+let _decodeCanvas = null;
+let _decodeCtx = null;
+function getDecodeCtx() {
+  if (!_decodeCanvas) {
+    _decodeCanvas = document.createElement('canvas');
+    _decodeCanvas.width = 256;
+    _decodeCanvas.height = 2048;
+    _decodeCtx = _decodeCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  return _decodeCtx;
+}
+
+function createRadarTileTexture(bmp, useRedFormat) {
+  const ctx = getDecodeCtx();
+  ctx.clearRect(0, 0, 256, 2048);
+  ctx.drawImage(bmp, 0, 0);
+  const rgba = ctx.getImageData(0, 0, 256, 2048).data;
+  const n = 256 * 2048;
+  const red = new Uint8Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) red[i] = rgba[j];
+
+  // WebGL2 → RedFormat; WebGL1 fallback uses LuminanceFormat (also 1 byte/px).
+  const format = useRedFormat ? THREE.RedFormat : THREE.LuminanceFormat;
+  const tex = new THREE.DataTexture(red, 256, 2048, format, THREE.UnsignedByteType);
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.generateMipmaps = false;
+  // Match the prior `new THREE.Texture(bmp)` orientation so shader UV math is
+  // unchanged (DataTexture defaults to flipY=false, Texture defaults to true).
+  tex.flipY = true;
+  tex.needsUpdate = true;
+  // Release the decoded bitmap — on iOS these are GPU-backed and expensive.
+  bmp.close?.();
+  return tex;
+}
+
 // ── Tile texture cache ──────────────────────────────────────────────────────
 
 class TileTextureCache {
-  constructor(onLoad) {
+  constructor({ onLoad, maxTextures, getFormat }) {
     this._textures = new Map();
     this._loading = new Map();
     this._onLoad = onLoad;
+    this._maxTextures = maxTextures;
+    this._getFormat = getFormat;
   }
 
   _key(ts, z, x, y) { return `${ts}/${z}/${x}/${y}`; }
+
+  setMaxTextures(n) {
+    this._maxTextures = n;
+    this._evict();
+  }
 
   has(ts, z, x, y) {
     return this._textures.has(this._key(ts, z, x, y));
@@ -306,14 +370,8 @@ class TileTextureCache {
       const r = await fetch(url, { cache: 'force-cache' });
       if (!r.ok) return null;
       const bmp = await createImageBitmap(await r.blob());
-      const t = new THREE.Texture(bmp);
-      t.magFilter = THREE.LinearFilter;
-      t.minFilter = THREE.LinearFilter;
-      t.wrapS = THREE.ClampToEdgeWrapping;
-      t.wrapT = THREE.ClampToEdgeWrapping;
-      t.generateMipmaps = false;
-      t.needsUpdate = true;
-      this._textures.set(k, { t, lu: performance.now() });
+      const t = createRadarTileTexture(bmp, this._getFormat());
+      this._textures.set(k, { t, lu: performance.now(), z });
       this._evict();
       this._onLoad?.();
       return t;
@@ -324,11 +382,22 @@ class TileTextureCache {
   }
 
   _evict() {
-    if (this._textures.size <= MAX_TEXTURES) return;
+    if (this._textures.size <= this._maxTextures) return;
     const arr = [...this._textures.entries()].sort((a, b) => a[1].lu - b[1].lu);
-    for (const [k, e] of arr.slice(0, arr.length - MAX_TEXTURES)) {
+    for (const [k, e] of arr.slice(0, arr.length - this._maxTextures)) {
       e.t.dispose();
       this._textures.delete(k);
+    }
+  }
+
+  // Drop every tile whose z isn't in `keepZs`. Called after zoom changes so
+  // that VRAM isn't held by tiles from a zoom level we've long left behind.
+  evictByZ(keepZs) {
+    for (const [k, e] of this._textures) {
+      if (!keepZs.has(e.z)) {
+        e.t.dispose();
+        this._textures.delete(k);
+      }
     }
   }
 
@@ -341,10 +410,11 @@ class TileTextureCache {
 // ── Motion texture cache ────────────────────────────────────────────────────
 
 class MotionTextureCache {
-  constructor(onLoad) {
+  constructor({ onLoad, maxTextures }) {
     this._textures = new Map();
     this._loading = new Map();
     this._onLoad = onLoad;
+    this._maxTextures = maxTextures;
   }
 
   has(ts) { return this._textures.has(ts); }
@@ -377,11 +447,21 @@ class MotionTextureCache {
       t.generateMipmaps = false;
       t.needsUpdate = true;
       this._textures.set(ts, { t, lu: performance.now() });
+      this._evict();
       this._onLoad?.();
       return t;
     } catch (e) {
       if (e.name !== 'AbortError') console.warn('Motion load failed:', ts, e);
       return null;
+    }
+  }
+
+  _evict() {
+    if (this._textures.size <= this._maxTextures) return;
+    const arr = [...this._textures.entries()].sort((a, b) => a[1].lu - b[1].lu);
+    for (const [k, e] of arr.slice(0, arr.length - this._maxTextures)) {
+      e.t.dispose();
+      this._textures.delete(k);
     }
   }
 
@@ -450,13 +530,22 @@ class RadarLayer {
     this._timeMix = 0;
     this._timestamps = [];
 
+    this._useRedFormat = false; // set from renderer.capabilities in _initThree
+
     this._tileLoadGen = 0;
-    this._tileCache = new TileTextureCache(() => {
-      this._tileLoadGen++;
-      this._checkPendingReady();
-      this._requestRepaint();
+    this._tileCache = new TileTextureCache({
+      onLoad: () => {
+        this._tileLoadGen++;
+        this._checkPendingReady();
+        this._requestRepaint();
+      },
+      maxTextures: MAX_TILE_TEXTURES,
+      getFormat: () => this._useRedFormat,
     });
-    this._motionCache = new MotionTextureCache(() => this._requestRepaint());
+    this._motionCache = new MotionTextureCache({
+      onLoad: () => this._requestRepaint(),
+      maxTextures: MAX_MOTION_TEXTURES,
+    });
     this._motionBounds = new THREE.Vector4(-130, 20, -60, 55);
     this._maxDispDeg = 0.5;
     this._map = null;
@@ -475,8 +564,8 @@ class RadarLayer {
     this._currentMatrix = null;
     this._camPosVec = null;
 
-    this._volCanvasA = null;
-    this._volCanvasB = null;
+    this._volAtlasDataA = null;
+    this._volAtlasDataB = null;
     this._volAtlasA = null;
     this._volAtlasB = null;
     this._volLayout = null;
@@ -558,6 +647,7 @@ class RadarLayer {
     if (this._tileMeshes.size === 0) {
       this._pendingTiles = null;
       this._visibleTiles = tiles;
+      this._updateTileCacheSize();
       this._rebuildMeshes();
       return;
     }
@@ -568,9 +658,19 @@ class RadarLayer {
     }
 
     this._pendingTiles = tiles;
+    this._updateTileCacheSize();
     this._pendingTilesTimer = setTimeout(() => this._applyPendingTiles(), 3000);
     this._startPrefetchPending();
     this._checkPendingReady();
+  }
+
+  // Size the tile LRU to what's actually needed for the current viewport:
+  // visible (or pending) tile count × a small prefetch window × A+B. Clamped
+  // to MAX_TILE_TEXTURES so a wild zoom-out can't balloon the cap.
+  _updateTileCacheSize() {
+    const n = Math.max(this._visibleTiles.length, this._pendingTiles?.length || 0);
+    const target = Math.min(MAX_TILE_TEXTURES, Math.max(24, n * 6));
+    this._tileCache.setMaxTextures(target);
   }
 
   _computeVisibleTiles() {
@@ -629,6 +729,7 @@ class RadarLayer {
     clearTimeout(this._pendingTilesTimer);
     this._visibleTiles = this._pendingTiles;
     this._pendingTiles = null;
+    this._updateTileCacheSize();
     this._rebuildMeshes();
   }
 
@@ -702,11 +803,7 @@ class RadarLayer {
     this._tileCache.clear();
     this._motionCache.clear();
     this._clearMeshes();
-    if (this._volAtlasA) { this._volAtlasA.dispose(); this._volAtlasA = null; }
-    if (this._volAtlasB) { this._volAtlasB.dispose(); this._volAtlasB = null; }
-    this._volCanvasA = null;
-    this._volCanvasB = null;
-    this._volLayout = null;
+    this._disposeVolumeResources();
     if (this._renderer) {
       this._renderer.dispose();
       this._renderer.domElement.remove();
@@ -745,12 +842,22 @@ class RadarLayer {
     this._dummyTex = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
     this._dummyTex.needsUpdate = true;
     this._camPosVec = new THREE.Vector3();
+
+    // R8 requires WebGL2; otherwise fall back to Luminance (also 1 byte/px).
+    this._useRedFormat = !!this._renderer.capabilities?.isWebGL2;
   }
 
   _resizeRenderer() {
     if (!this._renderer || !this._map) return;
     const mc = this._map.getCanvas();
-    this._renderer.setSize(mc.width, mc.height, false);
+    // MapLibre's canvas backing size already includes devicePixelRatio; on
+    // modern phones (DPR 3) that's a 9× framebuffer area. We re-derive CSS
+    // dimensions and apply our own cap so the radar overlay uses at most
+    // ~2.25× area on mobile, ~4× on desktop. The base map keeps its own DPR.
+    const cssW = parseFloat(mc.style.width) || mc.clientWidth || mc.width;
+    const cssH = parseFloat(mc.style.height) || mc.clientHeight || mc.height;
+    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    this._renderer.setSize(Math.round(cssW * dpr), Math.round(cssH * dpr), false);
     this._renderer.domElement.style.width = mc.style.width;
     this._renderer.domElement.style.height = mc.style.height;
   }
@@ -764,6 +871,12 @@ class RadarLayer {
       this._staleMeshes.push(mesh);
     }
     this._tileMeshes.clear();
+
+    // Free the (big) volume atlas when switching away from volume mode so we
+    // don't sit on ~40 MB of VRAM while rendering composite/3d.
+    if (this._mode !== 'volume') {
+      this._disposeVolumeResources();
+    }
 
     if (this._mode === 'volume') {
       this._buildVolumeMesh();
@@ -780,8 +893,29 @@ class RadarLayer {
       }
     }
 
+    this._pruneCrossZoomTiles();
+
     clearTimeout(this._stalePurgeTimer);
     this._stalePurgeTimer = setTimeout(() => this._purgeStale(), 3000);
+  }
+
+  // After a zoom change, the LRU is still full of tiles from the old zoom that
+  // the shader will never sample again. Flush them so VRAM matches the view.
+  _pruneCrossZoomTiles() {
+    const keep = new Set();
+    for (const t of this._visibleTiles) keep.add(t.z);
+    if (this._pendingTiles) for (const t of this._pendingTiles) keep.add(t.z);
+    if (keep.size > 0) this._tileCache.evictByZ(keep);
+  }
+
+  _disposeVolumeResources() {
+    if (this._volAtlasA) { this._volAtlasA.dispose(); this._volAtlasA = null; }
+    if (this._volAtlasB) { this._volAtlasB.dispose(); this._volAtlasB = null; }
+    this._volAtlasDataA = null;
+    this._volAtlasDataB = null;
+    this._volLayout = null;
+    this._volLastKeyA = '';
+    this._volLastKeyB = '';
   }
 
   _addTileMesh(z, x, y, mz, tiltIndex) {
@@ -844,36 +978,43 @@ class RadarLayer {
     this._volLastKeyB = '';
 
     const aw = totalTiles * 256;
-    const ah = 2048;
-    const needResize = !this._volCanvasA
-      || this._volCanvasA.width !== aw || this._volCanvasA.height !== ah;
+    const ah = VOLUME_ATLAS_HEIGHT;
+    // The previous CanvasTexture pair cost ~2 × (aw×2048×4) bytes of 2D-canvas
+    // backing store on the CPU plus the same again on the GPU. The DataTexture
+    // pair below is 1 byte/pixel and we dropped the 2D canvas entirely.
+    const needResize = !this._volAtlasA
+      || this._volAtlasA.image.width !== aw
+      || this._volAtlasA.image.height !== ah;
 
     if (needResize) {
-      this._volCanvasA = document.createElement('canvas');
-      this._volCanvasA.width = aw;
-      this._volCanvasA.height = ah;
-      this._volCanvasB = document.createElement('canvas');
-      this._volCanvasB.width = aw;
-      this._volCanvasB.height = ah;
-
       if (this._volAtlasA) this._volAtlasA.dispose();
       if (this._volAtlasB) this._volAtlasB.dispose();
 
-      this._volAtlasA = new THREE.CanvasTexture(this._volCanvasA);
+      const format = this._useRedFormat ? THREE.RedFormat : THREE.LuminanceFormat;
+      this._volAtlasDataA = new Uint8Array(aw * ah);
+      this._volAtlasDataB = new Uint8Array(aw * ah);
+
+      this._volAtlasA = new THREE.DataTexture(
+        this._volAtlasDataA, aw, ah, format, THREE.UnsignedByteType,
+      );
       this._volAtlasA.flipY = false;
       this._volAtlasA.magFilter = THREE.LinearFilter;
       this._volAtlasA.minFilter = THREE.LinearFilter;
       this._volAtlasA.wrapS = THREE.ClampToEdgeWrapping;
       this._volAtlasA.wrapT = THREE.ClampToEdgeWrapping;
       this._volAtlasA.generateMipmaps = false;
+      this._volAtlasA.needsUpdate = true;
 
-      this._volAtlasB = new THREE.CanvasTexture(this._volCanvasB);
+      this._volAtlasB = new THREE.DataTexture(
+        this._volAtlasDataB, aw, ah, format, THREE.UnsignedByteType,
+      );
       this._volAtlasB.flipY = false;
       this._volAtlasB.magFilter = THREE.LinearFilter;
       this._volAtlasB.minFilter = THREE.LinearFilter;
       this._volAtlasB.wrapS = THREE.ClampToEdgeWrapping;
       this._volAtlasB.wrapT = THREE.ClampToEdgeWrapping;
       this._volAtlasB.generateMipmaps = false;
+      this._volAtlasB.needsUpdate = true;
     }
 
     const mzMax = mercToAlt(TILT_HEIGHTS_M[RADAR_NUM_BANDS - 1] * this._vertExag);
@@ -986,7 +1127,7 @@ class RadarLayer {
     const gen = this._tileLoadGen;
     const keyA = `${tsA}|${gen}`;
     if (this._volLastKeyA !== keyA) {
-      const any = this._drawVolAtlas(this._volCanvasA, tsA);
+      const any = this._drawVolAtlas(this._volAtlasDataA, tsA);
       this._volAtlasA.needsUpdate = true;
       this._volLastKeyA = keyA;
       volMesh.visible = any;
@@ -995,7 +1136,7 @@ class RadarLayer {
     if (tsB && tsB !== tsA) {
       const keyB = `${tsB}|${gen}`;
       if (this._volLastKeyB !== keyB) {
-        this._drawVolAtlas(this._volCanvasB, tsB);
+        this._drawVolAtlas(this._volAtlasDataB, tsB);
         this._volAtlasB.needsUpdate = true;
         this._volLastKeyB = keyB;
       }
@@ -1006,16 +1147,29 @@ class RadarLayer {
     }
   }
 
-  _drawVolAtlas(canvas, timestamp) {
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Pack each visible tile's R8 bytes into the volume atlas array. On mobile
+  // the destination atlas is half-height (1024 rows), so we decimate the
+  // source 2048-row tile by taking every other row.
+  _drawVolAtlas(dstArr, timestamp) {
     const layout = this._volLayout;
+    const aw = this._volAtlasA.image.width;
+    const ah = this._volAtlasA.image.height;
+    dstArr.fill(0);
     let anyDrawn = false;
+    const yStride = 2048 / ah; // 1 on desktop, 2 on mobile
     for (const { z, x, y } of this._visibleTiles) {
       const tex = this._tileCache.get(timestamp, z, x, y);
-      if (!tex?.image) continue;
+      const src = tex?.image?.data;
+      if (!src || src.length !== 256 * 2048) continue;
       const col = (x - layout.minX) + (y - layout.minY) * layout.numX;
-      ctx.drawImage(tex.image, col * 256, 0);
+      const colOffset = col * 256;
+      for (let row = 0; row < ah; row++) {
+        const srcRow = row * yStride;
+        dstArr.set(
+          src.subarray(srcRow * 256, srcRow * 256 + 256),
+          row * aw + colOffset,
+        );
+      }
       anyDrawn = true;
     }
     return anyDrawn;

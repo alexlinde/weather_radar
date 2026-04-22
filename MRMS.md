@@ -151,6 +151,49 @@ Pixel encoding: `uint8 = round((dBZ + 30) * 2)`, mapping dBZ range [-30, +97.5] 
 
 The resulting PNG is typically 2-10 KB per tile. All colorisation, compositing, and smoothing happens on the GPU via GLSL shaders.
 
+## Frontend VRAM Management
+
+Mobile browsers (especially iOS Safari) kill WebGL contexts at ~250–500 MB of GPU memory. The overlay is tuned with a device-class split (`IS_MOBILE` via `matchMedia('(max-width: 600px)')` + `Mobi|Android` UA check) so a CONUS viewport stays well inside that budget.
+
+### Tile textures: R8 instead of RGBA8
+
+The server serves grayscale 256×2048 atlas PNGs, but the naive `new THREE.Texture(bmp)` path uploads them as RGBA8 (~2 MB/tile). `createRadarTileTexture()` in `radar-layer.js` instead:
+
+1. Decodes the PNG via `createImageBitmap`
+2. Draws to a single shared 2D canvas (`willReadFrequently: true`), extracts the R channel via `getImageData`
+3. Uploads a `DataTexture` in `RedFormat` (WebGL2) or `LuminanceFormat` (WebGL1 fallback) — **1 byte/pixel, ~512 KB/tile, 4× VRAM reduction**
+4. Calls `bmp.close()` to release the decoded bitmap (on iOS these are GPU-backed)
+
+Shader code is unchanged: `sampler2D` + `.r` sampling works for RGBA, Luminance, and Red formats alike. `flipY=true` is set explicitly on the `DataTexture` to match the prior `THREE.Texture(bmp)` orientation so the `(1.0 - uv.y)` band-select math is unchanged.
+
+### Tile cache: device-aware LRU, cross-zoom eviction, dynamic sizing
+
+`TileTextureCache` has three caps:
+
+- **Absolute ceiling:** `MAX_TILE_TEXTURES` — 80 on mobile, 150 on desktop (was a flat 300).
+- **Dynamic target:** `_updateTileCacheSize()` clamps the LRU to `min(ceiling, max(24, visibleTiles × 6))` on every visible/pending tile set change, so a small viewport doesn't keep a 150-slot LRU full of stale tiles.
+- **Cross-zoom eviction:** `evictByZ(keepZs)` is called from `_pruneCrossZoomTiles()` after every `_rebuildMeshes()`. Tiles from previous zoom levels are disposed immediately rather than waiting to age out of the LRU. The pending-tile zoom is retained across zoom transitions so we don't evict tiles we're about to swap to.
+
+Per-tile VRAM after these changes: desktop ≈ 75 MB ceiling, mobile ≈ 40 MB ceiling (down from ~600 MB worst case).
+
+### Motion cache: bounded LRU
+
+`MotionTextureCache` was unbounded (a slow leak). It now enforces `MAX_MOTION_TEXTURES` (20 mobile, 40 desktop) with the same LRU pattern as the tile cache.
+
+### Volume mode: R8 DataTexture atlas, half-height on mobile
+
+The previous implementation allocated two full-size 2D canvases + two `CanvasTexture`s for the volume ray-march atlas. For a 20-tile CONUS viewport that was ~160 MB transient (2D-canvas backing + GPU texture × 2 frames).
+
+The current implementation uses two `DataTexture`s backed by `Uint8Array`s (no 2D canvas). `_drawVolAtlas()` copies R8 bytes directly out of each tile's `DataTexture` and packs them column-wise into the atlas array. On mobile, `VOLUME_ATLAS_HEIGHT = 1024` (half the source resolution) with row decimation via `yStride = 2`, cutting volume atlas VRAM 4× vs desktop. `_disposeVolumeResources()` runs whenever `_rebuildMeshes()` enters a non-volume mode, so switching away from volume frees the atlas immediately instead of holding it for the lifetime of the layer.
+
+### Overlay DPR cap
+
+MapLibre renders at full `devicePixelRatio`; on a DPR=3 phone that's a 9× framebuffer area, which also multiplies per-pixel shader cost (composite does an 8-band `fmax`; volume does a 48-step ray march). `_resizeRenderer()` caps the radar overlay's internal framebuffer at `DPR_CAP` (1.5 mobile, 2.0 desktop) while leaving the base-map MapLibre canvas at full DPR. The overlay already uses `LinearFilter` everywhere, so softer pixels are visually indistinguishable.
+
+### Prefetch budget
+
+`PREFETCH_AHEAD` and `PREFETCH_BURST` in `radar-engine.js` are halved on mobile (3/5 vs 5/10). Each prefetched frame triggers `visibleTiles × 2` GPU uploads (A+B), so this halves peak upload pressure during `play()` and zoom-transition bursts.
+
 ## NWS Reflectivity Color Scale
 
 Standard palette for mapping dBZ to RGBA. Alpha is 0 below 5 dBZ (no echo).
